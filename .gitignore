@@ -1,0 +1,10 @@
+# Build output
+build/
+
+# Sony Camera Remote SDK — proprietary, not ours to redistribute.
+# Populate these from your own copy of the SDK package: make sdk
+lib/
+include/CRSDK/
+
+# macOS
+.DS_Store
