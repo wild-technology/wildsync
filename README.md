@@ -28,6 +28,10 @@ make sdk CRSDK_DIR=/path/to/unpacked/RemoteCli
 make
 ```
 
+`CRSDK_DIR` defaults to `../RemoteCli`, so unpacking the SDK package next to
+this repo needs no argument. On the machine this was developed against it lives
+at `~/Desktop/CrSDK_v2/RemoteCli`.
+
 That compiles `build/ilxctl` and stages the SDK dylibs beside it. Tested with
 SDK v2.02.00 on macOS 26 (Apple Silicon).
 
