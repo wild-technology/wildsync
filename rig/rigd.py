@@ -19,19 +19,37 @@ without it, runs still work and the flight log simply carries empty nav columns.
 
 import json
 import os
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import rigcore
-from rigcore import (NODES, EventLog, NodeMonitor, SettingsManager, TimeSync,
-                     http_json, http_bytes)
+from rigcore import (NODES, EventLog, NodeMonitor, RunBrowser, RunsError,
+                     SettingsManager, TimeSync, free_mb, http_json, http_bytes)
 from run import RunManager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("RIGD_PORT", "9090"))
 UI_PATH = os.path.join(HERE, "rig_ui.html")
+
+# Free space on the JETSON volume below which a transect is at risk. Nothing
+# measured this before: the disk_low detector and the UI's "Disk" field both
+# report a Pi's PC-save spool, while every transect is written to ~/rig-runs on
+# the Jetson. A full Jetson volume is not survivable in-run - each frame's write
+# raises OSError and the frame is never retried, so it gets no flight_log row
+# and no nav/IMU correlation, permanently - so the warning has to come early.
+# Sized on the worst case: at transsize=0 a delivered JPEG measured 14.1 MB, so
+# 5 GB is only ~180 stereo pairs.
+RUNS_DISK_LOW_MB = 5000
+# How long a card write may stay in progress before it is a stuck write rather
+# than a busy one. This is the fault that took cam1 down on 2026-08-16: one
+# frame wedged in the body's write buffer locks the whole property table, kills
+# PC delivery, and makes ilxctl look dead - while `slotStatus` still reads OK,
+# which is why nothing detected it. slotWriting is the field that does.
+SLOT_WRITING_STUCK_S = 30.0
+SLOT_WRITING_CRITICAL_S = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -39,13 +57,30 @@ UI_PATH = os.path.join(HERE, "rig_ui.html")
 # evidence and a suggested action an operator (or agent) can act on.
 # ---------------------------------------------------------------------------
 class Anomalies:
-    def __init__(self, monitors, runmgr, nav, events):
+    def __init__(self, monitors, runmgr, nav, events, settings=None):
         self.monitors = monitors
         self.runmgr = runmgr
         self.nav = nav
         self.events = events
+        self.settings = settings
         self._flap = {}          # node -> deque of transition times
         self._last = {}
+        self._writing_since = {}  # node -> epoch its card write started
+        self._disk = (0.0, None)  # (checked_at, free_mb) — see _runs_free_mb
+
+    def _runs_free_mb(self):
+        """Free space on the runs volume, cached for a second.
+
+        scan() is called from /api/anomalies (every 2.5 s per browser) and from
+        /api/diag; the syscall is cheap but there is no reason to make it once
+        per client per poll."""
+        at, val = self._disk
+        now = time.time()
+        if now - at < 1.0:
+            return val
+        val = free_mb(rigcore.RUNS_DIR)
+        self._disk = (now, val)
+        return val
 
     def scan(self):
         out = []
@@ -60,32 +95,86 @@ class Anomalies:
                 out.append(self._a("node_offline", m.name_, "node unreachable",
                                    {"last_seen_s": snap.get("age_s")},
                                    "check power, network, and that ilxctl/"
-                                   "piagent are running"))
+                                   "piagent are running", sev="bad"))
             elif st == NodeMonitor.REACHABLE:
                 out.append(self._a("camera_absent", m.name_,
                                    "node up but camera not claimed",
                                    {"log": (status.get("log") or [])[-1:]},
                                    "check USB cable is a data cable, camera on, "
-                                   "PC Remote mode"))
+                                   "PC Remote mode", sev="bad"))
             conv = snap.get("convergence") or {}
             if conv.get("synced") is False and conv.get("diverged"):
+                # Name the ilxctl error where there is one: for filetype /
+                # imagesize / transsize there is no readback, so the body's own
+                # words are the only evidence the field did not take.
+                errs = conv.get("blind_errors") or {}
                 out.append(self._a("settings_divergent", m.name_,
-                                   "settings will not converge",
-                                   {"fields": conv["diverged"]},
-                                   "check the field is settable in the current "
-                                   "exposure mode; inspect ilxctl log"))
+                                   "settings will not converge: %s"
+                                   % ",".join(conv["diverged"]),
+                                   {"fields": conv["diverged"],
+                                    "errors": errs,
+                                    "unsettable": conv.get("unsettable") or []},
+                                   "the two bodies are NOT identically "
+                                   "configured - check the field is settable in "
+                                   "the current exposure mode, that the body is "
+                                   "not sitting on its own menu, and that PC "
+                                   "remote priority is still held",
+                                   sev="bad"))
+            # Camera health that ilxctl now reports and nothing consumed.
+            oh = status.get("overheatingLabel")
+            if oh in ("pre-overheat", "OVERHEATING"):
+                out.append(self._a("camera_overheating", m.name_,
+                                   "body overheating (%s)" % oh,
+                                   {"overheating": status.get("overheating"),
+                                    "label": oh},
+                                   "the body shuts itself down when it reaches "
+                                   "the limit, mid-transect - reduce duty "
+                                   "cycle, get air over the housing, or stop "
+                                   "and cool it now",
+                                   sev="bad" if oh == "OVERHEATING" else "warn"))
+            sw = status.get("slotWritingLabel")
+            if sw == "WRITING":
+                since = self._writing_since.setdefault(m.name_, now)
+                held = now - since
+                if held > SLOT_WRITING_STUCK_S:
+                    out.append(self._a(
+                        "card_write_stuck", m.name_,
+                        "card write has not completed in %.0fs" % held,
+                        {"held_s": round(held, 1),
+                         "slotStatus": status.get("slotStatus"),
+                         "storeDest": status.get("storeDest")},
+                        "one frame stuck in the write buffer takes the whole "
+                        "body down: the property table locks, PC delivery "
+                        "stops and ilxctl wedges, while slotStatus still reads "
+                        "OK. Power the body fully off, then read/format the "
+                        "card in a computer. A UHS-I or worn card cannot "
+                        "sustain 61 MP RAW and will stall exactly this way",
+                        sev="bad" if held > SLOT_WRITING_CRITICAL_S else "warn"))
+            else:
+                self._writing_since.pop(m.name_, None)
+            pk = status.get("priorityKeyLabel")
+            if status.get("connected") and pk == "Camera position":
+                out.append(self._a(
+                    "pc_control_lost", m.name_,
+                    "the body has taken control priority back",
+                    {"priorityKey": status.get("priorityKey"), "label": pk},
+                    "PC Remote priority was lost, so writes will be refused "
+                    "and PC save will not deliver - it masquerades as an SDK "
+                    "bug. Set the body's priority back to PC remote",
+                    sev="bad"))
             batt = status.get("battery")
             if isinstance(batt, (int, float)) and 0 <= batt <= 15:
                 out.append(self._a("battery_low", m.name_,
                                    "battery low (%s%%)" % batt, {"battery": batt},
                                    "bring the 12 V harness supply up or swap "
-                                   "battery"))
+                                   "battery", sev="bad"))
             disk = h.get("disk_free_mb")
             if isinstance(disk, (int, float)) and disk < 2000:
                 out.append(self._a("disk_low", m.name_,
                                    "node disk low (%s MB)" % disk,
                                    {"disk_free_mb": disk},
-                                   "clear old frames from the PC-save dir"))
+                                   "clear old frames from the PC-save dir",
+                                   sev="bad"))
             imu = h.get("imu") or {}
             if imu.get("present") and imu.get("age_s") not in (None,) \
                     and isinstance(imu.get("age_s"), (int, float)) \
@@ -109,7 +198,7 @@ class Anomalies:
                                        {"health": self.nav.health()},
                                        "the iKonvert draws power from the N2K "
                                        "bus, not USB - check bus power and the "
-                                       "gateway's POWER LED"))
+                                       "gateway's POWER LED", sev="bad"))
                 elif snap and snap.get("lat") is None:
                     out.append(self._a("nav_no_fix", None, "no GPS fix",
                                        {"snap": {k: snap.get(k) for k in
@@ -132,20 +221,58 @@ class Anomalies:
                     out.append(self._a("pull_fail", node,
                                        "%d frame pulls failed" % pf,
                                        {"failed": pf},
-                                       "check node link speed and disk"))
+                                       "check node link speed and disk",
+                                       sev="bad"))
+        # A held settings preview, read from the SettingsManager rather than
+        # from a node's convergence badge: the manager is the only authority on
+        # whether a pin exists, and a badge on a camera that has since dropped
+        # offline cannot be trusted to clear itself.
+        pv = self.settings.preview_state() if self.settings else {}
+        if pv.get("active"):
+            out.append(self._a(
+                "preview_pinned", pv.get("node"),
+                "holding a settings preview (%s) - the pair is NOT matched"
+                % ",".join("%s=%s" % kv for kv in
+                           sorted((pv.get("pending") or {}).items())),
+                {"pending": pv.get("pending"),
+                 "fleet": pv.get("desired"),
+                 "expires_in_s": pv.get("expires_in_s")},
+                "in Controls, Deploy to fleet or Discard. Frames taken now are "
+                "a mismatched stereo pair, and a run start will drop the "
+                "preview; it also expires on its own"))
+        # The Jetson volume the transects are actually written to.
+        free = self._runs_free_mb()
+        if isinstance(free, (int, float)) and free < RUNS_DISK_LOW_MB:
+            out.append(self._a(
+                "runs_disk_low", None,
+                "Jetson runs volume low (%d MB free)" % free,
+                {"free_mb": free, "path": rigcore.RUNS_DIR,
+                 # Both the format the fleet runs today and the one a survey
+                 # actually wants, because the difference is 44x.
+                 "frames_left_at_320kb": int(free / 0.32),
+                 "frames_left_at_14mb": int(free / 14.1)},
+                "~/rig-runs is on this volume. When it fills, every frame write "
+                "fails and those frames are NOT retried - they get no "
+                "flight_log row at all. Move finished transects off now",
+                sev="bad"))
         # emit newly-appearing anomalies once
         cur = {(a["kind"], a["node"]) for a in out}
         for key in cur - set(self._last):
             a = next(x for x in out if (x["kind"], x["node"]) == key)
-            self.events.emit("warn", a["kind"], a["msg"], node=a["node"],
+            self.events.emit("error" if a.get("sev") == "bad" else "warn",
+                             a["kind"], a["msg"], node=a["node"],
                              **a.get("evidence", {}))
         self._last = {k: now for k in cur}
         return out
 
     @staticmethod
-    def _a(kind, node, msg, evidence, action):
+    def _a(kind, node, msg, evidence, action, sev="warn"):
+        # `sev` travels with the anomaly instead of being re-derived from the
+        # kind's spelling by the UI: "card_write_stuck" and "camera_overheating"
+        # matched none of the old severity patterns and would have rendered
+        # amber, alongside advisories, while taking a body down.
         return {"kind": kind, "node": node, "msg": msg, "evidence": evidence,
-                "suggested_action": action, "since": time.time()}
+                "suggested_action": action, "sev": sev, "since": time.time()}
 
 
 class Rig:
@@ -158,8 +285,13 @@ class Rig:
         self.runmgr = RunManager(self.monitors, self.settings, self.timesync,
                                  self.events, self.nav)
         self.anomalies = Anomalies(self.monitors, self.runmgr, self.nav,
-                                   self.events)
+                                   self.events, self.settings)
+        self.runs = RunBrowser(self.events)
         self._stop = threading.Event()
+        self._stopped = threading.Event()
+        # Before anything else can write to the tree: repair whatever the last
+        # process left behind.
+        self._recover_runs()
         for m in self.monitors:
             m.start()
         threading.Thread(target=self._reconcile_loop, daemon=True).start()
@@ -168,6 +300,63 @@ class Rig:
         self.events.emit("info", "lifecycle", "rigd up", port=PORT,
                          nodes=[m.name_ for m in self.monitors],
                          nav=bool(self.nav))
+
+    def _recover_runs(self):
+        """Finalise runs left open by a crash, a kill, or a power cut.
+
+        rigd had no restart-time recovery, so an abnormal exit mid-transect left
+        run.json with final:false, `frames` stale by up to 9 entries (the index
+        is rewritten every 10th frame) and no per-worker stats at all. The
+        imagery, the flight_log rows and events.log all survive - they are
+        flushed as they are produced - so the run can be rebuilt from what is on
+        disk, which is what this does: recount from each camera's flight_log,
+        mark it final, and say plainly that it was interrupted rather than
+        leaving a manifest that disagrees with its own directory.
+
+        Bounded to the newest 20 runs: an old survey tree must not turn a rigd
+        restart into a minutes-long scan before the fleet comes up."""
+        try:
+            listing = self.runs.list_runs(limit=20)
+        except Exception as e:  # noqa: BLE001
+            self.events.emit("warn", "run_recover",
+                             "could not scan %s: %s" % (rigcore.RUNS_DIR, e))
+            return
+        for row in listing.get("runs", []):
+            if row.get("final") or not row.get("has_run_json"):
+                continue
+            rid = row["run_id"]
+            try:
+                detail = self.runs.detail(rid)
+                path = os.path.join(self.runs.run_dir(rid), "run.json")
+                with open(path) as fh:
+                    doc = json.load(fh)
+                rows = {c: v.get("rows", 0)
+                        for c, v in (detail.get("per_camera") or {}).items()}
+                doc["final"] = True
+                doc["interrupted"] = True
+                doc["interrupted_note"] = (
+                    "rigd exited before this run was stopped. frames/stats were "
+                    "rebuilt from the flight_log files on disk at %s; the "
+                    "in-memory per-frame index ends at the last multiple of 10."
+                    % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                doc["recovered"] = {"at": time.time(), "flight_log_rows": rows,
+                                    "frames_indexed": doc.get("frames")}
+                doc["frames"] = sum(rows.values()) or doc.get("frames")
+                tmp = path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(doc, fh, indent=1)
+                os.replace(tmp, path)
+                self.events.emit(
+                    "warn", "run_recover",
+                    "run %s was never finalised (rigd exited mid-transect); "
+                    "rebuilt from flight_logs: %s" %
+                    (rid, ", ".join("%s=%d rows" % kv
+                                    for kv in sorted(rows.items())) or "none"),
+                    run_id=rid, rows=rows)
+            except (RunsError, OSError, ValueError) as e:
+                self.events.emit("warn", "run_recover",
+                                 "could not finalise %s: %s" % (rid, e),
+                                 run_id=rid)
 
     def _start_nav(self):
         try:
@@ -248,7 +437,13 @@ class Rig:
                      "exif_offset": self.timesync.exif_offset},
             "nodes": [m.snapshot() for m in self.monitors],
             "desired": self.settings.get(),
+            "preview": self.settings.preview_state(),
             "run": self.runmgr.status(),
+            # The volume the transects are written to — the one nothing
+            # measured. `disk_free_mb` on a node is that Pi's PC-save spool.
+            "storage": {"runs_dir": rigcore.RUNS_DIR,
+                        "jetson_free_mb": free_mb(rigcore.RUNS_DIR),
+                        "low_threshold_mb": RUNS_DISK_LOW_MB},
             "anomaly_counts": self.events.recent_counts(),
             "anomalies": self.anomalies.scan(),
         }
@@ -256,6 +451,9 @@ class Rig:
     def fleet(self):
         return {"nodes": [self._node_view(m) for m in self.monitors],
                 "run": self.runmgr.status(),
+                "preview": self.settings.preview_state(),
+                "jetson_free_mb": free_mb(rigcore.RUNS_DIR),
+                "jetson_disk_low_mb": RUNS_DISK_LOW_MB,
                 "time_source": self.timesync.now()[1]}
 
     def _node_view(self, m):
@@ -281,6 +479,41 @@ class Rig:
             "shutter_raw": status.get("shutterValue"),
             "aperture_raw": status.get("apertureValue"),
             "store_dest": status.get("storeDest"),
+            "store_dest_label": status.get("storeDestLabel"),
+            # Body-menu-only on these bodies (enableFlag=DisplayOnly): shown so
+            # the operator can SEE them, never offered as something the UI can
+            # set. `writable` is carried so the UI can say why.
+            "pcsave": status.get("pcsave"),
+            "writable": status.get("writable") or {},
+            # Format properties. ilxctl has no readback for these on this body
+            # (they appear in /api/status only on the fake node), so the UI
+            # shows the desired value marked "no readback" rather than implying
+            # it has confirmed anything.
+            "filetype": status.get("filetypeValue"),
+            "imagesize": status.get("imagesizeValue"),
+            "transsize": status.get("transsizeValue"),
+            # Health fields ilxctl reports and nothing consumed until now.
+            # slotWriting == WRITING persistently is a stuck card write, which
+            # takes the whole body down while slotStatus still reads OK.
+            "slot_status": status.get("slotStatus"),
+            "slot_writing": status.get("slotWriting"),
+            "slot_writing_label": status.get("slotWritingLabel"),
+            "overheating": status.get("overheating"),
+            "overheating_label": status.get("overheatingLabel"),
+            "live_view": status.get("liveViewStatus"),
+            "live_view_label": status.get("liveViewLabel"),
+            "priority_key_label": status.get("priorityKeyLabel"),
+            # Lens position, READ ONLY and PER CAMERA. These are deliberately
+            # not converged (docs/future-tests.md §1: encoder parity between the
+            # two bodies is unmeasured), but a body that came back from a
+            # power cycle at a different focus than its partner invalidates the
+            # stereo solution, so the numbers have to be visible even though
+            # nothing may push one body's value to the other.
+            "focus_mode": status.get("focusMode"),
+            "focus_mode_label": status.get("focusModeLabel"),
+            "focus_pos": status.get("focusPosCur", status.get("focusPos")),
+            "zoom_pos": status.get("zoomPosCur", status.get("zoomPos")),
+            "zoom_setting_label": status.get("zoomSettingLabel"),
             "convergence": snap.get("convergence"),
             "gpio": h.get("gpio"), "imu": h.get("imu"),
             "disk_free_mb": h.get("disk_free_mb"),
@@ -362,9 +595,32 @@ class Rig:
             return {"present": False, "error": str(e)}
 
     def stop(self):
+        """Shut down cleanly, finalising an active run first.
+
+        A rigd that goes away mid-transect used to leave run.json with
+        final:false and no per-worker stats, and - the part that costs imagery -
+        left frames that had reached a node but not yet been pulled to be
+        baselined as "old" by the NEXT run's PullWorker, so they were never
+        pulled, renamed, or given a flight_log row. runmgr.stop() drains the
+        pull workers and writes the manifest, so the ordinary exit path stops
+        creating that seam. Idempotent: SIGTERM and the KeyboardInterrupt path
+        can both land here."""
+        if self._stopped.is_set():
+            return
+        self._stopped.set()
+        try:
+            if self.runmgr.status().get("active"):
+                self.events.emit("warn", "lifecycle",
+                                 "rigd is stopping with a run active - "
+                                 "finalising it before exit")
+                self.runmgr.stop()
+        except Exception as e:  # noqa: BLE001
+            self.events.emit("error", "lifecycle",
+                             "could not finalise the active run: %s" % e)
         self._stop.set()
         for m in self.monitors:
             m.stop()
+        self.events.emit("info", "lifecycle", "rigd down")
 
 
 RIG = None
@@ -436,8 +692,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.events.since(since, sev))
             elif p == "/api/settings":
                 self._json(RIG.settings.get())
+            elif p == "/api/settings/preview":
+                self._json(RIG.settings.preview_state())
             elif p == "/api/run":
                 self._json(RIG.runmgr.status())
+            elif p == "/api/runs":
+                # A junk limit is the client's problem, not a 500: clamp it.
+                try:
+                    lim = int((q.get("limit") or ["50"])[0] or 50)
+                except ValueError:
+                    lim = 50
+                self._json(RIG.runs.list_runs(limit=lim))
+            elif p == "/api/run/detail":
+                self._runs(lambda: RIG.runs.detail((q.get("id") or [""])[0]))
+            elif p == "/api/run/frame":
+                self._run_frame((q.get("id") or [""])[0],
+                                (q.get("cam") or [""])[0],
+                                (q.get("name") or [""])[0])
+            elif p == "/api/run/flight_log":
+                self._run_flight_log((q.get("id") or [""])[0],
+                                     (q.get("cam") or [""])[0])
             elif p == "/api/imu":
                 self._json(RIG.imu())
             elif p == "/api/imu/window":
@@ -471,6 +745,54 @@ class Handler(BaseHTTPRequestHandler):
             RIG.events.emit("error", "http", "GET %s: %s" % (p, e))
             self._json({"ok": False, "error": str(e)}, 500)
 
+    # ---- transect browser (read-only) ------------------------------------
+    # Every one of these takes a run id / camera / filename straight from the
+    # browser. RunBrowser validates each part against a strict character class
+    # AND checks the resolved realpath is still inside the runs directory, so
+    # neither "../.." nor a symlink planted in a run folder can read outside it.
+    # RunsError is the one exception type they raise, and it is answered with a
+    # 400/404 rather than the 500-with-a-stack-trace an unexpected error gets.
+    def _runs(self, fn):
+        try:
+            self._json(fn())
+        except RunsError as e:
+            self._json({"ok": False, "error": str(e)},
+                       404 if "no such" in str(e) else 400)
+
+    def _run_frame(self, rid, cam, name):
+        try:
+            path = RIG.runs.frame_path(rid, cam, name)
+        except RunsError as e:
+            self._json({"ok": False, "error": str(e)},
+                       404 if "no such" in str(e) else 400)
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            self._json({"ok": False, "error": str(e)}, 404)
+            return
+        ext = os.path.splitext(name)[1].lower()
+        self._bytes(data, "image/jpeg" if ext in (".jpg", ".jpeg")
+                    else "application/octet-stream")
+
+    def _run_flight_log(self, rid, cam):
+        try:
+            data, truncated = RIG.runs.flight_log(rid, cam)
+        except RunsError as e:
+            self._json({"ok": False, "error": str(e)},
+                       404 if "no such" in str(e) or "no flight_log" in str(e)
+                       else 400)
+            return
+        # text/csv, not a download: the operator reads it in the browser, and
+        # nothing here should be able to hand the client an executable name.
+        self._bytes(data, "text/csv; charset=utf-8")
+        if truncated:
+            RIG.events.emit("warn", "runs",
+                            "flight_log for %s/%s exceeded the serve cap and "
+                            "was truncated in transit - read it from disk"
+                            % (rid, cam))
+
     def _proxy_frame(self, node, name):
         m = self._mon(node)
         if not m or not name:
@@ -497,7 +819,23 @@ class Handler(BaseHTTPRequestHandler):
         b = self._read_body()
         try:
             if p == "/api/settings":
-                self._json({"ok": True, "applied": RIG.settings.update(b)})
+                rep = RIG.settings.update(b)
+                # A rejected value is returned, not swallowed: an out-of-range
+                # desired value looks exactly like a camera fault from the
+                # operator's side (red badge, anomaly pointing at the body),
+                # and the only way out was to guess which field was bad.
+                self._json({"ok": bool(rep["applied"]) or not rep["rejected"],
+                            "applied": rep["applied"],
+                            "rejected": rep["rejected"]})
+            elif p == "/api/settings/preview":
+                # Stage on the primary only. `desired` is untouched and that
+                # node is pinned so the 3 s reconcile cannot yank the preview
+                # back before the operator has looked at it.
+                self._json(RIG.settings.preview(b, node=b.get("node")))
+            elif p == "/api/settings/commit":
+                self._json(RIG.settings.commit())
+            elif p in ("/api/settings/discard", "/api/settings/revert"):
+                self._json(RIG.settings.discard())
             elif p == "/api/settings/auto":
                 RIG.settings.set_auto(bool(b.get("on")))
                 self._json({"ok": True})
@@ -505,6 +843,16 @@ class Handler(BaseHTTPRequestHandler):
                 cur = RIG.settings.bump_ev(int(b.get("steps", 0)))
                 self._json({"ok": True, "expcomp_mev": cur})
             elif p == "/api/run/start":
+                # A pinned preview means cam1 is deliberately NOT on the fleet
+                # vector. Recording a transect in that state produces stereo
+                # pairs shot at two different exposures - unusable, and not
+                # visible in the frames themselves. The UI blocks this in
+                # pre-flight; releasing it here as well means an API client
+                # that skips pre-flight cannot record a mismatched survey.
+                if RIG.settings.pinned_node():
+                    RIG.settings.discard("a run was started while a preview was "
+                                         "pinned - the fleet must be matched to "
+                                         "record")
                 self._json(RIG.runmgr.start(b or {}))
             elif p == "/api/run/stop":
                 self._json(RIG.runmgr.stop())
@@ -519,10 +867,28 @@ class Handler(BaseHTTPRequestHandler):
             elif p == "/api/reconcile":
                 RIG.settings.reconcile_all(force=True)
                 self._json({"ok": True})
-            elif p in ("/api/focus/mode", "/api/focus/drive", "/api/focus/position",
-                       "/api/zoom/drive", "/api/zoom/position", "/api/zoom/setting"):
-                # Lens controls fan out to every connected camera so the pair
-                # stays identically framed and focused. A "node" key targets one.
+            elif p == "/api/focus/mode":
+                # Focus MODE is fleet state, so it goes through `desired` and
+                # is converged like any other field. Fanning it out instead
+                # meant the reconcile loop pushed MF back over the operator's
+                # choice within 3 s while the selector kept showing the choice,
+                # and the disagreement never reached the convergence badge.
+                # (The rig is always MF; this is how it STAYS MF, and how a
+                # deliberate change is recorded rather than fought.)
+                rep = RIG.settings.update({"focus_mode": b.get("mode")})
+                self._json({"ok": bool(rep["applied"]), "applied":
+                            rep["applied"], "rejected": rep["rejected"]})
+            elif p in ("/api/focus/drive", "/api/focus/position",
+                       "/api/zoom/drive", "/api/zoom/position",
+                       "/api/zoom/setting"):
+                # Lens POSITION stays per-camera and out of `desired`: encoder
+                # parity between the two bodies is unmeasured
+                # (docs/future-tests.md §1), so nothing may push one body's
+                # count to the other. Without a "node" key this fans out to
+                # every connected camera as a convenience for a rig whose
+                # lenses are set by hand; it is never re-asserted afterwards,
+                # and the per-camera readback is in /api/fleet so a mismatch is
+                # at least visible.
                 self._json(RIG.fanout(p, b))
             elif p == "/api/node/connect":
                 m = self._mon(b.get("node"))
@@ -551,12 +917,30 @@ def main():
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     print("rigd -> http://0.0.0.0:%d" % PORT)
+
+    # systemctl stop/restart sends SIGTERM, and the default disposition is to
+    # die on the spot: an active transect was left with run.json final:false,
+    # no stats, and frames on the nodes that the next run would baseline away
+    # as "already seen". Route it to the same finalising path as Ctrl-C.
+    # serve_forever() must be woken from ANOTHER thread - calling shutdown()
+    # from inside the handler deadlocks, because the handler runs on the very
+    # thread shutdown() waits for.
+    def _term(signum, _frame):
+        RIG.events.emit("warn", "lifecycle",
+                        "signal %d received - shutting down" % signum)
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _term)
+        except (ValueError, OSError):
+            pass          # not the main thread (embedded/test use): skip
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         RIG.stop()
+        srv.server_close()
 
 
 if __name__ == "__main__":
