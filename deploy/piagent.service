@@ -1,0 +1,21 @@
+[Unit]
+Description=Wild Sync piagent - Pi-side GPIO/IMU/health agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+# The camera and this Pi share PoE, so at boot the camera is still powering up.
+# piagent has no camera dependency, but give the system a moment to settle.
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 -u /home/ubuntu/wildsync/rig/piagent.py
+Restart=always
+RestartSec=3
+# GPIO access: the udev rule (installed by deploy.sh) grants the gpio group
+# /dev/gpiochip*, so no root is needed once that lands. Until then piagent
+# falls back to sudo -n internally.
+SupplementaryGroups=gpio dialout i2c
+
+[Install]
+WantedBy=multi-user.target

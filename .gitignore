@@ -6,5 +6,10 @@ build/
 lib/
 include/CRSDK/
 
-# macOS
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state (rigd writes these outside the repo, but be explicit)
+*.jsonl
 .DS_Store
