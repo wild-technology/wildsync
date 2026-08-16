@@ -339,6 +339,55 @@ suite first.
 11. **Re-measure sustained frame rate at real archive settings** — every figure on record
     used 320 KB thumbnails (`docs/future-tests.md` §3).
 
+
+## 7a. OPERATOR PUNCH LIST — 2026-08-16, after driving the GUI
+
+Stated by the operator after the first real drive of the finished UI. These
+supersede earlier UI decisions where they conflict, including one feature built
+the same day (see the note on preview).
+
+**Review tab — becomes the primary working screen**
+
+1. Where "newest" is read from is undefined on initial launch. Define it
+   explicitly: which source, which camera, what happens before any frame exists.
+2. **Always present image PAIRS.** If a frame's partner does not exist - a
+   mis-sync, a failed fire, a lost pull - render a **"missing"** panel in its
+   place rather than silently showing one camera.
+3. The **timestamp / filename must be the prominent title** of each frame.
+4. Between the two rendered frames of a pair, show **`<#.#ms>`** - the measured
+   inter-camera jitter for that pair. The EXPOSURE edges make this exact; use
+   `epoch_hw`, not `epoch`.
+5. Fold the **Fleet tab's content into Review** - either live fleet data, or the
+   metadata belonging to the image currently on screen.
+6. Move **Start transect / End transect** into Review, out of Controls.
+
+**Controls tab — restructure**
+
+7. **Remove the histogram.**
+8. **Remove "Preview on Cam1" entirely.** Exposure changes are made **live to the
+   respective camera**. The operator then either hits apply-to-fleet, or
+   deliberately leaves the two cameras slightly different - which is a real
+   workflow (balancing exposure between the two bodies), not a mistake to guard
+   against. The staged preview/commit/discard model is the wrong shape for this.
+9. **Perfectly columnar layout:** each camera's settings sit directly under that
+   camera's preview. **Zoom and focus apply to that camera only** - never fleet.
+10. **Exposure section gets its own "apply to fleet" button, top-right.** It must
+    apply **ONLY the settings in that section**. No accidental global writes of
+    anything else - not image type, not zoom, not focus.
+11. Lens metadata belongs in the respective **zoom** or **focus** header.
+12. Remove irrelevant debug text.
+
+**Elsewhere**
+
+13. **Drop all visibility of cam3** - not needed yet.
+14. Transects tab wants an **"open folder"** button.
+
+**Known-broken, needs fixing not just re-laying-out**
+
+15. **Focus and zoom do not work reliably.** Zoom has huge lag and is
+    inconsistent. This is behavioural, not cosmetic - the controls need to
+    actually work, not merely be moved.
+
 ## 8. DOCUMENTS THAT ARE NOW WRONG
 
 All corrected during the 2026-08-16 cleanup — `README.md` (sync figures, caution
