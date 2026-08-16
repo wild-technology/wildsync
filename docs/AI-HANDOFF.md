@@ -9,9 +9,8 @@ what is done, what is half-done, and what will bite you.**
 
 ## 0. Read this first — the three things that will waste your day
 
-1. **Nothing is committed.** Every change from this session is uncommitted on branch
-   `jetson-port` (~2600 insertions across 9 files). `git stash` or a careless checkout
-   destroys a day of work. Consider committing before you do anything else.
+1. **Everything is committed and pushed** — `ae6668d` on `jetson-port`. The working tree
+   is clean and the full suite is green. You are starting from a known-good state.
 2. **A fix workflow was stopped mid-flight.** Two of three lanes finished, one did not,
    and a fourth phase never started. It CANNOT be resumed — §5 has the work list instead.
 3. **The rig cannot record right now.** cam1's SD card has a stuck write. This is
@@ -256,7 +255,7 @@ this.** Focus/zoom must remain per-camera until lens encoder parity is proven
 out of the script before resuming, and make sure the UI never offers an "apply focus to
 fleet" control.
 
-## 6. WHAT CHANGED THIS SESSION (all uncommitted)
+## 6. WHAT CHANGED THIS SESSION (committed as `ae6668d`)
 
 ```
 deploy/deploy.sh        +17    usbfs persistence via kernel cmdline
@@ -302,25 +301,33 @@ suite first.
 2. **Deploy** `deploy.sh node cam1 && deploy.sh node cam2`, then read the new
    `slotWriting` / `overheating` / `liveViewStatus` fields to confirm the fault signature
    is now visible.
-3. **Resume the workflow** (§5, minding §5.3) — finish `run.py`, then cross-cutting
-   (preview-then-deploy, transect browser), then verify.
-4. **Fix the archive resolution** (§4.2): `transsize=0`, measure L/M/S, pick the setting
+3. **Verify the `run.py` lane's work.** ~1650 lines changed by an agent that was stopped
+   before it finished. It compiles and the suite passes, but it is NOT verified against
+   its 19-item work list in `docs/audit-2026-08-16-findings.json` (filter `file` ==
+   `rig/run.py`). Check each finding is genuinely addressed before trusting it.
+4. **Build the two missing goal capabilities** — neither exists: **cam1
+   preview-then-deploy** and the **transect browser**. Plus the 8 `rigd.py`/`rigcore.py`
+   findings. This was the phase that never started (§5.2). Mind §5.3.
+5. **Fix the archive resolution** (§4.2): `transsize=0`, measure L/M/S, pick the setting
    nearest 12 MP, switch to `filetype=3` + `pcsave=1` so RAW lands on the card.
-5. **Build the Pi→NVMe pipeline**: pull → verify hash → **delete the Pi's copy**. The
+6. **Build the Pi→NVMe pipeline**: pull → verify hash → **delete the Pi's copy**. The
    SD cards are at 456/461 files and nothing prunes them; `/api/shots` re-lists the whole
    directory every 0.4 s.
-6. **Implement the strobe** — fully specified in
+7. **Implement the strobe** — fully specified in
    `docs/strobe-trigger.md`, whose open decisions are now all settled: 2.9 V
    sync (measured) means **no components needed**; open-drain BCM26 (header pin 37) + GND
    (pin 39); δ ≈ 8–12 ms after T; shutter 1/30 or slower; acceptance check
    `strobe ∈ ⋂[fallᵢ, riseᵢ]` using `epoch_hw`.
-7. **Add format-property readback to `ilxctl`** (§4.4) so convergence stops flying blind.
-8. **Fix `ilxctl` startup**: bind :8080 *before* connecting the camera, so a stuck SDK
+8. **Add format-property readback to `ilxctl`** (§4.4) so convergence stops flying blind.
+9. **Fix `ilxctl` startup**: bind :8080 *before* connecting the camera, so a stuck SDK
    session cannot make the daemon look dead (§2.2).
-9. **Tab-gate live view** and set `LiveView_Image_Quality` Low / expose an off switch
+10. **Tab-gate live view** and set `LiveView_Image_Quality` Low / expose an off switch
    (§3.7).
-10. **Re-measure sustained frame rate at real archive settings** — every figure on record
+11. **Re-measure sustained frame rate at real archive settings** — every figure on record
     used 320 KB thumbnails (`docs/future-tests.md` §3).
+12. **Fix the soaktest flake** (`docs/future-tests.md` §6). One run in ~4 fails a
+    timing-dependent assertion in the pull suite. It is a harness bug, not a code
+    regression — but it will make you doubt a good tree at exactly the wrong moment.
 
 ## 8. DOCUMENTS THAT ARE NOW WRONG
 
