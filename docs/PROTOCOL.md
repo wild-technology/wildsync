@@ -56,8 +56,14 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
 - Inter-camera start skew over USB 0–200 ms → GPIO firing is the fix.
 - Sony encodings: shutter `(num<<16)|den` (1/200 = 65736); aperture = f×100;
   ISO AUTO = 16777215; drive Single = 1, Continuous Lo = 65540;
-  FileType JPEG=1 RAW=2 RAW+JPEG=3; ImageSize L/M/S=1/2/3;
+  FileType None=0 JPEG=1 RAW=2 RAW+JPEG=3 RAW+HEIF=4 HEIF=5; ImageSize L/M/S=1/2/3;
   TransSize Original=0 Small=1; StoreDest PC=1 card=2 both=3.
+- **Body-menu-only properties.** `pcsave` (RAW_J_PC_Save_Image, "RAW+H Save Image")
+  and `storeDest` report `enableFlag=DisplayOnly(2)` on these bodies and CANNOT be
+  set over USB - they must be changed in the camera's own menu over HDMI, per body.
+  `filetype`, `imagesize` and `transsize` ARE settable over USB. Measured 2026-08-16.
+- `transsize=0` (Original) delivers the full frame: measured **9504x6336 = 60.2 MP,
+  14.1 MB** per JPEG. `transsize=1` (Small) delivers 1616x1080 = 1.7 MP, ~320 KB.
 - Camera DateTime **cannot** be set on ILX-LR1 (0x8402) — correct EXIF offsets
   host-side instead.
 
