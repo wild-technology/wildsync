@@ -496,10 +496,19 @@ std::string Camera::modeSummary() {
     add("slot1", SDK::CrDeviceProperty_MediaSLOT1_Status, formatSlotStatus);
     add("program", SDK::CrDeviceProperty_ExposureProgramMode, formatExposureProgram);
     SDK::CrDeviceProperty caution;
-    if (getProp(SDK::CrDeviceProperty_CameraErrorCautionStatus, caution) &&
-        caution.GetCurrentValue() != 0) {
-        s += ", CAUTION ON BODY (0x" +
-             crErrorString(static_cast<CrInt32u>(caution.GetCurrentValue())).substr(2) + ")";
+    if (getProp(SDK::CrDeviceProperty_CameraErrorCautionStatus, caution)) {
+        // CrCameraErrorCautionStatus is 1-based: NoError = 0x01, Error = 0x02.
+        // Testing `!= 0` therefore reported "CAUTION ON BODY (0x00000001)" on a
+        // perfectly healthy body - i.e. on EVERY read-only error this function
+        // ever formatted. That sent operators hunting for a modal on a
+        // screenless camera that was never there, and it is quoted in the
+        // handover docs as though it were a real diagnosis. Only 0x02 (and any
+        // future non-NoError value) is an actual caution.
+        const long long c = static_cast<long long>(caution.GetCurrentValue());
+        if (c != 0 && c != SDK::CrCameraErrorCautionStatus_NoError) {
+            s += ", CAUTION ON BODY (0x" +
+                 crErrorString(static_cast<CrInt32u>(c)).substr(2) + ")";
+        }
     }
     return s;
 }
@@ -1420,6 +1429,14 @@ std::string Camera::statusJson() {
             SDK::CrDeviceProperty_BatteryRemain,
             SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber,
             SDK::CrDeviceProperty_MediaSLOT1_Status,
+            // The three properties that distinguish "the software is broken"
+            // from "the body cannot record right now". Without them a stuck
+            // card write, a thermal shutdown and a live-view session that never
+            // stopped all present identically: a camera that connects, answers
+            // every read, fires the shutter, and silently records nothing.
+            SDK::CrDeviceProperty_MediaSLOT1_WritingState,
+            SDK::CrDeviceProperty_DeviceOverheatingState,
+            SDK::CrDeviceProperty_LiveViewStatus,
             SDK::CrDeviceProperty_StillImageStoreDestination,
             SDK::CrDeviceProperty_PriorityKeySettings,
             SDK::CrDeviceProperty_Interval_Rec_Mode,
@@ -1461,6 +1478,8 @@ std::string Camera::statusJson() {
         long long iso = 0, shutter = 0, fnum = 0, program = 0, drive = 0;
         long long battery = -1, remainShots = -1, slotStatus = -1, storeDest = 0;
         long long priorityKey = 0;
+        // -1 = the body did not report it, which is different from "fine".
+        long long overheat = -1, liveViewStatus = -1, slotWriting = -1;
         long long powerStatus = 0, opMode = 0, menuStatus = 0, sdkCtlMode = -1;
         long long ivMode = SDK::CrIntervalRecMode_OFF, ivStatus = 0;
         long long ivInterval = 0, ivShots = 0, ivStart = 0;
@@ -1555,6 +1574,29 @@ std::string Camera::statusJson() {
                 case SDK::CrDeviceProperty_BatteryRemain: battery = cur; break;
                 case SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber: remainShots = cur; break;
                 case SDK::CrDeviceProperty_MediaSLOT1_Status: slotStatus = cur; break;
+                // Whether the card is mid-write. This is NOT covered by
+                // MediaSLOT1_Status, which reports the card as OK because the
+                // card is recognised perfectly well - it is the WRITE that is
+                // hung. A body with one frame stuck in its write buffer goes
+                // busy, locks its whole property table (storeDest and the drive
+                // list stop being offered at all), stops delivering to the PC
+                // and refuses to format, while still answering status and still
+                // firing the shutter. Every visible symptom points at the
+                // software; the only honest signal is this property.
+                case SDK::CrDeviceProperty_MediaSLOT1_WritingState:
+                    slotWriting = cur; break;
+                // A body that is cooking stops recording long before it says so
+                // in any way the host can see: the shutter still fires and the
+                // EXPOSURE edge still lands, but nothing is written to card or
+                // delivered to the PC, and every save-related property goes
+                // read-only behind a caution the screenless body cannot show.
+                // That is indistinguishable from a software fault unless this
+                // property is read - and it was not, which cost a session.
+                case SDK::CrDeviceProperty_DeviceOverheatingState: overheat = cur; break;
+                // Whether the sensor is actually streaming for live view. On a
+                // sealed underwater housing, live view is pure heat with nobody
+                // watching, so the rig needs to be able to SEE that it is on.
+                case SDK::CrDeviceProperty_LiveViewStatus: liveViewStatus = cur; break;
                 case SDK::CrDeviceProperty_PriorityKeySettings: priorityKey = cur; break;
                 case SDK::CrDeviceProperty_CameraPowerStatus: powerStatus = cur; break;
                 case SDK::CrDeviceProperty_CameraOperatingMode: opMode = cur; break;
@@ -1641,6 +1683,32 @@ std::string Camera::statusJson() {
         os << ",\"battery\":" << (battOk ? std::to_string(battery) : "null");
         os << ",\"remainingShots\":" << (remainShots >= 0 ? std::to_string(remainShots) : "null");
         emitStr("slotStatus", slotStatus >= 0 ? formatSlotStatus(slotStatus) : "--");
+        // Thermal state, and whether the sensor is streaming for live view.
+        // null means the body did not report the property at all - which must
+        // never be shown as "not overheating".
+        os << ",\"overheating\":"
+           << (overheat >= 0 ? std::to_string(overheat) : "null");
+        emitStr("overheatingLabel",
+                overheat < 0 ? "unknown"
+                : overheat == SDK::CrDeviceOverheatingState_NotOverheating ? "ok"
+                : overheat == SDK::CrDeviceOverheatingState_PreOverheating ? "pre-overheat"
+                : overheat == SDK::CrDeviceOverheatingState_Overheating ? "OVERHEATING"
+                : "unknown");
+        os << ",\"slotWriting\":"
+           << (slotWriting >= 0 ? std::to_string(slotWriting) : "null");
+        emitStr("slotWritingLabel",
+                slotWriting < 0 ? "unknown"
+                : slotWriting == SDK::CrMediaSlotWritingState_NotWriting ? "idle"
+                : slotWriting == SDK::CrMediaSlotWritingState_ContentsWriting ? "WRITING"
+                : "unknown");
+        os << ",\"liveViewStatus\":"
+           << (liveViewStatus >= 0 ? std::to_string(liveViewStatus) : "null");
+        emitStr("liveViewLabel",
+                liveViewStatus < 0 ? "unknown"
+                : liveViewStatus == SDK::CrLiveView_NotSupport ? "not supported"
+                : liveViewStatus == SDK::CrLiveView_Disable ? "disabled"
+                : liveViewStatus == SDK::CrLiveView_Enable ? "streaming"
+                : "unknown");
         // The body's own Interval REC. Interval is reported in tenths of a
         // second; the UI works in seconds.
         os << ",\"camIv\":{"

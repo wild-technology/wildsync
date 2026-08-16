@@ -133,8 +133,23 @@ Every service writes a structured event journal (JSONL), one object per line:
 ```
 `sev` ∈ debug|info|warn|error|critical. `kind` is a stable slug
 (`node_transition`, `reconnect`, `settings_divergent`, `capture_fail`,
-`pull_fail`, `gpio_late`, `jitter_high`, `imu_stall`, `nav_stale`,
-`exif_offset`, `disk_low`, `sdk_error`, …). Never log secrets.
+`pull_fail`, `pull_retry`, `gpio_late`, `sync_skew`, `sync_degraded`,
+`orphan_fire`, `frames_missing`, `calibration_missing`, `timebase`,
+`jitter_high`, `imu_stall`, `nav_stale`, `exif_offset`, `disk_low`,
+`sdk_error`, …). Never log secrets.
+
+Run-level alert kinds and what each one means:
+
+| kind | raised when |
+|---|---|
+| `capture_fail` | a node's fire returned `ok:false` — that camera took no picture |
+| `sync_skew` | the realised inter-camera exposure spread for one shot exceeded 10 ms |
+| `gpio_late` | a node reported firing >2 ms from its scheduled instant |
+| `sync_degraded` | a camera dropped to the USB path, or its `/health` went unreadable while it stays on the GPIO path it last had |
+| `orphan_fire` | a fire produced no frame; its queued command was dropped so later frames keep their own capture instants |
+| `frames_missing` | shots fired minus frames landed exceeded a small threshold on one camera |
+| `calibration_missing` | a GPIO-armed camera has no trigger-latency measurement of its own and is firing on the fleet median |
+| `timebase` | the master clock changed mid-run; the run keeps its start-of-run base |
 
 rigd exposes, for both humans and an autonomous agent:
 - `GET /api/events?since=<seq>&sev=<min>` → `{next, events:[...]}` — cursor-based,
@@ -181,7 +196,8 @@ Transect run layout (Jetson, `~/rig-runs/`):
 
 ```
 runs/260815_1930_transect-01/
-  run.json            journal: config, nodes, events, per-frame index, alerts
+  run.json            journal: config, nodes, events, per-frame index, alerts,
+                      the timebase applied, and per-shot sync quality
   nmea_raw.log        every serial line, prefixed epoch
   events.log          human-readable event stream
   cam2/
@@ -189,6 +205,18 @@ runs/260815_1930_transect-01/
     flight_log.csv
   cam3/ …
 ```
+
+A run **never reuses an existing directory**. `run_id` is
+`YYMMDD_hhmm_<label>`, which is not unique — two starts in the same minute with
+the same label (a false start, or a rigd restart) would otherwise interleave two
+surveys in one folder and destroy the first `run.json`. On collision the id gains
+a `_b`, `_c`, … suffix and the API response returns the id actually used.
+
+Calibration exposures (the EXIF-clock frame and the trigger-latency frames) are
+**not survey data**: they are fired before the capture loop is armed, named by
+the calibration that caused them, and excluded from the run folder, the
+flight_log and the frame index. Run-start calibration and auto-capture never
+overlap.
 
 UI (`rig_ui.html`, served by rigd, **runs with no AI**) is tabbed:
 - **Review** — the existing single-camera captures pane generalised to N cameras
@@ -217,6 +245,19 @@ Time model: GPS time (PGN 126992/129029) when the N2K network is live →
 (calibration frame: fire, read EXIF DateTimeOriginal+SubSec, diff vs
 GPIO exposure edge when available, else command epoch + 20 ms). Frame capture
 instant preference: GPIO EXPOSURE fall edge > corrected EXIF > command time.
+
+**Where the correction is applied, and where it must not be.** Every epoch
+handled internally — fire commands, EXPOSURE edges, the nav history ring, the
+IMU window — is a raw local (Jetson) epoch; those are all local-clock domains
+and a corrected stamp handed to `fix_at()` or `/imu/window` silently blanks
+those columns. `gps_offset` is applied exactly **once**, at the presentation
+boundary: the `datetime` column and the `CamN_` filename. `time_source` names
+the offset actually applied to that row, never a second, later reading.
+
+The offset is **latched at run start** and held for the whole transect, so a fix
+arriving or dropping mid-run cannot leave rows in one CSV sitting on two clocks.
+The change is journalled (`timebase`) and `run.json` records both the applied
+base and the live one, so a whole run can be re-based afterwards.
 
 Exposure policy: **manual is the default** (aperture, shutter, ISO pushed
 identically to every camera, verified by readback). Optional auto = ISO servo

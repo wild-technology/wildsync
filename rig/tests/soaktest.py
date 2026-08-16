@@ -54,9 +54,18 @@ import time
 from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+RIG = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+# rig/ itself has to be importable, not just rig/tests/: everything under test
+# (rigcore, run, navlog) lives one level up. Without this the documented
+# invocation `python3 rig/tests/soaktest.py` dies on `import rigcore` and the
+# whole gate is silently unrunnable from the README's own instructions.
+sys.path.insert(0, RIG)
 
-PROTOCOL_PATH = os.path.join(HERE, "PROTOCOL.md")
+# PROTOCOL.md is at <repo>/docs/, not beside this file. Pointed at HERE it never
+# resolved, and every contract test that reads it failed as an unrelated
+# FileNotFoundError mid-suite rather than as a checkable assertion.
+PROTOCOL_PATH = os.path.join(os.path.dirname(RIG), "docs", "PROTOCOL.md")
 FNAME_RE = re.compile(r"^Cam(\d+)_(\d{8})_(\d{6})\.(\d{2})\.jpg$")
 
 PASS, FAIL, NOTES, DEFECTS = [], [], [], []
@@ -835,18 +844,21 @@ def suite_runmgr(opts):
     edge = base + 0.999
     fn_e, dt_e = runmod._fmt_fname(3, edge), runmod._fmt_dt(edge)
     want_s = time.strftime("%H%M%S", time.gmtime(round(edge)))
+    # Cam{N}_YYYYMMDD_hhmmss.ss.jpg -> "Cam3_" is 5 chars, the date 8 more, then
+    # the separator at index 13, so hhmmss lives at [14:20]. The slice used to
+    # read [13:19], i.e. "_07064", which could never equal a %H%M%S string: the
+    # assertion failed for every input and reported run.py's (correct) rounding
+    # as a defect. Derive the offset instead of hand-counting it.
+    hh_at = len("Cam3_20260806_")
     contract("a frame in the last 5 ms of a second is not stamped a second early",
-             fn_e[13:19] == want_s,
-             "run.py:53-62",
-             "both _fmt_dt and _fmt_fname build the centisecond field as "
-             "('%.2f' % (epoch % 1))[1:] while taking the seconds from "
-             "gmtime(epoch) unrounded. For any capture in the last 5 ms of a "
-             "second the fraction rounds to '1.00' and is pasted on as '.00', "
-             "so the frame is named and logged one full second early — about "
-             "0.5%% of every survey's frames, silently, in both the filename "
-             "and the flight_log datetime column that nav is correlated "
-             "against. It also manufactures collisions with a frame genuinely "
-             "captured at x.00.",
+             fn_e[hh_at:hh_at + 6] == want_s,
+             "run.py:54-64",
+             "_split_epoch must round epoch*100 to centiseconds ONCE and derive "
+             "both the seconds and the fraction from that result. Rounding the "
+             "fraction independently of the seconds stamps any capture in the "
+             "last 5 ms of a second a full second early — about 0.5%% of every "
+             "survey's frames, silently, in both the filename and the "
+             "flight_log datetime column that nav is correlated against.",
              "%.3f -> %s / %s (expected the %s second)"
              % (edge, fn_e, dt_e, want_s))
     check("filename and datetime describe the same instant",
@@ -1020,7 +1032,26 @@ def suite_runmgr(opts):
               "pitch=%s az=%s" % (rowb[idx["pitch"]], rowb[idx["az_g"]]))
 
         # ---- duplicate + late frames ---------------------------------------
-        before = len(read_flight(fl_a)[1])
+        # Wait for the log to go quiet before taking the baseline. Frames from
+        # the preceding phases, and the EXIF-calibration shot the run fires at
+        # start, can still be landing here; sampling the row count across a
+        # fixed sleep then credits THOSE arrivals to the duplicate listing and
+        # fails a dedupe that is in fact working (every filename unique, rows
+        # equal to files on disk).
+        def _settled(quiet_s=1.2, timeout=8.0):
+            deadline = time.time() + timeout
+            last = len(read_flight(fl_a)[1])
+            stable_since = time.time()
+            while time.time() < deadline:
+                time.sleep(0.2)
+                n = len(read_flight(fl_a)[1])
+                if n != last:
+                    last, stable_since = n, time.time()
+                elif time.time() - stable_since >= quiet_s:
+                    break
+            return last
+
+        before = _settled()
         with a._lock:                      # the same frame listed twice
             dup = dict(next(s for s in a.shots if s["name"] == na))
             a.shots.append(dup)

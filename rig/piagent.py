@@ -7,7 +7,8 @@ that is *not* the SDK:
 
     * the GPIO trigger harness  — FOCUS hold, TRIGGER firing on an absolute
       clock, and the EXPOSURE capture-edge monitor;
-    * the IMU (cam3 only)       — via rig/imu_yb.py, sampled into a ring;
+    * the IMU (whichever node    — via rig/imu_yb.py, sampled into a ring;
+      it is plugged into)
     * node health + a time probe the Jetson uses to align clocks.
 
 It speaks plain JSON over HTTP on :8081 and depends on nothing outside the
@@ -27,6 +28,13 @@ Design notes that matter:
   * The kernel edge timestamps from gpiomon are a different clock across
     libgpiod builds, so we stamp each EXPOSURE edge with wall time at read and
     keep the raw device ts only for interval math.
+  * Shots are identified, not counted. Each /gpio/fire answers with a
+    `fire_seq` and the `edge_seq` in force just before the TRIGGER, and each
+    EXPOSURE edge carries its own index plus the `fire_seq` it belongs to, so
+    the Jetson pairs a frame to the shot that produced it by identity. Pairing
+    by queue position means one fire that never exposes shifts every later
+    frame on that camera by a whole shot period, with nothing in the log to say
+    so. All of these fields are additive: an older Jetson ignores them.
 """
 
 import json
@@ -212,7 +220,7 @@ class _LineDriver:
                 return
             time.sleep(rem if rem < 0.002 else rem - 0.001)
 
-    def shot(self, focus_bcm, trigger_bcm, lead_s, pulse_s):
+    def shot(self, focus_bcm, trigger_bcm, lead_s, pulse_s, focus_after=None):
         """One frame: FOCUS leads, TRIGGER fires, both release.
 
         The camera only accepts a TRIGGER while FOCUS is already Low, but
@@ -221,7 +229,17 @@ class _LineDriver:
         light was when the run started. Asserting FOCUS a few tens of
         milliseconds ahead of each shot satisfies the camera and still lets it
         meter every frame. Both edges are register writes in this process, so
-        the lead is precise regardless of how busy the host is."""
+        the lead is precise regardless of how busy the host is.
+
+        `focus_after` is an optional callable invoked in the finally block that
+        must leave FOCUS in the state its owner wants. This shot does not own
+        FOCUS: a caller may legitimately be holding it (calibration does), and
+        forcing it Idle here used to yank that hold away while the holder's
+        bookkeeping still said "held" - after which every subsequent trigger
+        pulsed with FOCUS idle, produced no exposure, and still answered ok.
+        If it is absent or raises, FOCUS is forced Idle: never leave the line
+        asserted on the way out, because that is a permanent half-press, which
+        locks the whole property table and looks exactly like a dead camera."""
         f = self._lines.get(focus_bcm)
         t_ln = self._lines.get(trigger_bcm)
         if f is None or t_ln is None:
@@ -234,9 +252,16 @@ class _LineDriver:
             self._spin_until(t + pulse_s)
             t_ln.set_value(self.IDLE)
         finally:
-            # FOCUS must never be left asserted: that is a permanent half-press,
-            # which locks the whole property table and looks like a dead camera.
-            f.set_value(self.IDLE)
+            restored = False
+            if focus_after is not None:
+                try:
+                    focus_after()
+                    restored = True
+                except Exception as e:  # noqa: BLE001
+                    log("warn", "gpio_error",
+                        "FOCUS restore hook failed, forcing idle", err=str(e))
+            if not restored:
+                f.set_value(self.IDLE)
         return t
 
     def close(self):
@@ -273,17 +298,40 @@ class Gpio:
     # drives open-drain, and re-parks.
     PARKED_INPUTS = (BCM_FOCUS, BCM_TRIGGER)
 
+    # An `at_epoch` is a promise about a shared clock, and fire() waits for it on
+    # a CPU. Bound it in both directions so a bad promise cannot pin a core or
+    # fire a frame nobody is waiting for any more:
+    #  * the Jetson's own call times out at ~10 s, so anything further into the
+    #    future is a request whose answer can never be read - usually this node's
+    #    clock sitting minutes behind before chrony's first step. Waiting it out
+    #    fires the body long after the transect has moved on.
+    #  * an at_epoch already well in the past is a stale schedule (a queued
+    #    request, or this clock running ahead). Firing it immediately puts an
+    #    unplanned frame on the card and reports late_ms in the thousands.
+    # Both are answered with an explicit error the Jetson can count, which is
+    # also the only way a node clock this wrong ever becomes visible.
+    FIRE_MAX_FUTURE_S = 10.0
+    FIRE_MAX_PAST_S = 2.0
+
     def __init__(self):
         self.chip = GPIOCHIP
         self._lock = threading.RLock()
         self._focus_proc = None          # long-lived gpioset holding FOCUS low
         self._parkers = {}               # bcm -> Popen holding the line idle-high
         self._focus_direct = False       # FOCUS state when using the gpiod path
+        # fire() drives shared lines and must never interleave with another
+        # fire; a dedicated lock keeps that serialisation off `_lock`, which the
+        # edge monitor and /health take, so a fire waiting on its at_epoch can
+        # never stall the health endpoint or delay an EXPOSURE edge.
+        self._fire_lock = threading.Lock()
+        self._fire_seq = 0               # identity of each fire, monotonic
+        self._pending_fire = None        # (fire_seq, deadline) awaiting its edge
+        self._edge_fire = None           # fire_seq of the exposure now open
         self._interval_stop = None
         self._interval_thread = None
         self._interval_state = {"running": False, "fired": 0, "target": 0,
                                 "period_s": 0.0, "last_late_ms": None}
-        self._edges = deque(maxlen=20000)   # (epoch, edge, raw_ts, seq)
+        self._edges = deque(maxlen=20000)   # (epoch, edge, raw_ts, seq, hw, fire_seq)
         self._edge_seq = 0
         self._last_edge = {}                # edge -> last accepted timestamp
         self._bounced = 0                   # edges dropped as ring/bounce
@@ -408,6 +456,44 @@ class Gpio:
         self._park(BCM_FOCUS)
 
     # ---- TRIGGER ----------------------------------------------------------
+    def _focus_restore(self):
+        """Leave FOCUS where its owner wants it, after a shot borrowed the line.
+
+        Read live under `_lock` rather than snapshotted before the shot, so a
+        /gpio/focus release that lands mid-shot wins: re-asserting a hold the
+        operator has just dropped would leave the body half-pressed with nobody
+        holding it. Either way `_focus_direct` stays true to the wire, which is
+        what focus_held() - and every guard built on it - depends on."""
+        with self._lock:
+            self.driver.set(BCM_FOCUS, _LineDriver.ASSERT if self._focus_direct
+                            else _LineDriver.IDLE)
+
+    @classmethod
+    def _epoch_fault(cls, at_epoch):
+        """Error dict if `at_epoch` is not a schedule this node can honour.
+
+        See FIRE_MAX_* above: an out-of-range at_epoch is a clock disagreement,
+        not a schedule, so say so instead of spinning to it. Returns (epoch,
+        fault) with the epoch coerced to float; 0/absent means "now" as before."""
+        try:
+            at_epoch = float(at_epoch or 0)
+        except (TypeError, ValueError):
+            return 0.0, None
+        if at_epoch <= 0:
+            return 0.0, None
+        skew = at_epoch - time.time()
+        if -cls.FIRE_MAX_PAST_S <= skew <= cls.FIRE_MAX_FUTURE_S:
+            return at_epoch, None
+        log("error", "gpio_time",
+            "refusing implausible at_epoch - check this node's clock",
+            skew_s=round(skew, 3), at_epoch=round(at_epoch, 3))
+        return at_epoch, {
+            "ok": False, "code": 400,
+            "error": ("at_epoch is %+.3f s from this node's clock (limits "
+                      "+%.0f/-%.0f s) - node clock or schedule is wrong"
+                      % (skew, cls.FIRE_MAX_FUTURE_S, cls.FIRE_MAX_PAST_S)),
+            "clock_skew_s": round(skew, 3), "node_epoch": time.time()}
+
     def fire(self, at_epoch, pulse_ms, focus_lead_ms=0):
         if not self.available:
             return {"ok": False, "error": "no gpio on this node"}
@@ -418,12 +504,32 @@ class Gpio:
         if not focus_lead_ms and not self.focus_held():
             return {"ok": False, "error": "FOCUS not held", "code": 409}
         pulse_ms = max(1, min(int(pulse_ms), 200))
+        at_epoch, fault = self._epoch_fault(at_epoch)
+        if fault:
+            return fault
+        # One fire at a time. Two overlapping fires share FOCUS and TRIGGER, so
+        # they interleave into a single malformed pulse train that drops frames,
+        # and the second would steal the first's FOCUS. Queueing the second is no
+        # better - by the time it ran its at_epoch would be gone - so refuse it
+        # with an explicit busy error the Jetson can count against its own shot
+        # log. Note this is NOT `_lock`: the edge monitor and /health take that,
+        # and a fire may sit here for seconds waiting for its instant.
+        if not self._fire_lock.acquire(blocking=False):
+            log("warn", "gpio_busy", "fire rejected: another fire in flight")
+            return {"ok": False, "code": 409, "busy": True,
+                    "error": "another fire is in flight on this node"}
+        try:
+            return self._fire_locked(at_epoch, pulse_ms, focus_lead_ms)
+        finally:
+            self._fire_lock.release()
+
+    def _fire_locked(self, at_epoch, pulse_ms, focus_lead_ms):
         # Busy-wait the final approach so scheduling jitter does not smear the
         # fire time; sleep the coarse part to stay off the CPU.
         # Wake early enough to place the FOCUS lead before the target instant,
         # so it is the TRIGGER that lands on time, not the start of the sequence.
         lead_s = focus_lead_ms / 1000.0
-        if at_epoch and at_epoch > 0:
+        if at_epoch > 0:
             while True:
                 dt = (at_epoch - lead_s) - time.time()
                 if dt <= 0:
@@ -432,6 +538,20 @@ class Gpio:
                     time.sleep(dt - 0.015)
                 # else spin
         requested = at_epoch if at_epoch else time.time()
+        # Identity for this fire, and the edge counter as it stands immediately
+        # before the TRIGGER. Every EXPOSURE edge carries a monotonic index, so
+        # `edge_seq` lets the Jetson bound the answer by construction: this
+        # fire's exposure is the first fall edge with i > edge_seq. Pairing by
+        # queue position instead silently shifts every later frame by one shot
+        # the first time a fire produces no edge.
+        with self._lock:
+            self._fire_seq += 1
+            seq = self._fire_seq
+            edge_seq = self._edge_seq
+            # Claimed by the next fall edge (see _monitor_loop). The deadline
+            # stops a fire that never exposed from adopting an unrelated edge
+            # minutes later; trigger->exposure measures ~22 ms here.
+            self._pending_fire = (seq, time.time() + 1.0)
         if self.driver.ok:
             # Two register writes. `actual` is stamped after the line is already
             # low, so it is the real assert instant rather than the moment we
@@ -440,43 +560,86 @@ class Gpio:
             # models.
             if focus_lead_ms:
                 actual = self.driver.shot(BCM_FOCUS, BCM_TRIGGER, lead_s,
-                                          pulse_ms / 1000.0)
+                                          pulse_ms / 1000.0,
+                                          focus_after=self._focus_restore)
             else:
                 actual = self.driver.pulse(BCM_TRIGGER, pulse_ms / 1000.0)
             if actual is None:
-                return {"ok": False, "error": "trigger line unavailable"}
-            late_ms = (actual - requested) * 1000.0
-            if abs(late_ms) > 50:
-                log("warn", "gpio_late", "trigger fired late",
-                    late_ms=round(late_ms, 1))
-            return {"ok": True, "requested_epoch": requested,
-                    "actual_epoch": actual, "late_ms": round(late_ms, 2),
-                    "pulse_ms": pulse_ms, "path": "gpiod"}
-        actual = time.time()
-        self._unpark(BCM_TRIGGER)
-        cmd = _gpio(["gpioset", "--drive=open-drain", "--mode=time",
-                     "--usec=%d" % (pulse_ms * 1000), self.chip,
-                     "%d=0" % BCM_TRIGGER])
+                self._unclaim(seq)
+                return {"ok": False, "error": "trigger line unavailable",
+                        "fire_seq": seq, "edge_seq": edge_seq}
+            return self._fire_result(seq, edge_seq, requested, actual, pulse_ms,
+                                     "gpiod")
+        # Fallback path: no python3-libgpiod, so every edge is a subprocess.
+        held = self.focus_held()
+        if focus_lead_ms and not held:
+            # The gpiod path asserts FOCUS itself; this path used to ignore
+            # focus_lead_ms entirely and pulse TRIGGER with FOCUS idle, which the
+            # body simply ignores - a silent no-op frame reported as ok:true.
+            # Spawning the holder costs ~50 ms, so the lead is approximate here;
+            # a late frame beats a missing one.
+            if not self.focus(True):
+                self._unclaim(seq)
+                return {"ok": False, "error": "could not assert FOCUS",
+                        "fire_seq": seq, "edge_seq": edge_seq}
+            # The holder spawn (~50 ms) has already eaten into the lead, so wait
+            # only what is left of it - the TRIGGER should still land on
+            # at_epoch, not 50 ms behind the other camera. Never leave the body
+            # less than 40 ms of half-press: that is the shortest lead measured
+            # to produce an exposure at all.
+            rest = (at_epoch - time.time()) if at_epoch > 0 else lead_s
+            time.sleep(max(0.040, min(lead_s, rest)))
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL,
-                           timeout=pulse_ms / 1000.0 + 3)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            log("error", "gpio_error", "trigger pulse failed", err=str(e))
-            self._park(BCM_TRIGGER)
-            return {"ok": False, "error": str(e)}
-        finally_parked = self._park(BCM_TRIGGER)
-        if not finally_parked:
-            log("error", "gpio_error",
-                "TRIGGER could not be re-parked idle-high - unplug the harness "
-                "if the camera stops responding", bcm=BCM_TRIGGER)
+            actual = time.time()
+            self._unpark(BCM_TRIGGER)
+            cmd = _gpio(["gpioset", "--drive=open-drain", "--mode=time",
+                         "--usec=%d" % (pulse_ms * 1000), self.chip,
+                         "%d=0" % BCM_TRIGGER])
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL,
+                               timeout=pulse_ms / 1000.0 + 3)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                log("error", "gpio_error", "trigger pulse failed", err=str(e))
+                self._park(BCM_TRIGGER)
+                self._unclaim(seq)
+                return {"ok": False, "error": str(e), "fire_seq": seq,
+                        "edge_seq": edge_seq}
+            finally_parked = self._park(BCM_TRIGGER)
+            if not finally_parked:
+                log("error", "gpio_error",
+                    "TRIGGER could not be re-parked idle-high - unplug the "
+                    "harness if the camera stops responding", bcm=BCM_TRIGGER)
+        finally:
+            if focus_lead_ms and not held:
+                # Release only what this shot asserted, and never leave FOCUS
+                # low on the way out: a permanent half-press locks the body.
+                self.focus(False)
+        return self._fire_result(seq, edge_seq, requested, actual, pulse_ms,
+                                 "gpioset")
+
+    def _unclaim(self, seq):
+        """A fire that never pulsed must not adopt the next edge on the line."""
+        with self._lock:
+            if self._pending_fire and self._pending_fire[0] == seq:
+                self._pending_fire = None
+
+    @staticmethod
+    def _fire_result(seq, edge_seq, requested, actual, pulse_ms, path):
         late_ms = (actual - requested) * 1000.0
         if abs(late_ms) > 50:
             log("warn", "gpio_late", "trigger fired late",
                 late_ms=round(late_ms, 1))
         return {"ok": True, "requested_epoch": requested,
                 "actual_epoch": actual, "late_ms": round(late_ms, 2),
-                "pulse_ms": pulse_ms}
+                "pulse_ms": pulse_ms, "path": path,
+                # Identity, so a frame can be paired to the fire that made it
+                # rather than to whatever is next in a queue.
+                "fire_seq": seq, "edge_seq": edge_seq,
+                # This node's clock, read as the answer is built. The Jetson can
+                # difference it against its own to bound node clock offset from
+                # every shot, without a separate /timeprobe round trip.
+                "node_epoch": time.time()}
 
     # ---- interval ---------------------------------------------------------
     def interval_start(self, at_epoch, period_s, count):
@@ -485,6 +648,12 @@ class Gpio:
                 return {"ok": False, "error": "interval already running"}
             if not self.focus_held():
                 return {"ok": False, "error": "FOCUS not held", "code": 409}
+            # Same clock sanity as fire(): the loop's first frame targets
+            # `at_epoch` directly, so an implausible start would be rejected
+            # frame by frame instead of once, here, where it can be answered.
+            at_epoch, fault = self._epoch_fault(at_epoch)
+            if fault:
+                return fault
             period_s = max(0.05, float(period_s))
             self._interval_stop = threading.Event()
             self._interval_state.update(running=True, fired=0,
@@ -547,7 +716,16 @@ class Gpio:
 
     def _monitor_loop(self):
         """Long-lived gpiomon on EXPOSURE; respawn if it ever dies."""
-        fmt = "%e %s.%n"
+        # Seconds and nanoseconds are asked for as SEPARATE fields and joined
+        # here. The obvious "%s.%n" is a trap: gpiomon prints %n as a plain
+        # integer with no zero padding, so an edge 41,993,474 ns into its second
+        # comes out as "2924.41993474" and float() reads it as 0.42 s instead of
+        # 0.042 s. Every edge landing in the first 100 ms of a second is wrong,
+        # by up to 0.9 s - measured 11% of edges on this rig. That corrupts the
+        # ring's own debounce reference below, which is what decides whether a
+        # ringing harness's repeats are swallowed or handed out as real
+        # exposures.
+        fmt = "%e %s %n"
         while self._mon_run:
             # stdbuf forces gpiomon to line-buffer: it is a C program printing to
             # a pipe, which otherwise block-buffers, so infrequent EXPOSURE edges
@@ -572,7 +750,16 @@ class Gpio:
                     parts = line.split()
                     ev = parts[0] if parts else ""
                     raw = None
-                    if len(parts) > 1:
+                    if len(parts) > 2:
+                        try:
+                            # CLOCK_MONOTONIC on this kernel/libgpiod: seconds
+                            # since boot plus a separate nanosecond field.
+                            raw = int(parts[1]) + int(parts[2]) / 1e9
+                        except ValueError:
+                            raw = None
+                    elif len(parts) > 1:
+                        # Tolerate the older single-field form during a rolling
+                        # deploy, accepting that it may be mis-scaled.
                         try:
                             raw = float(parts[1])
                         except ValueError:
@@ -591,6 +778,20 @@ class Gpio:
                     # discard same-direction repeats inside the guard window.
                     # Sony specs EXPOSURE as asserted >=1 ms and it measures
                     # ~13 ms here, so 1 ms cannot swallow a genuine edge.
+                    # The kernel edge timestamp is CLOCK_MONOTONIC (seconds since
+                    # this node's boot), so it is meaningless to another machine
+                    # on its own. Convert it to wall time HERE, where the offset
+                    # can be sampled in the same breath as the edge was read, and
+                    # publish that as `epoch_hw`. It is the same instant as
+                    # `epoch` but measured by the kernel at the interrupt rather
+                    # than by Python after the pipe read - measured median 0.09 ms
+                    # of read latency on cam1 and 0.32 ms on cam2, with occasional
+                    # excursions into the hundreds of ms under load. For a stereo
+                    # pair that read latency is pure, uncorrelated skew error, so
+                    # the Jetson should prefer epoch_hw when pairing frames.
+                    hw = None
+                    if raw is not None:
+                        hw = raw + (time.time() - time.monotonic())
                     ref = raw if raw is not None else epoch
                     last = self._last_edge.get(edge)
                     if last is not None and (ref - last) < EDGE_DEBOUNCE_S:
@@ -605,9 +806,7 @@ class Gpio:
                         self._bounced += 1
                         continue
                     self._last_edge[edge] = ref
-                    with self._lock:
-                        self._edge_seq += 1
-                        self._edges.append((epoch, edge, raw, self._edge_seq))
+                    self._record_edge(epoch, edge, raw, hw)
                     if edge == "fall":
                         log("debug", "exposure_edge", "capture edge",
                             epoch=round(epoch, 4))
@@ -616,6 +815,34 @@ class Gpio:
             if self._mon_run:
                 time.sleep(1)      # brief backoff before respawn
 
+    def _record_edge(self, epoch, edge, raw, hw):
+        """Ring one accepted edge, attributed to the fire that caused it.
+
+        The identity matters as much as the instant: pairing a frame to a shot
+        by queue position means one fire that produces no edge shifts every
+        later frame on that camera by exactly one shot period, still labelled as
+        a hardware capture. A fall claims the pending fire exactly once - the
+        first fall after a TRIGGER is that trigger's exposure - and the matching
+        rise carries the same id, since it closes the same exposure. An edge with
+        no pending fire (a USB release, the body's own timer, a fire that already
+        got its edge) reports null rather than borrowing another shot's
+        identity. Best-effort by design; `edge_seq` from /gpio/fire is the exact
+        bound."""
+        with self._lock:
+            fs = None
+            if edge == "fall":
+                pend = self._pending_fire
+                if pend and time.time() <= pend[1]:
+                    fs = self._edge_fire = pend[0]
+                    self._pending_fire = None
+                else:
+                    self._edge_fire = None
+            else:
+                fs = self._edge_fire
+            self._edge_seq += 1
+            self._edges.append((epoch, edge, raw, self._edge_seq, hw, fs))
+            return self._edge_seq
+
     def monitor_running(self):
         return self._mon_proc is not None and self._mon_proc.poll() is None
 
@@ -623,9 +850,12 @@ class Gpio:
         with self._lock:
             evs = [e for e in self._edges if e[3] > since]
             nxt = self._edge_seq
+        # `fire_seq` is additive: an older Jetson ignores it and still pairs on
+        # `i`/`epoch_hw` exactly as before.
         return {"next": nxt,
-                "events": [{"i": s, "edge": ed, "epoch": ep, "raw_ts": raw}
-                           for (ep, ed, raw, s) in evs]}
+                "events": [{"i": s, "edge": ed, "epoch": ep, "raw_ts": raw,
+                            "epoch_hw": hw, "fire_seq": fs}
+                           for (ep, ed, raw, s, hw, fs) in evs]}
 
     def state(self):
         parked = self.parked()
@@ -634,6 +864,10 @@ class Gpio:
                 "monitor_running": self.monitor_running(),
                 "interval": self.interval_status(),
                 "edges_seen": self._edge_seq,
+                # Fires dispatched vs edges seen: if these stop tracking each
+                # other the harness is triggering without exposing (or the body
+                # is exposing without us), which no other field reveals.
+                "fires": self._fire_seq,
                 # An unparked camera-input line can hold the body in a permanent
                 # half-press, so the fleet view needs to see this, not just the
                 # edge count. False here is an operator-visible fault.
@@ -669,7 +903,9 @@ class Gpio:
 
 
 # ---------------------------------------------------------------------------
-# IMU — optional, cam3 only. Imported lazily so nodes without it still run.
+# IMU — optional, on whichever node it happens to be plugged into (the Jetson
+# discovers that from fleet health; nothing here assumes a node name). Imported
+# lazily so nodes without it still run.
 # ---------------------------------------------------------------------------
 class Imu:
     """Owns the IMU reader and keeps trying to (re)acquire it.
@@ -768,7 +1004,22 @@ class Imu:
         if self.reader:
             try:
                 s = self.reader.latest()
-                h["rate_hz"] = self.info.get("sample_rate_hz")
+                # The LIVE ring rate, not the probe's figure: rate_hz is what
+                # the Jetson sizes "how stale may this attitude be" against, so
+                # it has to be the rate real samples are actually published at.
+                # Fall back to the probe value only until the first second of
+                # streaming has been measured.
+                # getattr, because a node mid-rolling-deploy may still be running
+                # an older imu_yb without these; health must answer regardless.
+                h["rate_hz"] = self.reader.rate_hz() or \
+                    self.info.get("sample_rate_hz")
+                fr = getattr(self.reader, "frame_rate_hz", None)
+                h["frame_rate_hz"] = fr() if fr else None
+                # Seconds since the attitude last MOVED. A locked-up fusion
+                # keeps streaming identical numbers at full rate, so age_s stays
+                # small and nothing else here would ever notice.
+                fz = getattr(self.reader, "orientation_frozen_s", None)
+                h["orient_frozen_s"] = fz() if fz else None
                 h["age_s"] = round(time.time() - s["epoch"], 3) if s and \
                     s.get("epoch") else None
             except Exception:  # noqa: BLE001

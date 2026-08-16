@@ -1,10 +1,22 @@
 # Build output
 build/
 
-# Sony Camera Remote SDK — proprietary, not ours to redistribute.
-# Populate these from your own copy of the SDK package: make sdk
+# Sony Camera Remote SDK.
+#
+# The shared libraries are NOT committed - they are large, they are pure binary,
+# and `make sdk` stages them from your own copy of the official package.
 lib/
-include/CRSDK/
+#
+# The CRSDK *headers* ARE committed, deliberately. They are the only authoritative
+# source for property codes, enum values and their semantics, and reading them is
+# what distinguishes a real diagnosis from a guess - three separate faults on
+# 2026-08-16 were only explained by going to these headers (a 1-based caution enum
+# misread as a bitmask, an unread overheating property, an unread card-writing
+# state). Vendoring them costs 288 KB and saves hours.
+#
+# THIS REPOSITORY IS PRIVATE AND MUST STAY PRIVATE while these are in it: the SDK
+# is proprietary and licensed to us, not ours to publish. If this repo is ever made
+# public, strip include/CRSDK/ from the history first.
 
 # Python
 __pycache__/
@@ -13,3 +25,6 @@ __pycache__/
 # Runtime state (rigd writes these outside the repo, but be explicit)
 *.jsonl
 .DS_Store
+
+# Claude Code session/tooling state
+.claude/

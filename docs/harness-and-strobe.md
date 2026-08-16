@@ -1,14 +1,20 @@
-# ILX-LR1 harness ↔ XR256 strobe — leads, electrical behaviour, and the trigger chain
+# ILX-LR1 harness — leads, electrical behaviour, and the trigger chain
 
-What each lead on the ILX-LR1 power/control harness does, what the Smart Vision
-Lights XR256 strobe expects on its terminal block, and how the two are joined.
+What each lead on the ILX-LR1 power/control harness does, how `FOCUS`, `TRIGGER`
+and `EXPOSURE` behave electrically, and what the sync-speed and flash-timing
+measurements say.
+
+> **Scope.** This is the **camera harness** reference. The strobe sections that
+> once lived here covered a Smart Vision Lights XR256, which is **out of scope** —
+> the rig uses a Bolt VB-22 speedlight on a contact-closure sync port, and none of
+> the XR256's 24 V / 20 A constraints carry over. Those sections have been removed.
+> For the strobe as actually built, see **`docs/strobe-trigger.md`**.
 
 **Sources**
 
 | | |
 |---|---|
-| Sony *ILX-LR1 Help Guide*, `5-055-988-22(1)`, 437 pp | `cameraarts/docs/other/BQ202484M.pdf` — the copy here is the **French** edition; wording below is translated, values are verbatim. Sections: connector spec pp. 414–416, making your own cable p. 417, connection examples pp. 28–29, power p. 70, specifications p. 426. |
-| Smart Vision Lights *XR256 High-Speed Strobe Light* data sheet, Rev. 2020/06/15, 7 pp | `cameraarts/docs/XR256_Datasheet-2.pdf` |
+| Sony *ILX-LR1 Help Guide*, `5-055-988-22(1)`, 437 pp | connector spec pp. 414–416, making your own cable p. 417, connection examples pp. 28–29, power p. 70, specifications p. 426. |
 | Camera Remote SDK v2.02.00 support matrix | `CrSDK_API_Reference_v2.02.00/_static/device_property_list.csv` |
 
 ---
@@ -28,10 +34,10 @@ The SDK is no help either — every flash property is unsupported on this body:
 | `CrDeviceProperty_WirelessFlash` | — |
 | `CrDeviceProperty_SynchroterminalForcedOutput` | — |
 
-**One path exists: harness pin 6, `EXPOSURE`.** And it does not plug into the
-XR256 directly — the camera output sinks and is active-low, the strobe's
-preferred input sources and is rising-edge. §5 is the interface that reconciles
-them.
+**One path exists: harness pin 6, `EXPOSURE`** — an open-drain, active-low output
+that sinks while the shutter is open. Whether the strobe is driven from it, or
+from a scheduled GPIO pulse that sees both cameras, is decided in
+`docs/strobe-trigger.md`; the rig uses the scheduled GPIO pulse.
 
 ---
 
@@ -188,7 +194,7 @@ Sony's sizing rule for the external pull-up:
 Read back, the implied model is ~1 kΩ of sink on-resistance, so the asserted low
 sits at `A × 1/(B+1)` and must land below the receiver's V<sub>IL</sub>.
 
-**Worked example, Jetson GPIO input** (A = 3.3 V, V<sub>IL</sub> ≈ 0.8 V):
+**Worked example, Pi GPIO input** (A = 3.3 V, V<sub>IL</sub> ≈ 0.8 V):
 
 | Pull-up B | Low level `A/(B+1)` | OK? |
 |---|---|---|
@@ -374,192 +380,7 @@ designs. Do not trust log-interpolation of a flash-duration range; measure it.
 
 ---
 
-## 5. Strobe side — XR256, and joining the two
-
-**Smart Vision Lights XR256 High-Speed Strobe Light, OverDrive™.**
-
-### Specifications
-
-| | |
-|---|---|
-| Supply | **24 V DC ±5 %** |
-| Input current | **max 20 A for max 15 ms** |
-| Pulse energy | up to **2000 W** (288 mm² of die — 144 × 2 mm² — at 180 A pulsed die current) |
-| Duty cycle | **max 2 %**, preprogrammed |
-| Trigger edge | **fires on the leading edge of the pulse** |
-| Max rate | **5000 strobes/s** |
-| Pulse-initiated durations | 8 dial settings: **20, 50, 100, 250, 500, 750, 1000 µs**, plus `Auto` |
-| Pulse-following | tracks the pulse width, **max 40 ms** |
-| Time Delay ON | 1 µs — Full ON |
-| Connection | 5-position screw terminal block (plug included) |
-| Ambient | **0–40 °C** |
-| **IP rating** | **IP50** |
-| Indicators | green = power · yellow = over-temp/cool-down · red = strobe firing |
-| Protection | SafeStrobe™ — shuts down above 80 °C die temperature |
-| Weight | ~1820 g · **8× M4 through-holes + 8 T-slots (M5)** for mounting |
-| Optics | 14° / W30 / W50 / W80 lenses · WHI, 470, 530, 625, 850, 940 nm |
-
-Output, white 5700 K: **14° lens** → 130 mm pattern and 700,000 lux at 500 mm.
-**W80 lens** → 280 mm pattern and 177,000 lux at 500 mm.
-
-### Terminal block — two modes
-
-| Pin | Pulse-Initiated | Pulse-Following |
-|---|---|---|
-| 1 | `+24 V DC` | `+24 V DC` |
-| 2 `NPN` | not used | **Pulse Following (sinking)** |
-| 3 `PI` | **Pulse Initiated** | not used |
-| 4 `PNP` | not used | **Pulse Following (sourcing)** |
-| 5 `GND` | Ground | Ground |
-
-- **Pulse-Initiated:** input **must be a sourcing PNP** signal — 4–24 V DC applied
-  to pin 3, **rising edge**. Flash length comes from the dial, not the pulse.
-- **Pulse-Following:** sinking NPN on pin 2 *or* sourcing PNP on pin 4. The light
-  tracks the pulse width. Dial is inactive in this mode.
-
-### The mismatch, stated plainly
-
-The camera's `EXPOSURE` pin is **open-drain, sinking, active-LOW**. The strobe's
-good mode wants **sourcing, active-HIGH, rising-edge**. They are electrically
-opposite. So:
-
-**Option A — Pulse-Initiated (recommended).** Needs an inverting, sourcing,
-isolating buffer between the two. §5.1.
-
-- Flash duration is decoupled from exposure — **20 µs kills motion blur**, which
-  is the entire reason for a strobe on a moving platform.
-- Duty cycle becomes a non-issue (see below).
-
-**Option B — Pulse-Following, "fire for the duration of the shutter-open
-signal".** This is the intuitive plan, and the XR256 genuinely supports it — but
-note **it is pin 2, not pin 4**, that the camera can drive. Pin 4 is the
-*sourcing* pulse-following input; `EXPOSURE` sinks, so only the **pin 2 NPN
-sinking** input matches without an inverting driver. Even then, reject it:
-
-1. The light is on for the **whole** exposure → blur is set by shutter speed, and
-   the strobe buys nothing over a continuous lamp.
-2. Max 40 ms strobe — exposures longer than 1/25 s are outside spec.
-3. The 2 % duty cycle caps frame rate brutally, because `ST` is now the whole
-   exposure:
-
-   | Exposure (`ST`) | Max rate `0.02/ST` |
-   |---|---|
-   | 40 ms (spec max) | 0.5 /s |
-   | 33 ms (1/30) | 0.6 /s |
-   | 16.7 ms (1/60) | 1.2 /s |
-   | 8 ms (1/125) | 2.5 /s |
-   | 4 ms (1/250) | 5 /s |
-
-4. `EXPOSURE` is floored at **≥1 ms** and starts **~4 ms late** (§4), so even as
-   a "duration" signal it is not faithful — at short exposures the light would
-   be on *longer* than the sensor was open.
-5. It exposes the camera's open-drain to the XR256's 24 V input domain, and
-   **Sony publishes no absolute-maximum voltage for the `EXPOSURE` pin.**
-
-> **Measured 2026-08-14: XR256 pin 2 idles at 24 V.** The sinking input has an
-> internal pull-up to the 24 V rail, so this is no longer a theoretical risk —
-> a direct connection puts 24 V on the camera's open-drain whenever it is not
-> asserting, on a body whose own supply maxes at 18 V. **Never wire `EXPOSURE`
-> to pin 2 directly.** Sony's formula also caps how far the camera could drag
-> that line even if it survived: `24/(B+1)` = 2.18 V at a 10 kΩ pull-up, 4.2 V
-> at 4.7 kΩ, 7.5 V at 2.2 kΩ — only the weakest is plausibly below an industrial
-> input's threshold.
->
-> *Still to measure:* pull-up stiffness. Put 1 kΩ from pin 2 to GND and read the
-> voltage across it — ~2 V means ≈11 kΩ (weak, resistive), ~10 V means ≈1.4 kΩ
-> (stiff, likely an opto LED in series). That sets the CTR the interface needs.
-
-By contrast, Pulse-Initiated decouples the two, and the duty cycle stops
-mattering:
-
-| Dial (`ST`) | Max rate `0.02/ST` | vs. camera's 5 fps |
-|---|---|---|
-| 20 µs | 1000 /s | 200× headroom |
-| 250 µs | 80 /s | 16× |
-| 1000 µs | 20 /s | 4× |
-
-### 5.1 The interface — opto-isolated, inverting, sourcing
-
-One optocoupler does all three jobs at once:
-
-```
-  CAMERA DOMAIN (10–18 V, camera GND)      │  STROBE DOMAIN (24 V, strobe GND)
-                                           │
-  DC IN+ (pin 3) ──[ R ]──▶│──┐  opto LED  │   +24 V ──── collector
-                              │            │                  │
-  EXPOSURE (pin 6) ───────────┘            │              emitter ──▶ XR256 pin 3 (PI)
-     sinks during exposure                 │              (sources 24 V on exposure)
-                                           │   XR256 pin 5 GND ── strobe supply −
-```
-
-- `EXPOSURE` goes low → camera sinks the LED current → opto conducts → 24 V is
-  **sourced** into pin 3 → rising edge → strobe fires for the dial duration.
-- Inversion, level translation and isolation, all in one part.
-- The camera side is powered from the camera's own `DC IN+` and returns through
-  its own ground, so Sony's grounding rule is satisfied with **no tie between the
-  camera and the 24 V strobe domain** — which is the right answer next to a
-  20 A pulsed load.
-
-**The same opto serves either strobe mode** — build one board, pick the mode with
-a jumper, and let the bench decide:
-
-| Mode | Opto output wiring |
-|---|---|
-| **Pulse-Initiated** (pin 3) | high-side switch: collector → +24 V, emitter → pin 3 |
-| **Pulse-Following** (pin 2) | low-side switch: collector → pin 2, emitter → strobe GND |
-
-Either way the opto needs **V<sub>CEO</sub> ≥ 24 V** (most parts are 30–70 V) and
-enough CTR to sink pin 2's measured pull-up current.
-
-**Two things to get right:**
-
-- **Sink current.** If the ~1 kΩ on-resistance inferred in §4 is real, 10 mA of
-  LED current would drop 10 V across the camera's output. Budget **≤1–2 mA** and
-  use a high-CTR or logic-output opto. Scope the actual low level.
-- **Edge speed.** Trigger jitter, not pulse width, is what matters here — the
-  dial sets the flash length. A garden-variety PC817 has ~4 µs of rise/fall,
-  which is comparable to a 20 µs flash. Use a **fast logic-output opto (6N137
-  class)** if the flash has to sit at a repeatable offset inside the exposure.
-
-### 5.2 Timing and duty-cycle budget
-
-`EXPOSURE` is Low for **≥1 ms**; the flash is **≤1 ms** and starts on the leading
-edge, so the flash always lands inside the exposure window. **But** the dial's
-1000 µs maximum equals the stated 1 ms minimum exactly — no margin. Keep the dial
-at **≤500 µs** unless a scope says otherwise.
-
-Duty cycle, `D = ST × SR`, ceiling 2 %:
-
-| Strobe time | Camera rate | Duty | Headroom |
-|---|---|---|---|
-| 1000 µs | 5 fps (harness) | 0.5 % | 4× |
-| 1000 µs | 8 fps (burst Hi+) | 0.8 % | 2.5× |
-| 250 µs | 5 fps | 0.125 % | 16× |
-| 1000 µs | **20 fps** | 2 % | **ceiling** |
-
-The strobe tops out at 5000 strobes/s; the camera at 5–8. **The camera is the
-bottleneck by three orders of magnitude — duty cycle never binds in this rig.**
-
-### 5.3 Two things that will shape the mechanical design
-
-- **IP50.** Dust-protected, *no* water ingress protection whatsoever. It must
-  live inside a pressure housing behind an optical port, and the port's
-  transmission at the chosen wavelength becomes part of the light budget.
-- **Heat.** 2000 W pulses inside a sealed housing, rated ambient 0–40 °C, with
-  SafeStrobe cutting out at 80 °C die temperature. Duty cycle is generous here
-  but conduction to the housing is not optional.
-
-### 5.4 Wavelength — pick for the water, not the eye
-
-Available as WHI, 470, 530, 625, 850, 940 nm. In water, **470 nm (blue) and
-530 nm (green) penetrate; 625 nm red is absorbed within roughly a metre** and
-850/940 nm IR essentially at once. For a colour survey camera, white or 530 nm;
-for maximum range, 470 nm. Lens choice is a straight trade of pattern against
-intensity — 14° gives ~4× the lux of W80 over ~1/4 the diameter at 500 mm.
-
----
-
-## 5.4b Measured inter-camera skew — stopwatch ground truth
+## 5. Measured inter-camera skew — stopwatch ground truth
 
 *2026-08-14, two ILX-LR1 bodies on separate Pi nodes, one running stopwatch in
 both frames. This needs no clock discipline: the stopwatch is a shared reference,
@@ -596,7 +417,7 @@ significant.
 
 ---
 
-## 5.5 Triggering a second camera — do not daisy-chain
+## 6. Triggering a second camera — do not daisy-chain
 
 Sony does describe `EXPOSURE` as a shooting-trigger output ("send a shooting
 trigger signal (EXPOSURE) to the drone"), so using camera 1 to trigger camera 2
@@ -621,7 +442,7 @@ edge, so both carry the same ~20 ms lag and differ only by unit-to-unit
 variation:
 
 ```
-Jetson GPIO ─┬─▶ cam1 FOCUS/TRIGGER
+Pi GPIO ─┬─▶ cam1 FOCUS/TRIGGER
              └─▶ cam2 FOCUS/TRIGGER          same edge, same ~20 ms lag
 ```
 
@@ -631,10 +452,15 @@ active-low, so "both exposing" is *both pins low* — which is precisely a
 
 - **AND-logic:** output goes high only when both cameras are mid-exposure.
 - **Inversion:** active-low in, active-high out.
-- **Sourcing drive:** a push-pull high output is exactly what the XR256's
-  Pulse-Initiated pin 3 wants (4–24 V sourcing, rising edge).
+- **Sourcing drive:** a push-pull high output is what a sourcing, rising-edge
+  strobe input wants.
 
-Feed the NOR output through the opto/FET stage of §5.1 into pin 3.
+> **Superseded in the rig as built.** The NOR gate existed to answer "fire only
+> when BOTH cameras are exposing" in hardware. The scheduled-GPIO topology answers
+> it in software instead — the Jetson picks one target instant, both nodes fire
+> against it, and the strobe is scheduled at that same instant — so no NOR gate is
+> needed. See `docs/strobe-trigger.md` §4. The reasoning below on **not** wiring
+> the two `EXPOSURE` pins together still stands and is worth reading.
 
 > **Do not wire the two `EXPOSURE` pins together.** They are open-drain, so
 > tying them to a shared pull-up gives a wired-OR of the pull-downs — the line
@@ -657,7 +483,7 @@ to be. Measure both `EXPOSURE` lines on a two-channel scope against a common
 
 ---
 
-## 6. Building the camera harness
+## 7. Building the camera harness
 
 | Ref | Part | Maker / number |
 |---|---|---|
@@ -677,25 +503,38 @@ before pulling, and pull the connector body, not the cable.
 
 ---
 
-## 7. The rig, end to end
+## 8. The rig, end to end
 
 Sony's own documented topology splits the interfaces by role — power/control
 connector for power, `FOCUS`, `TRIGGER` and `EXPOSURE`; micro HDMI for live
-view; USB Type-C for SDK control. Mapped onto the Jetson:
+view; USB Type-C for SDK control.
+
+> **Updated.** This section originally drove the harness from the Jetson. The rig
+> as built puts a Raspberry Pi at each camera: the Jetson schedules one shared
+> absolute instant and each Pi busy-waits to it on a chrony-disciplined clock
+> (~85 µs RMS), so the GPIO lines are local to each node. See `docs/PROTOCOL.md`.
+
+Per camera node:
 
 ```
-  Jetson GPIO out ──▶ FOCUS   (pin 4)   assert first, hold Low
-  Jetson GPIO out ──▶ TRIGGER (pin 5)   pulse Low to fire, ≤5 fps
+  Pi GPIO BCM17 ──▶ FOCUS   (pin 4)   assert ~120 ms ahead, per shot, then release
+  Pi GPIO BCM27 ──▶ TRIGGER (pin 5)   pulse Low to fire
                                           │
                                     camera exposes
                                           │
-  EXPOSURE (pin 6) ─┬─▶ opto ─▶ XR256 pin 3 (PI)   24 V sourced, rising edge
-                    │                              → 20–1000 µs flash
-                    └─▶ 10 kΩ to 3.3 V ─▶ Jetson GPIO in
-                                          hardware capture timestamp
+  EXPOSURE (pin 6) ──▶ BCM22 (bias pull-up, gpiomon)
+                                    hardware capture timestamp
 
-  12 V rail ──▶ camera pins 3 / 2   ≥40 W, camera grounds tie at pin 2 only
-  24 V rail ──▶ XR256 pins 1 / 5    stiff, 20 A for 15 ms, own ground
+  PoE ──▶ Pi;  12 V ──▶ camera pins 3 / 2   camera grounds tie at pin 2 only
+```
+
+Strobe, cam1 only — a Bolt VB-22 on its own isolated battery, fired from a
+scheduled GPIO pulse rather than off `EXPOSURE`, so it is placed against the
+instant BOTH cameras expose at:
+
+```
+  Pi GPIO BCM26 (open-drain, header pin 37) ──▶ sync CENTRE
+  Pi GND        (header pin 39)             ──▶ sync SHELL
 ```
 
 Four wins over the current USB-only design:
@@ -715,54 +554,3 @@ destination, focus/zoom on the PZ lens and image transfer all stay on USB. The
 harness is added underneath as the timing-critical path.
 
 ---
-
-## 8. What the strobe does *not* offer, and what is still unknown
-
-**The strobe cannot be a master — it has no outputs at all.** The terminal block
-is +24 V, `NPN`, `PI`, `PNP`, GND: **three inputs**, power and ground. Nothing
-comes *out* except light. So "strobe triggers the camera" is not a design choice
-to weigh, it is physically unavailable.
-
-The timing forbids it independently, which is worth knowing because it applies to
-any light, not just this one. The strobe fires **20 µs** after its edge; the
-camera exposes **~24 ms** after its edge (§4). Whoever leads absorbs that gap —
-camera-leads means the strobe waits 20 µs against a *measured* `EXPOSURE` signal,
-while strobe-leads would need the camera's shutter predicted 24 ms in advance and
-would otherwise return black frames. **The fast device waits on the slow one.**
-
-(Free-running the strobe in `Auto` and phase-locking the camera to it is a real
-technique elsewhere, but not here: open-loop against a lag whose jitter is
-unspecified, no feedback path, and `Auto`'s period is a mechanical dial with no
-readback. Drift shows up as black frames with nothing to diagnose it.)
-
-**No control channel either.** The XR256's only input is the trigger. Power level
-is set by the **mechanical dial and the lens**, not remotely; there is no serial,
-no RS-485, no CAN, no digital dimming. Feedback is three panel LEDs — green
-power, yellow over-temp, red firing — with **no electrical output**.
-Consequences:
-
-- No closed-loop exposure control. The only remote levers are camera-side (ISO,
-  aperture, shutter). Plan for that in `ilxctl`.
-- **SafeStrobe over-temp is invisible to software.** If the light drops into
-  cool-down mid-survey, nothing tells the Jetson; frames simply go dark. Worth
-  either watching the yellow LED with a photodiode or asking SVL whether a fault
-  output exists on a variant.
-
-**Still to pin down** — each needs a measurement or a vendor answer, not a
-document:
-
-1. **XR256 `PI` input current and thresholds.** The sheet gives only "sourcing,
-   4–24 V DC". Needed to size the opto output stage. (Pin 2's *open-circuit*
-   voltage is now measured at 24 V — see §5; its pull-up stiffness is not.)
-2. **ILX `EXPOSURE` absolute-maximum voltage and sink current.** Unpublished.
-   The measured 24 V on the strobe side makes this the highest-stakes unknown in
-   the document — assume the pin is fragile and keep it optically isolated.
-3. ~~**Where `EXPOSURE` stops tracking the true open-sensor window** as shutter
-   speed rises.~~ **Answered §4.1: 1/200 s**, mechanical shutter — banding absent
-   at 1/200, present at 1/250, curtain transit 4.4–4.7 ms measured three ways.
-   *Still open:* whether the electronic shutter moves that boundary.
-4. **"Time Delay ON: 1 µs — Full ON"** — the sheet lists this parameter without
-   explaining it. Ask SVL whether it is an adjustable trigger delay.
-5. **Measured trigger-to-light latency and jitter.** Not specified anywhere.
-6. **Optical port transmission** at the chosen wavelength, and housing thermal
-   path for the strobe.

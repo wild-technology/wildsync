@@ -39,8 +39,25 @@ provision_node() {
   ssh ubuntu@"$ip" "bash -s" <<REMOTE
 set -uo pipefail
 echo $USBFS_MB | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb >/dev/null
+# Persist it on the KERNEL COMMAND LINE, not in modprobe.d. usbcore is built
+# into the Pi kernel rather than loaded as a module, so /etc/modprobe.d/usbfs.conf
+# is never read and the setting silently reverted to the 16 MB default on every
+# reboot - taking PC image transfer with it, while the camera still connects,
+# still answers property reads and still writes to its own card. That failure
+# looks exactly like a broken camera and cost a session to find.
 echo "options usbcore usbfs_memory_mb=$USBFS_MB" | \
   sudo tee /etc/modprobe.d/usbfs.conf >/dev/null
+CMDLINE=/boot/firmware/cmdline.txt
+if [ -f "\$CMDLINE" ]; then
+  if ! grep -q "usbcore.usbfs_memory_mb=" "\$CMDLINE"; then
+    sudo sed -i "s/\$/ usbcore.usbfs_memory_mb=$USBFS_MB/" "\$CMDLINE"
+    echo "  added usbcore.usbfs_memory_mb=$USBFS_MB to \$CMDLINE (takes effect next boot)"
+  else
+    sudo sed -i "s/usbcore.usbfs_memory_mb=[0-9]*/usbcore.usbfs_memory_mb=$USBFS_MB/" "\$CMDLINE"
+  fi
+else
+  echo "  WARNING: \$CMDLINE not found - usbfs setting will NOT survive a reboot"
+fi
 # One master clock for the rig. Public NTP costs milliseconds of jitter and,
 # worse, disciplines a node to a different reference than its stereo partner -
 # that difference lands straight in the inter-camera skew.
@@ -81,7 +98,7 @@ sudo cp /tmp/piagent.service /etc/systemd/system/piagent.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now piagent
 sudo systemctl restart ilxctl 2>/dev/null || \
-  echo "  note: ilxctl.service not installed here — see docs/HANDOFF.md"
+  echo "  note: ilxctl.service not installed here — see docs/AI-HANDOFF.md"
 sleep 4
 echo "  ilxctl: $(systemctl is-active ilxctl)   piagent: $(systemctl is-active piagent)"
 REMOTE
