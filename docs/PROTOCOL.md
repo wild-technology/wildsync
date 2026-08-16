@@ -115,9 +115,17 @@ online camera — the cameras are never controlled individually:
 
 ```
 desired = { aperture, shutter, iso, expcomp, drive,
-            focus_mode, focus_position, zoom_setting, zoom_position,
-            filetype, imagesize, quality, transsize, store_dest }
+            focus_mode, filetype, imagesize, transsize, store_dest }
 ```
+
+**What is deliberately NOT in it, and must not be added:** `focus_position`,
+`zoom_setting`, `zoom_position`. Lens encoder parity between the two bodies is
+unmeasured (`docs/future-tests.md` §1), so pushing one body's encoder count to
+the other could silently change the stereo pair's interior orientation. They
+stay per-camera, are exposed read-only per node in `/api/fleet`
+(`focus_pos`, `zoom_pos`, `focus_mode_label`, `zoom_setting_label`) so a
+mismatch is at least visible, and **the UI must never offer "apply focus to
+fleet"**. Promotion requires the decision rule in future-tests §1 to pass first.
 
 A reconcile loop (every 3 s, and once immediately after any reconnect or user
 change) does, per online node: read `/api/status`, diff each field against
@@ -125,11 +133,69 @@ change) does, per online node: read `/api/status`, diff each field against
 re-read to confirm. This makes settings **independent of the node's last boot
 or last command** — a camera that rebooted to defaults, or was nudged by hand,
 is pulled back to `desired` automatically. A field that will not converge after
-N tries raises a `settings_divergent` alert naming node+field, and the UI marks
-that camera. `desired` persists to `~/rig/desired.json` so a rigd restart keeps
-the fleet's agreed state. User "set" actions mutate `desired`, never a single
-camera. Convergence status per node is exposed so the UI can show "synced ✓ /
-converging… / divergent ✗".
+2 consecutive passes raises a `settings_divergent` alert naming node+field, and
+the UI marks that camera; the alarm repeats only when the diverged field SET
+changes, or after 300 s. `desired` persists to `~/rig/desired.json` so a rigd
+restart keeps the fleet's agreed state. User "set" actions mutate `desired`,
+never a single camera — with exactly one exception, the staged preview below.
+Convergence status per node is exposed so the UI can show "synced ✓ /
+converging… / divergent ✗ / PREVIEW".
+
+Per-node convergence object:
+```
+{synced: true|false|null, diverged:[field…], unsettable:[field…],
+ blind_errors:{field: "the body's own error text"}, last_check: epoch,
+ preview: true, preview_fields:[field…]}      # last two only while pinned
+```
+
+**Fields with no readback.** `filetype`, `imagesize`, `transsize` and `expcomp`
+are settable over USB but appear nowhere in ilxctl's `/api/status`, so
+convergence tracks them against a per-node cache of what was last pushed. Three
+rules make that cache honest: it is cleared on every `OFFLINE→CAM_CONNECTED`
+transition, cleared whenever a *readable* field is found reverted (a body can
+power-cycle between two polls), and **never** written for a push that failed or
+that never reached the body. A refused blind field is reported in
+`convergence.diverged` with the body's error in `blind_errors` — it is invisible
+to the readback check by construction, and a body that silently rejects
+`filetype` means the two cameras record in different formats.
+
+**Body-menu-only properties.** `storeDest` and `pcsave` report
+`enableFlag=DisplayOnly` on these bodies and cannot be set over USB. They appear
+in `convergence.unsettable` (alarm kind `settings_unsettable`, raised once per
+state change) and read-only in the UI.
+
+**Validation.** `POST /api/settings` validates every value before it can enter
+`desired`: type, range, the Sony encoding (shutter `num`/`den` both ≥ 1), and —
+where the primary camera publishes a choice list — membership of that list.
+Rejections are returned to the caller and journalled as `settings_rejected`;
+nothing rejected is ever persisted. An unvalidated value (e.g. a cleared input
+box sending ISO 0) used to persist to `~/rig/desired.json`, survive every
+restart, and re-push to both bodies every 3 s forever.
+
+### Staged preview — "Cam1 previews before the fleet deploys"
+
+The one place a single camera is set on purpose. `POST /api/settings/preview`
+applies pending EXPOSURE values (`aperture`, `shutter`, `iso`, `expcomp` — never
+focus or zoom) to the **primary** camera only, leaves `desired` untouched, and
+**pins** that node so the reconcile loop does not revert it. `commit` promotes
+the staged values into `desired` and converges the fleet; `discard` drops them
+and re-converges the previewed camera immediately.
+
+While a pin is held the two bodies are **intentionally mismatched**, so every
+pair shot in that window is unusable. The pin is therefore self-healing in four
+independent ways:
+
+| release | why |
+|---|---|
+| expires after **180 s** (`PREVIEW_TTL_S`) | a forgotten preview cannot cost more than one TTL |
+| dropped when `desired` changes | the proposal is stale the moment the fleet moves |
+| dropped when a run starts | a transect must never record a mismatched pair |
+| never persisted | a rigd restart always comes up unpinned |
+
+It is also loud while held: the node's convergence reports `preview:true` (never
+`synced`), a `preview_pinned` anomaly fires, the UI outlines that camera's live
+view with a PREVIEW badge and the pending-vs-live diff, and pre-flight **blocks**
+a run start until it is deployed or discarded.
 
 ## Observability & AI live-correction hooks
 
@@ -138,11 +204,20 @@ Every service writes a structured event journal (JSONL), one object per line:
 {ts, node, sev, kind, msg, ctx{...}}
 ```
 `sev` ∈ debug|info|warn|error|critical. `kind` is a stable slug
-(`node_transition`, `reconnect`, `settings_divergent`, `capture_fail`,
+(`node_transition`, `reconnect`, `settings_divergent`, `settings_unsettable`,
+`settings_rejected`, `settings_preview`, `capture_fail`,
 `pull_fail`, `pull_retry`, `gpio_late`, `sync_skew`, `sync_degraded`,
 `orphan_fire`, `frames_missing`, `calibration_missing`, `timebase`,
 `jitter_high`, `imu_stall`, `nav_stale`, `exif_offset`, `disk_low`,
-`sdk_error`, …). Never log secrets.
+`runs_disk_low`, `card_write_stuck`, `camera_overheating`, `pc_control_lost`,
+`preview_pinned`, `run_recover`, `lifecycle`, `sdk_error`, …). Never log secrets.
+
+`~/rig/rigd.jsonl` is capped at **16 MB** with exactly one previous generation
+(`rigd.jsonl.1`). It is written from every thread in the process, so the writer
+tolerates both `OSError` (disk full, read-only) and `ValueError` (a per-run
+`events.log` closed underneath it at run stop) — an escaping exception there
+kills the thread that was reporting the fault, and when that thread is a
+NodeMonitor the fleet silently stops being watched.
 
 Run-level alert kinds and what each one means:
 
@@ -157,6 +232,20 @@ Run-level alert kinds and what each one means:
 | `calibration_missing` | a GPIO-armed camera has no trigger-latency measurement of its own and is firing on the fleet median |
 | `timebase` | the master clock changed mid-run; the run keeps its start-of-run base |
 
+Fleet/hardware alert kinds:
+
+| kind | raised when |
+|---|---|
+| `runs_disk_low` | the **Jetson** volume holding `~/rig-runs` is below 5 GB. This is the volume every transect is written to; a node's `disk_free_mb` is that Pi's PC-save spool and says nothing about it. When it fills, each frame write raises OSError and that frame is **never retried** — no flight_log row, no nav/IMU correlation |
+| `card_write_stuck` | `slotWriting` has read `WRITING` continuously for >30 s (critical at >120 s). One frame wedged in the body's write buffer locks the whole property table, stops PC delivery and wedges ilxctl **while `slotStatus` still reads OK** — do not trust slotStatus to catch it |
+| `camera_overheating` | `overheatingLabel` is `pre-overheat` (warn) or `OVERHEATING` (critical); the body shuts itself down mid-transect |
+| `pc_control_lost` | `priorityKeyLabel` reads `Camera position` — PC Remote priority was taken back by the body, so writes are refused and PC save stops delivering. Masquerades as an SDK bug |
+| `preview_pinned` | a settings preview is being held on one camera, so the pair is not matched |
+
+Every anomaly carries `sev: "bad"|"warn"` alongside `{kind, node, since,
+evidence, suggested_action}`; the UI renders that field rather than pattern-
+matching the kind's spelling.
+
 rigd exposes, for both humans and an autonomous agent:
 - `GET /api/events?since=<seq>&sev=<min>` → `{next, events:[...]}` — cursor-based,
   never blocks, bounded page. The AI watcher polls this.
@@ -170,6 +259,65 @@ rigd exposes, for both humans and an autonomous agent:
   flapping. Each has {kind, node, since, evidence, suggested_action}.
 - Log files under the run dir (`events.log` human, `run.json` machine) and a
   rolling `~/rig/rigd.jsonl` across runs.
+
+`/api/diag` also carries `storage:{runs_dir, jetson_free_mb,
+low_threshold_mb}` and `/api/fleet` carries `jetson_free_mb` +
+`jetson_disk_low_mb`, so the capacity of the volume the survey is written to is
+visible before a run rather than after it fails.
+
+Per-node fields in `/api/fleet` (beyond exposure/battery/convergence):
+`slot_status`, `slot_writing` + `slot_writing_label`, `overheating` +
+`overheating_label`, `live_view` + `live_view_label`, `priority_key_label`,
+`store_dest` + `store_dest_label`, `writable{}`, `filetype`/`imagesize`/
+`transsize` (null on real bodies — no readback), and the read-only per-camera
+lens readings `focus_mode`, `focus_mode_label`, `focus_pos`, `zoom_pos`,
+`zoom_setting_label`.
+
+### rigd HTTP API (Jetson, :9090)
+
+Settings:
+- `GET  /api/settings` → the desired vector plus `_auto` and `_preview`
+- `POST /api/settings` `{field:value,…}` → `{ok, applied{}, rejected{field:why}}`
+- `GET  /api/settings/preview` → `{active}` | `{active, node, pending{},
+  desired{}, since, expires_at, expires_in_s}`
+- `POST /api/settings/preview` `{aperture?,shutter?,iso?,expcomp?,node?}` →
+  `{ok, node, preview{}, failed{}, rejected{}}` — primary only, `desired`
+  untouched, node pinned
+- `POST /api/settings/commit` → promote the staged values into `desired`,
+  release the pin, converge the fleet
+- `POST /api/settings/discard` (alias `/api/settings/revert`) → drop them and
+  re-converge the previewed camera
+- `POST /api/settings/auto` `{on}`, `POST /api/ev` `{steps}`,
+  `POST /api/reconcile`
+- `POST /api/focus/mode` `{mode}` → routed through `desired` (it is fleet
+  state), returns `{ok, applied, rejected}`. `POST /api/focus/drive|position`
+  and `/api/zoom/drive|position|setting` fan out to the connected cameras and
+  are **not** converged or persisted — per-camera by design.
+
+Transect browser (read-only; the runs tree is never written by these):
+- `GET /api/runs?limit=<n≤200>` → `{root, total, runs:[{run_id, label, started,
+  nodes, cams, frames, final, interrupted, time_source, skew_ms_max,
+  pulled{}, failed{}}…]}`, newest first
+- `GET /api/run/detail?id=<run_id>` → the run.json header, `per_camera{cam:
+  {rows, untimed_rows, files, first, last, sources{}, truncated}}` and
+  **`pairs`** — the stereo-completeness view:
+  `{cams, shots, complete, incomplete, tolerance_s, gaps:[{i, epoch, have[],
+  missing[], files{}, spread_ms}…], gaps_truncated, strip, recent[]}`.
+  Shots are formed by grouping every camera's flight_log rows within
+  `tolerance_s` (≤0.75 s, or interval/2). `strip` is one character per shot,
+  oldest first: `.` = every camera present, a digit = how many were missing.
+- `GET /api/run/frame?id=&cam=&name=` → image bytes from the run directory
+- `GET /api/run/flight_log?id=&cam=` → that camera's `flight_log.csv` verbatim
+
+**Path safety.** `id`, `cam` and `name` come from the browser and are validated
+twice: a strict character class (`[A-Za-z0-9][A-Za-z0-9._-]*`, so no separator,
+no leading dot, no `..`, no absolute path) and a `realpath` containment check
+against `~/rig-runs`, which also defeats a symlink planted inside a run folder.
+Frames additionally require an image extension. Everything is bounded —
+≤200 runs listed, ≤50 000 flight_log rows and 32 MB parsed per camera, ≤500 gaps
+enumerated (the counts stay exact), ≤64 MB per frame — and run details are
+cached on the mtimes of the files they were built from, because the UI polls
+this during a live survey on the host that is writing the frames.
 
 The intent: an AI agent (or the user) can poll `/api/diag` + `/api/anomalies`
 in the field, see what's wrong with evidence, and correct — restart a node,
@@ -212,6 +360,17 @@ runs/260815_1930_transect-01/
   cam3/ …
 ```
 
+**Lifecycle.** `rigd` finalises an active run on SIGTERM (systemctl
+stop/restart), on SIGINT, and on any clean exit: `Rig.stop()` drains the pull
+workers and writes `run.json` with `final:true`. On **startup** it scans the 20
+newest runs for a `run.json` still marked `final:false` — the signature of a
+crash or a power cut — and repairs it: `frames` is recounted from the
+`flight_log.csv` files actually on disk, `final` is set, and `interrupted:true`
+plus `interrupted_note` and `recovered{at, flight_log_rows, frames_indexed}`
+record that the manifest was rebuilt rather than written by the run itself. The
+imagery, the flight_log rows and events.log survive an abnormal exit intact
+(all are flushed as produced); it is only the manifest that needs rebuilding.
+
 A run **never reuses an existing directory**. `run_id` is
 `YYMMDD_hhmm_<label>`, which is not unique — two starts in the same minute with
 the same label (a false start, or a rigd restart) would otherwise interleave two
@@ -230,12 +389,31 @@ UI (`rig_ui.html`, served by rigd, **runs with no AI**) is tabbed:
   in, arrow-key stepping. Dynamically adds/removes camera columns as nodes come
   and go.
 - **Fleet** — heartbeat strip per node (state, battery, disk, jitter, last
-  frame age) with slick live sparklines.
+  frame age) with slick live sparklines, plus the camera-health fields (card
+  write, thermal, live-view status, control priority). Live view here is **off
+  by default** behind an explicit switch.
+- **Transects** — the run browser: every run newest-first, and for the selected
+  one its stereo-pair completeness (complete / incomplete counts, the per-shot
+  strip, the gap list with the frame that *did* land), per-camera flight_log
+  row counts and capture-source breakdown, a link to each `flight_log.csv`, and
+  a side-by-side viewer for the last shots so a missing half of a pair is
+  visible as a MISSING panel, not a number.
 - **Nav** — location plot (track from lat/lon), heading rose, depth readout.
 - **IMU** — live attitude (pitch/roll/yaw) horizon + heading.
 - **Controls** — the one desired-settings panel that drives all cameras, with
-  per-node convergence badges and the EV-bump control.
+  per-node convergence badges, the EV-bump control, the **Preview on Cam1 /
+  Deploy to fleet** pair beside cam1's live view + histogram, the recording
+  format selects (filetype / imagesize / transsize, marked "no readback"), and
+  read-only panels for the body-menu-only properties and the per-camera lens
+  positions.
 - **Events** — the live event/anomaly stream.
+
+**Live view is gated.** `liveViewJpeg()` takes the same recursive SDK mutex as
+image transfer, so every live-view GET competes with the capture path on a body
+that is mid-survey. No live-view or `/api/shots` request is issued unless its
+tab is both selected AND `document.hidden === false`; the Fleet tab additionally
+requires its switch to be on. One backgrounded browser tab used to pull frames
+from both bodies every 2 s for an entire survey.
 
 flight_log.csv header (exact):
 ```
