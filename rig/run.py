@@ -47,11 +47,28 @@ FLIGHT_HEADER = [
 ]
 
 
+# Pillow is a REAL dependency of rigd, not an optional extra, and it is the one
+# dependency that fails silently. It backs the EXIF fallback for a frame's capture
+# instant (GPIO edge > corrected EXIF > command time), and the whole body of
+# _exif_capture_epoch is wrapped in `except Exception`, so on a host without
+# Pillow every frame quietly skips the EXIF tier and lands on command time
+# instead - a worse timestamp, with nothing in the log to say why. Probe once at
+# import so run start can say so out loud.
+try:
+    from PIL import Image as _PIL_Image
+    PIL_AVAILABLE = True
+except ImportError:
+    _PIL_Image = None
+    PIL_AVAILABLE = False
+
+
 def _exif_capture_epoch(jpeg_bytes):
     """Camera capture epoch from EXIF, or None. Pure-bytes, no temp file."""
+    if not PIL_AVAILABLE:
+        return None
     try:
         from io import BytesIO
-        from PIL import Image
+        Image = _PIL_Image
         with Image.open(BytesIO(jpeg_bytes)) as im:
             ex = im.getexif().get_ifd(0x8769)
         dt = ex.get(0x9003)
@@ -811,6 +828,13 @@ class RunManager:
                              nodes=run["nodes"], run_id=rid,
                              time_source=time_src,
                              gps_offset_s=round(time_off, 3))
+            if not PIL_AVAILABLE:
+                self.events.emit(
+                    "warn", "run",
+                    "Pillow is not installed, so the EXIF fallback for a frame's "
+                    "capture instant is unavailable: any frame without a GPIO "
+                    "EXPOSURE edge will be stamped with the command time instead "
+                    "of the camera's own clock. Install python3-pil on this host.")
             # Calibration and the survey capture loop are NOT concurrent. Run
             # start fires ~6 non-survey exposures per camera (one for the EXIF
             # clock offset, five for trigger latency); with the capture loop

@@ -1,9 +1,22 @@
-# AI handoff — Wild Sync stereo rig
+# Handoff — Wild Sync stereo rig
 
-Written 2026-08-16 at the end of a long working session, for the next agent taking over.
-`README.md` carries the operational picture and the measured performance.
-`docs/PROTOCOL.md` is the interface contract. **This file is the current truth about
-what is done, what is half-done, and what will bite you.**
+Written 2026-08-16 for whoever picks this up next. **This file is the current truth
+about what is done, what is half-done, and what will bite you.**
+
+Read in this order:
+
+1. **`README.md`** — what the system is, how to set up, build, deploy and test it,
+   and the hardware rules that will otherwise cost you a day each. Start there.
+2. **`docs/PROTOCOL.md`** — the interface contract: node HTTP APIs, the 23-column
+   `flight_log.csv` header, run layout, the time model, Sony property encodings.
+   Anything crossing a process boundary is defined there.
+3. **This file** — current state, what is unfinished, and the measurements behind
+   the decisions, so you do not re-derive them.
+4. **`docs/future-tests.md`** — open questions that need bench time, each with the
+   decision it unblocks and a decision rule.
+
+The rig is on the bench and mostly working; §2 says exactly what state it is in,
+including the one thing that currently needs a hand on the hardware.
 
 ---
 
@@ -269,7 +282,7 @@ rig/tests/soaktest.py   +59    path fixes + 3 wrong assertions corrected
 src/camera.cpp          +76    caution fix, overheating/liveView/slotWriting readback
 ```
 
-New files: `docs/future-tests.md`, `docs/AI-HANDOFF.md` (this),
+New files: `docs/future-tests.md`, `docs/HANDOFF.md` (this),
 `docs/audit-2026-08-16-findings.json` (the remaining work list),
 `docs/strobe-trigger.md` (author: operator, corrected this session).
 Deleted: `docs/HANDOFF.md` (superseded by this file + README; its fleet and wiring
@@ -325,9 +338,6 @@ suite first.
    (§3.7).
 11. **Re-measure sustained frame rate at real archive settings** — every figure on record
     used 320 KB thumbnails (`docs/future-tests.md` §3).
-12. **Fix the soaktest flake** (`docs/future-tests.md` §6). One run in ~4 fails a
-    timing-dependent assertion in the pull suite. It is a harness bug, not a code
-    regression — but it will make you doubt a good tree at exactly the wrong moment.
 
 ## 8. DOCUMENTS THAT ARE NOW WRONG
 

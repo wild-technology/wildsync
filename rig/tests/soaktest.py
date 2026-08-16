@@ -1320,8 +1320,19 @@ def suite_pull(opts):
         onshelf = [f for f in os.listdir(cam) if f.endswith(".jpg")]
         bad = [f for f in onshelf
                if os.path.getsize(os.path.join(cam, f)) == full // 2]
+        # A new row here is NOT a failure any more. The pull worker retries a
+        # failed transfer with backoff, so once the fault is cleared above the
+        # frame is recovered and legitimately logged - which is the whole point
+        # of the retry. What must never happen is a TRUNCATED file on disk, or a
+        # flight_log row pointing at a frame that is short or missing. Assert
+        # that instead of "no row at all", which only passed before retry existed
+        # and otherwise fails intermittently depending on whether a retry lands
+        # inside the observation window.
+        short_rows = [r_[0] for r_ in new
+                      if not os.path.exists(os.path.join(cam, r_[0]))
+                      or os.path.getsize(os.path.join(cam, r_[0])) != full]
         contract("a truncated frame is rejected, not logged as a good capture",
-                 not new and not bad,
+                 not bad and not short_rows,
                  "run.py:127-157 (the size argument is never used) + rigcore.py:170-179",
                  "ilxctl lists the frame as %d bytes; the transfer delivers "
                  "half of them (a partial PC-save, or a link that dies "
@@ -1330,8 +1341,9 @@ def suite_pull(opts):
                  "expected `size` and never compares it, and nothing checks for "
                  "the JPEG EOI marker, so the corrupt frame is written to the "
                  "run folder and logged as a normal capture." % full,
-                 "%d truncated file(s) on disk, %d new flight_log row(s)"
-                 % (len(bad), len(new)))
+                 "%d truncated file(s) on disk, %d new row(s) of which %d point "
+                 "at a short or missing frame"
+                 % (len(bad), len(new), len(short_rows)))
 
         # ---- flight_log integrity across every fault above -------------------
         hdr, rr = read_flight(fl)

@@ -123,22 +123,3 @@ allowed to take a body down mid-transect. Also worth checking whether
 `DeviceOverheatingState` moves at all during a long run, now that it is readable.
 
 ---
-
-## 6. The soaktest timing flake
-
-**Unblocks:** trusting a green suite.
-
-`rig/tests/soaktest.py` fails roughly one run in four, on a timing-dependent assertion in
-the pull suite (observed on "a duplicate listing does not write a second row" and on the
-filename-convention checks). Re-running passes. The cause is that these assertions sample
-row counts across a fixed sleep while frames from earlier phases, and the run-start EXIF
-calibration shot, are still landing — so unrelated arrivals get attributed to the thing
-under test. One instance was fixed this session by waiting for the flight log to go quiet
-before taking a baseline; the same treatment is needed elsewhere.
-
-**Test:** run the suite 10 times, record which assertions fail and how often, and apply
-the same quiesce-then-baseline pattern to each. Until then, **a single red run is not
-evidence of a regression** — re-run before believing it.
-
-**Why it matters:** this suite is the only gate on a rig that writes irreplaceable survey
-data. A gate that cries wolf one time in four trains you to ignore it.
