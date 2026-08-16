@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Wild Sync
+GenericName=Stereo Rig Control
+Comment=Control the ILX-LR1 stereo photogrammetry rig
+Exec=/home/wildtech/coyotethings/wildsync/deploy/launch-wildsync.sh
+Icon=camera-photo
+Terminal=false
+Categories=Science;Photography;
+StartupNotify=true
