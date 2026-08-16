@@ -95,17 +95,50 @@ recycle time at the working power setting and flashes per charge for survey plan
 
 ---
 
-## 5. What actually put both bodies into a caution state
+## 5. What actually stalled cam1's card
 
-**Unblocks:** knowing whether sustained high-rate triggering is safe.
+**Unblocks:** knowing whether sustained RAW-to-card is safe at survey rate.
 
-On 2026-08-16 both cameras entered `CAUTION ON BODY (0x00000001)` after roughly 250
-scheduled test fires in a session. Symptoms: `storeDest` and `pcsave` became read-only,
-the shutter kept firing (EXPOSURE edges present) but nothing was written to card or
-delivered to the host, and `ilxctl` eventually wedged inside an SDK call on both nodes.
-A USB unbind/rebind recovered the daemon; the body state itself needed more.
+On 2026-08-16 cam1 stopped recording entirely: one frame stuck in the camera's write
+buffer, SD LED solid red, a transfer icon showing "1", and format refused with
+*"writing to memory card. unable to operate."* The body went busy, which locked its whole
+property table (`storeDest` DisplayOnly, `storeChoices` and `driveChoices` empty), stopped
+PC delivery, and eventually wedged `ilxctl`. cam2, on the same fleet and the same firing
+sequence, was unaffected throughout.
 
-**Test:** determine the trigger — thermal, buffer exhaustion, card state, or PC-save
-session loss. Instrument body temperature if the SDK exposes it, and find the sustained
-rate and duration that provokes it. Until this is understood, treat long high-rate
-bench sessions as capable of taking the rig out of service.
+> **Note on an earlier misdiagnosis.** This was first attributed to a body "caution" and
+> then to thermal load. Both were wrong. The caution flag was a false positive in
+> `ilxctl` (a 1-based enum tested as a bitmask, since fixed), and no browser was ever
+> connected so live view was not running. Do not repeat either theory without evidence.
+
+**Test:** identify what the two bodies' cards are — make, capacity, speed class, age —
+and whether the ILX-LR1 slot is UHS-I or UHS-II. A 61 MP RAW is ~60-125 MB, so 1 fps is
+60-125 MB/s *sustained* and 2 fps is double; UHS-I cannot do that. Then find the sustained
+rate and duration that provokes a stall, on a known-good card, with the flight recorder
+watching the new `slotWriting` property.
+
+**Decision rule:** if a healthy card of known speed still stalls at the survey rate, RAW
+must come off the card path entirely (JPEG-only to host, RAW disabled) rather than being
+allowed to take a body down mid-transect. Also worth checking whether
+`DeviceOverheatingState` moves at all during a long run, now that it is readable.
+
+---
+
+## 6. The soaktest timing flake
+
+**Unblocks:** trusting a green suite.
+
+`rig/tests/soaktest.py` fails roughly one run in four, on a timing-dependent assertion in
+the pull suite (observed on "a duplicate listing does not write a second row" and on the
+filename-convention checks). Re-running passes. The cause is that these assertions sample
+row counts across a fixed sleep while frames from earlier phases, and the run-start EXIF
+calibration shot, are still landing — so unrelated arrivals get attributed to the thing
+under test. One instance was fixed this session by waiting for the flight log to go quiet
+before taking a baseline; the same treatment is needed elsewhere.
+
+**Test:** run the suite 10 times, record which assertions fail and how often, and apply
+the same quiesce-then-baseline pattern to each. Until then, **a single red run is not
+evidence of a regression** — re-run before believing it.
+
+**Why it matters:** this suite is the only gate on a rig that writes irreplaceable survey
+data. A gate that cries wolf one time in four trains you to ignore it.
