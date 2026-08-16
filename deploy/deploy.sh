@@ -98,7 +98,7 @@ sudo cp /tmp/piagent.service /etc/systemd/system/piagent.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now piagent
 sudo systemctl restart ilxctl 2>/dev/null || \
-  echo "  note: ilxctl.service not installed here — see docs/AI-HANDOFF.md"
+  echo "  note: ilxctl.service not installed here — see docs/HANDOFF.md"
 sleep 4
 echo "  ilxctl: $(systemctl is-active ilxctl)   piagent: $(systemctl is-active piagent)"
 REMOTE

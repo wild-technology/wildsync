@@ -286,7 +286,7 @@ eyeballing frames — **but see §6, it only catches timing failures.**
 ## 7. Related, and worth folding in while you are in here
 
 Ringing on cam2's `EXPOSURE` lead is currently logged as "shield or shorten"
-(carried into `docs/AI-HANDOFF.md`). The measured signature argues for a different order — and
+(carried into `docs/HANDOFF.md`). The measured signature argues for a different order — and
 it matters more if topology B wins, since B hangs another load on that net.
 
 cam2 produced 14 events inside 62 µs (`piagent.py:606`) — ~4.4 µs per

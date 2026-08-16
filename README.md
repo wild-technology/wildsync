@@ -25,10 +25,8 @@ flight log binding each frame to position and orientation.
 
 ## Measured performance
 
-All figures from the live rig, timed against each camera's own `EXPOSURE` line
-(hardware ground truth), not host-side estimates.
-
-Measured 2026-08-16 unless noted, from each camera's own `EXPOSURE` line.
+All figures from the live rig, measured 2026-08-16 against each camera's own
+`EXPOSURE` line (hardware ground truth), not host-side estimates.
 
 | | |
 |---|---|
@@ -77,13 +75,54 @@ src/            ilxctl — C++ camera daemon (one per node, :8080)
 rig/            Python: rigd (Jetson), piagent (node), nav, run, UI
 rig/tests/      regression + soak suites (no hardware required)
 deploy/         deploy.sh and the systemd units
-docs/           PROTOCOL.md (interface contract), AI-HANDOFF.md (state + TODO), hardware notes
+docs/           PROTOCOL.md (interface contract), HANDOFF.md (state + TODO), hardware notes
 ```
 
 `docs/PROTOCOL.md` is the contract every component is built against — node HTTP
 APIs, the 23-column `flight_log.csv` header, run layout, the time model, and the
 measured Sony property encodings. Read it before changing anything that crosses
 a process boundary.
+
+## Where things run
+
+| Process | Host | Port | Language | Owns |
+|---|---|---|---|---|
+| `rigd` | Jetson | 9090 | Python 3, stdlib | fleet state, desired settings, runs, web UI |
+| `ilxctl` | each Pi | 8080 | C++17 | the camera over USB via Sony's SDK — settings, live view, image transfer |
+| `piagent` | each Pi | 8081 | Python 3, stdlib | GPIO harness (FOCUS/TRIGGER/EXPOSURE), IMU, node health |
+
+All three are systemd units with `Restart=always`. `rigd` talks to both node
+services over plain HTTP; nothing else crosses a machine boundary.
+
+State on disk:
+
+| Path | Host | What |
+|---|---|---|
+| `~/rig-runs/<run_id>/` | Jetson | one directory per transect: `run.json`, `events.log`, `nmea_raw.log`, and a `camN/` per camera holding renamed frames + `flight_log.csv` |
+| `~/rig/desired.json` | Jetson | the fleet's agreed settings vector, survives restart |
+| `~/rig/rigd.jsonl` | Jetson | rolling structured event journal |
+| `~/rig/nodes.json` | Jetson | optional address override, e.g. `{"cam2": "192.168.1.171"}` |
+| `~/Pictures/ILX-LR1/` | each Pi | PC-save staging dir the camera writes into; `rigd` pulls from here. **Nothing prunes it yet.** |
+
+## Dependencies
+
+**Jetson (`rigd`):** Python 3.12, `python3-serial` (nav), **`python3-pil`**.
+
+Pillow is easy to miss and fails quietly — it backs the EXIF fallback for a
+frame's capture instant, and without it frames with no GPIO edge are stamped with
+the command time instead. `rigd` now emits a `warn` at run start if it is absent,
+but install it up front:
+
+```sh
+sudo apt install -y python3-serial python3-pil
+```
+
+**Camera nodes (`piagent`):** Python 3.12, `python3-libgpiod` (v1.6.3 API),
+`gpiod`/`gpioset`/`gpiomon` CLI tools. `deploy.sh provision` handles chrony, the
+usbfs buffer and the gpio udev rule.
+
+`piagent` and `ilxctl` need no Python packages beyond libgpiod. Services are
+stdlib-only by policy — see `docs/PROTOCOL.md`.
 
 ## Build
 
@@ -109,6 +148,34 @@ deploy/deploy.sh jetson            # install rigd here
 
 Then open `http://<jetson>:9090`.
 
+`deploy.sh node` ships `src/*`, `rig/piagent.py` and `rig/imu_yb.py`, rebuilds
+`ilxctl` on the node and restarts both services. It does **not** ship `rigd` —
+that runs from this checkout on the Jetson, so a `rigd` change takes effect on
+`sudo systemctl restart rigd`.
+
+## Working on it
+
+The edit-test loop needs no hardware. Change the code, run the suites, then
+deploy only when you want it on the rig.
+
+```sh
+# 1. full offline gate — this is what must stay green
+python3 rig/tests/soaktest.py
+
+# 2. iterate on one area
+python3 rig/tests/soaktest.py --only runmgr     # or: settings, pull, nav
+python3 rig/tests/soaktest.py --soak 300        # randomized fault injection
+
+# 3. see live state without a browser
+curl -s localhost:9090/api/diag      | python3 -m json.tool
+curl -s localhost:9090/api/anomalies | python3 -m json.tool
+curl -s 192.168.1.201:8081/gpio/state | python3 -m json.tool
+```
+
+Logs: `journalctl -u rigd -f` on the Jetson, `journalctl -u ilxctl -f` /
+`-u piagent -f` on a node. Structured events also land in `~/rig/rigd.jsonl` and
+are served cursor-style from `GET /api/events?since=<seq>`.
+
 ## Tests
 
 Everything runs without hardware, against an in-process fake node:
@@ -119,11 +186,16 @@ python3 rig/tests/soaktest.py              # state machine, convergence, pull fa
 python3 rig/tests/soaktest.py --soak 300   # randomized fault injection
 python3 rig/nav.py --selftest              # PGN decode, UTM, time authority
 python3 rig/tests/navtest.py               # nav integration over a real pty
+python3 rig/navlog.py --selftest           # raw NMEA log + replay
 ```
+
+Current baseline: **soaktest 137/0, selftest 48/0**, nav/navtest/navlog all pass.
+
 
 ## Operating notes
 
-Two things about this hardware will otherwise cost you a day each:
+Each of these has already cost a day. None of them look like what they are —
+every one presents as a software fault.
 
 - **A released GPIO is not high-Z.** The pad keeps the last requester's bias, and
   a Low `FOCUS` line is a permanent half-press: the camera reports every property
@@ -145,7 +217,7 @@ Two things about this hardware will otherwise cost you a day each:
   here, because `usbcore` is built into the Pi kernel.
 - **`ilxctl` cannot recover from an unclean shutdown.** The camera's PTP session
   stays stuck and the next start blocks before binding :8080. Recover with a USB
-  unbind/rebind — see `docs/AI-HANDOFF.md` §2.2.
+  unbind/rebind — see `docs/HANDOFF.md` §2.2.
 
-See `docs/AI-HANDOFF.md` for current fleet state, open work and the discoveries
+See `docs/HANDOFF.md` for current fleet state, open work and the discoveries
 behind these notes; `docs/future-tests.md` for what still needs measuring.
