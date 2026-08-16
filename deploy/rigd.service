@@ -1,0 +1,17 @@
+[Unit]
+Description=Wild Sync rigd - Jetson fleet orchestrator + web UI
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wildtech
+WorkingDirectory=/home/wildtech/coyotethings/wildsync/rig
+ExecStart=/usr/bin/python3 -u /home/wildtech/coyotethings/wildsync/rig/rigd.py
+Restart=always
+RestartSec=3
+# nav needs the iKonvert serial port
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wild Sync — Rig Control</title>
+<style>
+  :root{
+    --bg:#0e0f12; --panel:#16181d; --panel2:#1d2027; --line:#2a2e37;
+    --ink:#e8eaf0; --muted:#8b90a0; --accent:#5aa9e6; --ok:#3fbf7f;
+    --warn:#e6a94b; --bad:#e2574c; --grid:#22252d;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       font-size:14px;line-height:1.45}
+  header{display:flex;align-items:center;gap:16px;padding:10px 18px;
+         border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+  header h1{font-family:var(--mono);font-size:15px;margin:0;letter-spacing:.02em}
+  header .clock{font-family:var(--mono);color:var(--muted);font-size:12px}
+  .pill{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:10px;
+        border:1px solid var(--line);color:var(--muted)}
+  .pill.on{color:var(--ok);border-color:var(--ok)}
+  .pill.warn{color:var(--warn);border-color:var(--warn)}
+  .pill.bad{color:var(--bad);border-color:var(--bad)}
+  nav{display:flex;gap:2px;padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line);
+      position:sticky;top:45px;z-index:4;overflow-x:auto}
+  nav button{background:none;border:none;color:var(--muted);font-family:var(--mono);
+             font-size:12px;padding:10px 14px;cursor:pointer;border-bottom:2px solid transparent}
+  nav button.active{color:var(--ink);border-bottom-color:var(--accent)}
+  main{padding:16px}
+  .tab{display:none} .tab.active{display:block}
+  .grid{display:grid;gap:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+  .card h2{font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.08em;
+           color:var(--muted);margin:0 0 10px}
+  .kv{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
+  .kv .k{color:var(--muted)} .kv .v{font-family:var(--mono)}
+  .big{font-family:var(--mono);font-size:26px;font-weight:600}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button.act{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+             border-radius:6px;padding:7px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
+  button.act:hover{border-color:var(--accent)}
+  button.act.go{border-color:var(--ok);color:var(--ok)}
+  button.act.stop{border-color:var(--bad);color:var(--bad)}
+  input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+               border-radius:6px;padding:6px 8px;font-family:var(--mono);font-size:12px}
+  label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:3px}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
+  .dot.bad{background:var(--bad)} .dot.off{background:var(--muted)}
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em}
+  td.n,.mono{font-family:var(--mono)}
+  .cams{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .camcol{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .camcol .hd{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;
+              border-bottom:1px solid var(--line);background:var(--panel2)}
+  .camcol .hd .exp{font-family:var(--mono);font-size:12px;color:var(--accent)}
+  .frame{position:relative;background:#000;aspect-ratio:3/2;display:flex;align-items:center;justify-content:center}
+  .frame img{width:100%;height:100%;object-fit:contain}
+  .frame .burn{position:absolute;left:8px;top:8px;font-family:var(--mono);font-size:12px;
+               background:rgba(0,0,0,.6);padding:3px 7px;border-radius:4px;color:#fff}
+  .frame .cnt{position:absolute;right:8px;bottom:8px;font-family:var(--mono);font-size:11px;
+              background:rgba(0,0,0,.6);padding:2px 6px;border-radius:4px;color:var(--muted)}
+  .spark{display:block;width:100%;height:34px}
+  .ev{font-family:var(--mono);font-size:12px;padding:2px 0;border-bottom:1px solid var(--grid);display:flex;gap:8px}
+  .ev .t{color:var(--muted)} .ev .sev{width:56px}
+  .ev.warn .sev{color:var(--warn)} .ev.error .sev,.ev.critical .sev{color:var(--bad)}
+  .ev.info .sev{color:var(--accent)} .ev.debug .sev{color:var(--muted)}
+  .muted{color:var(--muted)} .small{font-size:12px}
+  .anom{border-left:3px solid var(--warn);padding:8px 10px;margin:6px 0;background:var(--panel2);border-radius:4px}
+  .anom.bad{border-left-color:var(--bad)}
+  canvas{display:block;max-width:100%}
+</style>
+</head>
+<body>
+<header>
+  <h1>WILD SYNC</h1>
+  <span id="hRun" class="pill">no run</span>
+  <span id="hNodes" class="pill">— nodes</span>
+  <span id="hTime" class="pill">time —</span>
+  <span id="hNav" class="pill">nav —</span>
+  <span style="flex:1"></span>
+  <span class="clock" id="hClock">—</span>
+</header>
+<nav id="tabs">
+  <button data-t="review" class="active">Review</button>
+  <button data-t="fleet">Fleet</button>
+  <button data-t="controls">Controls</button>
+  <button data-t="nav">Nav</button>
+  <button data-t="imu">IMU</button>
+  <button data-t="events">Events</button>
+</nav>
+<main>
+  <!-- REVIEW -->
+  <section class="tab active" id="tab-review">
+    <div class="row" style="margin-bottom:10px">
+      <button class="act" id="rvLive">Live view: off</button>
+      <button class="act" id="rvNewest">Jump to newest</button>
+      <span class="muted small">← / → step frames · newest first</span>
+    </div>
+    <div class="cams" id="reviewCams"></div>
+  </section>
+
+  <!-- FLEET -->
+  <section class="tab" id="tab-fleet">
+    <div class="grid" id="fleetCards" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))"></div>
+  </section>
+
+  <!-- NAV -->
+  <section class="tab" id="tab-nav">
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="card"><h2>Track</h2><canvas id="navTrack" width="420" height="300"></canvas></div>
+      <div class="card">
+        <h2>Fix</h2>
+        <div id="navKv"></div>
+        <h2 style="margin-top:14px">Heading</h2>
+        <canvas id="navRose" width="180" height="180"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <!-- IMU -->
+  <section class="tab" id="tab-imu">
+    <div id="imuBadge" class="small muted" style="margin-bottom:8px"></div>
+    <div class="grid" style="grid-template-columns:minmax(300px,1.4fr) minmax(240px,1fr)">
+      <div class="card"><h2>Attitude — master IMU</h2>
+        <canvas id="imuHorizon" width="480" height="360" style="width:100%;height:auto"></canvas></div>
+      <div class="card"><h2>Heading</h2>
+        <canvas id="imuRose" width="260" height="260" style="width:100%;max-width:260px;margin:0 auto;display:block"></canvas>
+        <div id="imuKv" style="margin-top:12px"></div></div>
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:12px">
+      <div class="card"><h2>Accelerometer (g)</h2>
+        <canvas id="imuAccel" width="520" height="140" style="width:100%;height:auto"></canvas></div>
+      <div class="card"><h2>Gyroscope (°/s)</h2>
+        <canvas id="imuGyro" width="520" height="140" style="width:100%;height:auto"></canvas></div>
+    </div>
+  </section>
+
+  <!-- CONTROLS -->
+  <section class="tab" id="tab-controls">
+    <div class="grid" style="grid-template-columns:2fr 1fr;margin-bottom:12px">
+      <div class="card">
+        <h2>Live view — connected cameras</h2>
+        <div class="cams" id="ctlLive"><span class="muted small">no cameras connected</span></div>
+      </div>
+      <div class="card">
+        <h2>Histogram — <span id="histCam" class="mono">primary</span></h2>
+        <canvas id="histCanvas" width="256" height="150" style="width:100%;height:auto;background:var(--panel2);border-radius:6px"></canvas>
+        <div id="histStats" class="small muted" style="margin-top:8px"></div>
+      </div>
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:12px">
+      <div class="card">
+        <h2>Focus — all cameras in lock-step</h2>
+        <div class="row">
+          <label>Mode<select id="fMode"></select></label>
+          <label>Step<input id="fStep" type="number" value="50" style="width:70px"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="act" id="fNear">◀ Near</button>
+          <button class="act" id="fFar">Far ▶</button>
+          <span class="muted small">hold to drive</span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="muted small">Position</span>
+          <input id="fPos" type="range" min="0" max="65535" value="0" style="flex:1">
+          <span id="fPosV" class="mono small">0</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Zoom — all cameras in lock-step</h2>
+        <div class="row">
+          <label>Setting<select id="zSet"></select></label>
+          <label>Speed<input id="zSpd" type="number" value="3" min="1" max="8" style="width:60px"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="act" id="zWide">◀ Wide</button>
+          <button class="act" id="zTele">Tele ▶</button>
+          <span class="muted small">hold to drive</span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="muted small">Position</span>
+          <input id="zPos" type="range" min="0" max="65535" value="0" style="flex:1">
+          <span id="zPosV" class="mono small">0</span>
+        </div>
+      </div>
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="card">
+        <h2>Transect</h2>
+        <div class="row">
+          <label>Label<input id="cLabel" value="transect-01" style="width:160px"></label>
+          <label>Interval s<input id="cInt" type="number" value="2" step="0.1" style="width:80px"></label>
+          <label>Frames (0=∞)<input id="cFrames" type="number" value="0" style="width:80px"></label>
+          <label style="flex-direction:row;align-items:center;gap:6px">
+            <input id="cAuto" type="checkbox" checked> auto-capture</label>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="act go" id="btnStart">▶ Start run</button>
+          <button class="act stop" id="btnStop">■ Stop run</button>
+          <button class="act" id="btnCap">Capture one</button>
+        </div>
+        <div id="runInfo" class="small muted" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <h2>Exposure — pushed identically to every camera</h2>
+        <div class="row">
+          <label>Mode
+            <select id="sExpMode"><option value="manual">Manual (default)</option>
+              <option value="auto">Auto (ISO servo)</option></select></label>
+          <label>Aperture f/<input id="sAp" type="number" value="8" step="0.1" style="width:70px"></label>
+          <label>Shutter 1/<input id="sSh" type="number" value="200" style="width:70px"></label>
+          <label>ISO<input id="sIso" type="number" value="400" style="width:80px"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="muted small">EV bump:</span>
+          <button class="act" id="evDn">−⅓</button>
+          <span id="evVal" class="mono">0 mEV</span>
+          <button class="act" id="evUp">+⅓</button>
+          <button class="act" id="btnApply" style="margin-left:auto">Apply to fleet</button>
+        </div>
+        <div id="convInfo" class="small" style="margin-top:10px"></div>
+      </div>
+      <div class="card" style="grid-column:1/-1">
+        <h2>Anomalies</h2><div id="anoms"><span class="muted small">none</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- EVENTS -->
+  <section class="tab" id="tab-events">
+    <div class="row" style="margin-bottom:8px">
+      <label>Min severity
+        <select id="evSev"><option>debug</option><option selected>info</option>
+          <option>warn</option><option>error</option></select></label>
+    </div>
+    <div class="card"><div id="evList" style="max-height:70vh;overflow:auto"></div></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = (p, body) => fetch(p, body ? {method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body)} : {}).then(r=>r.json()).catch(e=>({ok:false,error:String(e)}));
+let TAB = 'review';
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
+  TAB=b.dataset.t;
+  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active',x===b));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.id==='tab-'+TAB));
+});
+
+// ---- header + clock -------------------------------------------------------
+setInterval(()=>{ $('#hClock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+'Z'; },1000);
+
+function pill(el,txt,cls){ el.textContent=txt; el.className='pill'+(cls?(' '+cls):''); }
+
+// ---- fleet ----------------------------------------------------------------
+let FLEET={nodes:[]};
+const spark = {}; // name -> [values]
+async function pollFleet(){
+  const f = await api('/api/fleet'); if(!f.nodes) return; FLEET=f;
+  const run=f.run||{};
+  pill($('#hRun'), run.active?('run '+run.run_id+' · '+run.frames+' frm'):'no run', run.active?'on':'');
+  const conn=f.nodes.filter(n=>n.connected).length;
+  pill($('#hNodes'), conn+'/'+f.nodes.length+' cameras', conn?'on':'bad');
+  pill($('#hTime'), 'time '+(f.time_source||'—'), f.time_source==='gps'?'on':'warn');
+  renderFleet(); renderReviewHeaders();
+  // Paint the newly-shown tab now rather than waiting out its poll interval.
+  if(TAB==='controls') pollControls();
+  if(TAB==='imu') pollImuWindow();
+}
+function stateCls(s){return s==='CAM_CONNECTED'?'ok':s==='REACHABLE'?'warn':'off';}
+function renderFleet(){
+  const c=$('#fleetCards'); c.innerHTML='';
+  FLEET.nodes.forEach(n=>{
+    (spark[n.name]=spark[n.name]||[]).push(n.stats&&n.stats.interval_jitter_ms||0);
+    if(spark[n.name].length>60) spark[n.name].shift();
+    const conv=n.convergence||{};
+    const cs = conv.synced===true?'<span class="dot ok"></span> synced'
+      : conv.synced===false?'<span class="dot bad"></span> divergent: '+(conv.diverged||[]).join(',')
+      : '<span class="dot off"></span> —';
+    const gpio=n.gpio||{}; const imu=n.imu||{};
+    c.insertAdjacentHTML('beforeend', `<div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div><span class="dot ${stateCls(n.state)}"></span> <b>${n.name}</b>
+          <span class="muted small">${n.host}</span></div>
+        <span class="muted small mono">${n.state}</span></div>
+      <div class="big" style="margin:6px 0">${n.connected?(n.model||'ILX-LR1'):'—'}</div>
+      ${n.connected?`<div class="frame" style="aspect-ratio:3/2;border-radius:6px;margin:6px 0">
+        <img src="/api/liveview?node=${n.name}&_=${Date.now()}" style="width:100%;height:100%;object-fit:contain"
+             onerror="this.style.opacity=.15"></div>`:''}
+      <div class="kv"><span class="k">Exposure</span><span class="v">${n.connected?
+        ((n.aperture||'?')+' · '+(n.shutter||'?')+' · '+(n.iso||'?')):'—'}</span></div>
+      <div class="kv"><span class="k">Battery</span><span class="v">${n.battery??'—'}%</span></div>
+      <div class="kv"><span class="k">Settings</span><span class="v">${cs}</span></div>
+      <div class="kv"><span class="k">GPIO</span><span class="v">${gpio.available?
+        ('chip '+(gpio.chip||'?')+(gpio.focus_held?' · FOCUS held':'')+
+         (gpio.monitor_running?' · EXP mon':'')+' · '+(gpio.edges_seen||0)+' edges'):'—'}</span></div>
+      <div class="kv"><span class="k">IMU</span><span class="v">${imu.present?
+        ((imu.age_s!=null?imu.age_s+'s':'')+' @'+(imu.rate_hz||'?')+'Hz'):'—'}</span></div>
+      <div class="kv"><span class="k">Disk</span><span class="v">${n.disk_free_mb??'—'} MB</span></div>
+      <div class="kv"><span class="k">Run pull</span><span class="v">${n.stats&&n.stats.pulled!=null?
+        (n.stats.pulled+' ok / '+(n.stats.failed||0)+' fail · jit '+(n.stats.interval_jitter_ms??'—')+'ms'):'—'}</span></div>
+      ${sparkSvg(spark[n.name])}
+    </div>`);
+  });
+}
+function sparkSvg(vals){
+  if(!vals||vals.length<2) return '';
+  const w=280,h=34,mx=Math.max(1,...vals);
+  const pts=vals.map((v,i)=>`${(i/(vals.length-1))*w},${h-(v/mx)*(h-4)-2}`).join(' ');
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+}
+
+// ---- review (multi-cam, newest first) -------------------------------------
+let LIVE=false;
+const view = {}; // name -> {shots:[], idx, cache:{}}
+$('#rvLive').onclick=()=>{ LIVE=!LIVE; $('#rvLive').textContent='Live view: '+(LIVE?'on':'off'); };
+$('#rvNewest').onclick=()=>{ Object.values(view).forEach(v=>v.idx=0); renderReviewFrames(); };
+document.addEventListener('keydown',e=>{
+  if(TAB!=='review')return;
+  if(e.key==='ArrowLeft'){Object.values(view).forEach(v=>v.idx=Math.min((v.shots.length-1),v.idx+1));renderReviewFrames();}
+  if(e.key==='ArrowRight'){Object.values(view).forEach(v=>v.idx=Math.max(0,v.idx-1));renderReviewFrames();}
+});
+function renderReviewHeaders(){
+  const c=$('#reviewCams');
+  const live=FLEET.nodes.filter(n=>n.connected);
+  if(!c.dataset.n || +c.dataset.n!==live.length){
+    c.dataset.n=live.length; c.innerHTML='';
+    live.forEach(n=>{
+      c.insertAdjacentHTML('beforeend',`<div class="camcol" id="cam-${n.name}">
+        <div class="hd"><b>Cam${n.cam_num} · ${n.name}</b><span class="exp" id="exp-${n.name}"></span></div>
+        <div class="frame"><img id="img-${n.name}" alt=""><div class="burn" id="burn-${n.name}"></div>
+          <div class="cnt" id="cnt-${n.name}"></div></div></div>`);
+      view[n.name]=view[n.name]||{shots:[],idx:0,cache:{}};
+    });
+  }
+  live.forEach(n=>{ $('#exp-'+n.name).textContent =
+    n.connected?((n.aperture||'?')+' · '+(n.shutter||'?')+' · '+(n.iso||'?')):''; });
+}
+async function pollReview(){
+  const live=FLEET.nodes.filter(n=>n.connected);
+  for(const n of live){
+    if(LIVE){ const img=$('#img-'+n.name);
+      if(img){ img.src='/api/liveview?node='+n.name+'&_='+Date.now();
+        $('#burn-'+n.name).textContent='LIVE'; $('#cnt-'+n.name).textContent=''; }
+      continue; }
+    const shots=await api('/api/shots?node='+n.name);
+    if(Array.isArray(shots)){
+      const v=view[n.name]; const names=shots.map(s=>s.name).sort().reverse(); // newest first
+      const wasNew = v.shots[0]!==names[0];
+      v.shots=names; if(wasNew && v.idx>0) v.idx++; // keep pointing at same frame as new arrive
+    }
+  }
+  if(!LIVE) renderReviewFrames();
+}
+function renderReviewFrames(){
+  FLEET.nodes.filter(n=>n.connected).forEach(n=>{
+    const v=view[n.name]; if(!v||!v.shots.length){ $('#burn-'+n.name)&&($('#burn-'+n.name).textContent='no frames'); return; }
+    v.idx=Math.max(0,Math.min(v.idx,v.shots.length-1));
+    const name=v.shots[v.idx]; const img=$('#img-'+n.name);
+    if(img && img.dataset.name!==name){ img.dataset.name=name; img.src='/api/frame?node='+n.name+'&name='+encodeURIComponent(name); }
+    $('#burn-'+n.name).textContent = (n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||'?');
+    $('#cnt-'+n.name).textContent = (v.idx+1)+' / '+v.shots.length+' · '+name;
+  });
+}
+
+// ---- nav ------------------------------------------------------------------
+const track=[];
+async function pollNav(){
+  const s=await api('/api/nav');
+  const kv=$('#navKv');
+  if(!s||s.present===false){ kv.innerHTML='<div class="muted small">no nav source</div>';
+    pill($('#hNav'),'nav off','warn'); drawRose('navRose',null); return; }
+  pill($('#hNav'),'nav '+(s.lat!=null?'fix':'no fix'), s.lat!=null?'on':'warn');
+  kv.innerHTML = kvrow('Lat',fmt(s.lat,6))+kvrow('Lon',fmt(s.lon,6))+
+    kvrow('UTM',(s.xutm?fmt(s.xutm,1)+' E, '+fmt(s.yutm,1)+' N '+(s.utm_zone||''):'—'))+
+    kvrow('Depth',fmt(s.depth_m,2)+' m')+kvrow('Heading',fmt(s.heading_mag_deg??s.heading_true_deg,1)+'°')+
+    kvrow('SOG',fmt(s.sog,2))+kvrow('Sats',s.sats??'—');
+  if(s.lat!=null){ track.push([s.lon,s.lat]); if(track.length>3000)track.shift(); drawTrack(); }
+  drawRose('navRose', s.heading_mag_deg??s.heading_true_deg);
+}
+function drawTrack(){
+  const cv=$('#navTrack'),x=cv.getContext('2d'); x.clearRect(0,0,cv.width,cv.height);
+  if(track.length<2)return;
+  const xs=track.map(p=>p[0]),ys=track.map(p=>p[1]);
+  const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
+  const pad=20,W=cv.width-2*pad,H=cv.height-2*pad;
+  const sx=v=>pad+((v-x0)/((x1-x0)||1))*W, sy=v=>cv.height-pad-((v-y0)/((y1-y0)||1))*H;
+  x.strokeStyle='#5aa9e6';x.lineWidth=2;x.beginPath();
+  track.forEach((p,i)=>{const X=sx(p[0]),Y=sy(p[1]);i?x.lineTo(X,Y):x.moveTo(X,Y);});x.stroke();
+  x.fillStyle='#e2574c';const last=track[track.length-1];
+  x.beginPath();x.arc(sx(last[0]),sy(last[1]),4,0,7);x.fill();
+}
+// A proper compass: fixed degree ring, cardinal + intercardinal labels, a red
+// heading needle and a big numeric readout in the middle.
+function drawRose(id,deg){
+  const cv=$('#'+id),x=cv.getContext('2d'),W=cv.width,H=cv.height,c=W/2,cy=H/2,R=Math.min(c,cy)-6;
+  x.clearRect(0,0,W,H);
+  const g=x.createRadialGradient(c,cy,R*0.4,c,cy,R);
+  g.addColorStop(0,'#171a20');g.addColorStop(1,'#0c0e12');
+  x.fillStyle=g;x.beginPath();x.arc(c,cy,R,0,7);x.fill();
+  x.strokeStyle='#2a2e37';x.lineWidth=2;x.stroke();
+  for(let d=0;d<360;d+=10){const a=(d-90)*Math.PI/180,maj=d%30===0;
+    const r0=R-(maj?12:7);
+    x.strokeStyle=maj?'#5a6070':'#33373f';x.lineWidth=maj?2:1;x.beginPath();
+    x.moveTo(c+Math.cos(a)*r0,cy+Math.sin(a)*r0);x.lineTo(c+Math.cos(a)*(R-2),cy+Math.sin(a)*(R-2));x.stroke();}
+  x.fillStyle='#8b90a0';x.font='bold 13px monospace';x.textAlign='center';x.textBaseline='middle';
+  [['N',0],['E',90],['S',180],['W',270]].forEach(([L,d])=>{const a=(d-90)*Math.PI/180;
+    x.fillStyle=L==='N'?'#e2574c':'#8b90a0';
+    x.fillText(L,c+Math.cos(a)*(R-26),cy+Math.sin(a)*(R-26));});
+  if(deg!=null && !isNaN(deg)){
+    const a=(deg-90)*Math.PI/180;
+    x.strokeStyle='#5aa9e6';x.lineWidth=3;x.beginPath();
+    x.moveTo(c-Math.cos(a)*(R*0.28),cy-Math.sin(a)*(R*0.28));
+    x.lineTo(c+Math.cos(a)*(R-16),cy+Math.sin(a)*(R-16));x.stroke();
+    // arrowhead
+    x.fillStyle='#e2574c';x.beginPath();
+    const hx=c+Math.cos(a)*(R-16),hy=cy+Math.sin(a)*(R-16);
+    x.moveTo(hx,hy);x.lineTo(hx-Math.cos(a-0.4)*12,hy-Math.sin(a-0.4)*12);
+    x.lineTo(hx-Math.cos(a+0.4)*12,hy-Math.sin(a+0.4)*12);x.fill();
+    x.fillStyle='#e8eaf0';x.font='bold 26px monospace';
+    x.fillText(Math.round((deg+360)%360)+'°',c,cy-4);
+    x.fillStyle='#8b90a0';x.font='11px monospace';x.fillText(headingCardinal(deg),c,cy+16);
+  } else { x.fillStyle='#5f5e57';x.font='12px monospace';x.fillText('no heading',c,cy); }
+}
+function headingCardinal(d){const n=['N','NE','E','SE','S','SW','W','NW'];
+  return n[Math.round(((d%360)+360)%360/45)%8];}
+
+// ---- imu ------------------------------------------------------------------
+// Ring buffers of {x,y,z}. At ~200 Hz, 600 entries is about three seconds of
+// trace, which is enough to see a swell period without the canvas turning to
+// mush.
+const accelBuf=[], gyroBuf=[];
+let IMU_LAST=null, IMU_T0=0, IMU_RATE=0, IMU_KV_AT=0, IMU_RX=0, IMU_RX_AT=0;
+
+// Network side: one batched fetch, several times a second.
+async function pollImuWindow(){
+  const w=await api('/api/imu/window?t0='+(IMU_T0||0));
+  let samples = (w && w.samples) || [];
+  if(!samples.length && (!w || w.present===false)){ IMU_LAST=null; return; }
+  if(!samples.length) return;                      // alive, just nothing new yet
+  for(const s of samples){
+    if(s.epoch==null || s.epoch<=IMU_T0) continue;
+    IMU_T0=s.epoch;
+    accelBuf.push({x:s.ax||0,y:s.ay||0,z:s.az||0}); if(accelBuf.length>600)accelBuf.shift();
+    gyroBuf.push({x:s.gx||0,y:s.gy||0,z:s.gz||0}); if(gyroBuf.length>600)gyroBuf.shift();
+    IMU_LAST=s;
+  }
+  // Sample rate measured from what actually arrives, not what the driver claims.
+  const now=Date.now()/1000;
+  IMU_RX+=samples.length;
+  if(now-IMU_RX_AT>=1.0){ IMU_RATE=IMU_RX/(now-IMU_RX_AT); IMU_RX=0; IMU_RX_AT=now; }
+  if(w.node) IMU_LAST.node=w.node;
+}
+
+// Display side: runs on every animation frame so the horizon and compass move
+// at the refresh rate rather than at the poll rate.
+function renderImu(){
+  const s=IMU_LAST, kv=$('#imuKv'), badge=$('#imuBadge');
+  const live = !!(s && s.epoch!=null && (Date.now()/1000-s.epoch)<2);
+  if(live){
+    drawHorizon(s.pitch||0,s.roll||0,true); drawRose('imuRose',s.heading);
+  } else {
+    drawHorizon(0,0,false); drawRose('imuRose',null);
+  }
+  drawTrace('imuAccel',accelBuf,2.0,['#e2574c','#3fbf7f','#5aa9e6'],live);
+  drawTrace('imuGyro',gyroBuf,250,['#e2574c','#3fbf7f','#5aa9e6'],live);
+  // Text is throttled: rewriting these nodes 60 times a second is pure DOM
+  // churn, and the numbers are unreadable that fast anyway.
+  const now=Date.now();
+  if(now-IMU_KV_AT<100) return;
+  IMU_KV_AT=now;
+  if(live){
+    const age=Date.now()/1000-s.epoch;
+    badge.innerHTML=`<span class="dot ok"></span> IMU live · ${s.node||'yb-mra02'} · `+
+      `${IMU_RATE.toFixed(0)} Hz · age ${age.toFixed(2)}s`;
+    kv.innerHTML=kvrow('Pitch',fmt(s.pitch,2)+'°')+kvrow('Roll',fmt(s.roll,2)+'°')+
+      kvrow('Yaw',fmt(s.yaw,2)+'°')+kvrow('Heading',fmt(s.heading,1)+'°')+
+      kvrow('Temp',fmt(s.temp,1)+'°C')+kvrow('Sample rate',IMU_RATE.toFixed(0)+' Hz');
+  } else {
+    badge.innerHTML=`<span class="dot warn"></span> waiting for IMU — plug the YB-MRA02 into a cam3 <b>USB-A</b> port (the Pi 5 USB-C is power-only); piagent auto-detects it`;
+    kv.innerHTML='<div class="muted small">no samples yet</div>';
+  }
+}
+// Artificial horizon: sky/ground with pitch ladder, roll arc + bank pointer,
+// and a fixed aircraft reference. Clipped to a rounded instrument bezel.
+function drawHorizon(pitch,roll,live){
+  const cv=$('#imuHorizon'),x=cv.getContext('2d'),W=cv.width,H=cv.height,cx=W/2,cy=H/2;
+  const R=Math.min(W,H)/2-6, ppd=H/60;   // pixels per degree of pitch
+  x.clearRect(0,0,W,H);
+  x.save();
+  x.beginPath();x.arc(cx,cy,R,0,7);x.clip();
+  x.translate(cx,cy);x.rotate(-roll*Math.PI/180);
+  const off=pitch*ppd;
+  const sky=x.createLinearGradient(0,-H,0,off);sky.addColorStop(0,'#2f6fb0');sky.addColorStop(1,'#5aa0dd');
+  x.fillStyle=sky;x.fillRect(-W,-H+off,2*W,H);
+  const gnd=x.createLinearGradient(0,off,0,H);gnd.addColorStop(0,'#7a5a2d');gnd.addColorStop(1,'#4a3a1d');
+  x.fillStyle=gnd;x.fillRect(-W,off,2*W,H);
+  x.strokeStyle='#f0f0f0';x.lineWidth=2.5;x.beginPath();x.moveTo(-W,off);x.lineTo(W,off);x.stroke();
+  // pitch ladder
+  x.strokeStyle='rgba(255,255,255,.8)';x.fillStyle='rgba(255,255,255,.85)';
+  x.lineWidth=1.5;x.font='10px monospace';x.textAlign='center';x.textBaseline='middle';
+  for(let p=-30;p<=30;p+=10){ if(p===0)continue; const y=off - p*ppd; const w=Math.abs(p)===30?60:40;
+    x.beginPath();x.moveTo(-w/2,y);x.lineTo(w/2,y);x.stroke();
+    x.fillText(Math.abs(p), -w/2-12, y); x.fillText(Math.abs(p), w/2+12, y);}
+  x.restore();
+  // roll arc + ticks
+  x.save();x.translate(cx,cy);
+  x.strokeStyle='#e8eaf0';x.lineWidth=2;x.beginPath();x.arc(0,0,R-4,Math.PI*1.15,Math.PI*1.85);x.stroke();
+  [-60,-45,-30,-20,-10,0,10,20,30,45,60].forEach(t=>{const a=(-90+t)*Math.PI/180;
+    const rr=R-4, ll=(t%30===0)?12:7;
+    x.beginPath();x.moveTo(Math.cos(a)*rr,Math.sin(a)*rr);
+    x.lineTo(Math.cos(a)*(rr-ll),Math.sin(a)*(rr-ll));x.stroke();});
+  // bank pointer (rotates with roll)
+  x.rotate(-roll*Math.PI/180);
+  x.fillStyle='#e6a94b';x.beginPath();x.moveTo(0,-(R-4));x.lineTo(-7,-(R-16));x.lineTo(7,-(R-16));x.fill();
+  x.restore();
+  // fixed aircraft symbol
+  x.strokeStyle='#ffd24a';x.lineWidth=3;x.beginPath();
+  x.moveTo(cx-46,cy);x.lineTo(cx-16,cy);x.moveTo(cx-16,cy);x.lineTo(cx-16,cy+8);
+  x.moveTo(cx+46,cy);x.lineTo(cx+16,cy);x.moveTo(cx+16,cy);x.lineTo(cx+16,cy+8);x.stroke();
+  x.fillStyle='#ffd24a';x.beginPath();x.arc(cx,cy,3,0,7);x.fill();
+  // bezel
+  x.strokeStyle='#2a2e37';x.lineWidth=4;x.beginPath();x.arc(cx,cy,R+2,0,7);x.stroke();
+  if(!live){x.fillStyle='rgba(14,15,18,.55)';x.beginPath();x.arc(cx,cy,R,0,7);x.fill();
+    x.fillStyle='#8b90a0';x.font='12px monospace';x.textAlign='center';x.fillText('awaiting IMU',cx,cy-R/2);}
+}
+// Scrolling 3-axis trace strip.
+function drawTrace(id,buf,range,colors,live){
+  const cv=$('#'+id),x=cv.getContext('2d'),W=cv.width,H=cv.height;
+  x.clearRect(0,0,W,H);
+  x.strokeStyle='#22252d';x.lineWidth=1;
+  for(let f=0.25;f<1;f+=0.25){const y=H*f;x.beginPath();x.moveTo(0,y);x.lineTo(W,y);x.stroke();}
+  x.strokeStyle='#33373f';x.beginPath();x.moveTo(0,H/2);x.lineTo(W,H/2);x.stroke();
+  if(!buf.length){x.fillStyle='#5f5e57';x.font='11px monospace';x.textAlign='left';
+    x.fillText(live?'—':'no data',8,H/2-6);return;}
+  const n=buf.length, sx=W/Math.max(1,239);
+  ['x','y','z'].forEach((ax,ci)=>{
+    x.strokeStyle=colors[ci];x.lineWidth=1.5;x.beginPath();
+    for(let i=0;i<n;i++){const v=buf[i][ax], y=H/2 - (v/range)*(H/2-4);
+      const px=W-(n-1-i)*sx; i?x.lineTo(px,y):x.moveTo(px,y);}
+    x.stroke();});
+  const last=buf[n-1];
+  x.font='10px monospace';x.textAlign='right';
+  ['x','y','z'].forEach((ax,ci)=>{x.fillStyle=colors[ci];
+    x.fillText(ax.toUpperCase()+' '+last[ax].toFixed(2),W-8,12+ci*12);});
+}
+
+// ---- controls -------------------------------------------------------------
+let EV=0;
+$('#evUp').onclick=()=>bumpEv(1); $('#evDn').onclick=()=>bumpEv(-1);
+async function bumpEv(s){ const r=await api('/api/ev',{steps:s}); if(r.ok){EV=r.expcomp_mev;$('#evVal').textContent=EV+' mEV';} }
+$('#btnApply').onclick=async()=>{
+  const enc=(1<<16)|(+$('#sSh').value); // shutter 1/den
+  await api('/api/settings',{aperture:Math.round(+$('#sAp').value*100),
+    shutter:enc, iso:+$('#sIso').value});
+  await api('/api/settings/auto',{on:$('#sExpMode').value==='auto'});
+};
+$('#btnStart').onclick=async()=>{ const r=await api('/api/run/start',{
+  label:$('#cLabel').value, interval_s:+$('#cInt').value, frames:+$('#cFrames').value,
+  auto_capture:$('#cAuto').checked});
+  $('#runInfo').textContent = r.ok?('started '+r.run_id+' → '+r.root):('start failed: '+r.error); };
+$('#btnStop').onclick=async()=>{ const r=await api('/api/run/stop',{});
+  $('#runInfo').textContent = r.ok?('stopped '+r.run_id):('stop: '+(r.error||'')); };
+$('#btnCap').onclick=async()=>{ const r=await api('/api/capture',{});
+  $('#runInfo').textContent = r.ok?('captured: '+Object.keys(r.results||{}).join(', ')):('capture: '+r.error); };
+function renderConv(){
+  const c=$('#convInfo'); c.innerHTML=FLEET.nodes.filter(n=>n.connected).map(n=>{
+    const cv=n.convergence||{}; const ok=cv.synced===true;
+    return `<div class="kv"><span class="k">${n.name}</span><span class="v">${
+      ok?'<span class="dot ok"></span> synced':
+      cv.synced===false?'<span class="dot bad"></span> '+ (cv.diverged||[]).join(','):
+      '<span class="dot off"></span> —'}</span></div>`;}).join('')||'<span class="muted small">no cameras</span>';
+}
+async function pollAnoms(){
+  const r=await api('/api/anomalies'); const el=$('#anoms');
+  const a=r.anomalies||[];
+  el.innerHTML = a.length? a.map(x=>`<div class="anom ${x.kind.includes('offline')||x.kind.includes('fail')?'bad':''}">
+    <b>${x.kind}</b> ${x.node?('· '+x.node):''} — ${x.msg}<br><span class="muted small">→ ${x.suggested_action}</span></div>`).join('')
+    : '<span class="muted small">none</span>';
+}
+
+// ---- live view + histogram + lens controls --------------------------------
+function holdButton(el,onDown,onUp){
+  if(!el)return; let active=false;
+  const dn=e=>{e.preventDefault(); if(active)return; active=true; onDown();};
+  const up=()=>{ if(!active)return; active=false; onUp();};
+  el.addEventListener('mousedown',dn); el.addEventListener('touchstart',dn,{passive:false});
+  ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>el.addEventListener(ev,up));
+}
+let histPrimary=null;
+function renderCtlLive(){
+  const wrap=$('#ctlLive'), live=FLEET.nodes.filter(n=>n.connected);
+  if(!wrap.dataset.n || +wrap.dataset.n!==live.length){
+    wrap.dataset.n=live.length; wrap.innerHTML='';
+    if(!live.length){ wrap.innerHTML='<span class="muted small">no cameras connected</span>';
+      histPrimary=null; $('#histCam').textContent='—'; return; }
+    live.forEach(n=>wrap.insertAdjacentHTML('beforeend',
+      `<div class="camcol"><div class="hd"><b>Cam${n.cam_num} · ${n.name}</b>
+        <span class="exp mono" id="clx-${n.name}"></span></div>
+        <div class="frame"><img id="lv-${n.name}" alt=""></div></div>`));
+    histPrimary=live[0].name; $('#histCam').textContent='Cam'+live[0].cam_num;
+  }
+  live.forEach(n=>{const e=$('#clx-'+n.name); if(e) e.textContent=(n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||'');});
+}
+function refreshLive(prefix, nodes){
+  nodes.forEach(n=>{const img=$('#'+prefix+n.name); if(!img)return;
+    if(img.dataset.busy)return; img.dataset.busy='1';
+    const done=()=>{img.dataset.busy='';};
+    img.onload=()=>{done(); if(prefix==='lv-'&&n.name===histPrimary) drawHist(img);};
+    img.onerror=done;
+    img.src='/api/liveview?node='+n.name+'&_='+Date.now();
+  });
+}
+function drawHist(img){
+  const cv=$('#histCanvas'),x=cv.getContext('2d'),W=cv.width,H=cv.height;
+  const off=drawHist._o||(drawHist._o=document.createElement('canvas'));
+  off.width=192;off.height=120; const ox=off.getContext('2d');
+  try{ox.drawImage(img,0,0,192,120);}catch(e){return;}
+  let d; try{d=ox.getImageData(0,0,192,120).data;}catch(e){return;}
+  const bins=new Array(256).fill(0); let mn=255,mx=0,sum=0,nn=0;
+  for(let i=0;i<d.length;i+=4){const l=Math.round(0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]);
+    bins[l]++; if(l<mn)mn=l; if(l>mx)mx=l; sum+=l; nn++;}
+  const peak=Math.max(1,...bins);
+  x.clearRect(0,0,W,H);
+  x.strokeStyle='#5aa9e6';x.lineWidth=1;x.beginPath();x.moveTo(0,H);
+  for(let i=0;i<256;i++){const px=i/255*W, py=H-(bins[i]/peak)*(H-6);x.lineTo(px,py);}
+  x.lineTo(W,H);x.closePath();x.fillStyle='rgba(90,169,230,.35)';x.fill();x.stroke();
+  const clipLo=(bins[0]/nn*100), clipHi=(bins[255]/nn*100);
+  $('#histStats').textContent=`mean ${Math.round(sum/nn)} · range ${mn}–${mx} · clip ▼${clipLo.toFixed(1)}% ▲${clipHi.toFixed(1)}%`;
+}
+function fillSel(sel,choices,cur){ if(!sel||!choices)return;
+  if(+sel.dataset.n===choices.length && sel.options.length) return;
+  sel.dataset.n=choices.length; sel.innerHTML='';
+  choices.forEach(c=>{const o=document.createElement('option');o.value=c.v;o.textContent=c.l;
+    if(c.v==cur)o.selected=true; sel.appendChild(o);});
+}
+let ctlChoicesLoaded=false;
+async function pollControls(){
+  renderCtlLive(); refreshLive('lv-', FLEET.nodes.filter(n=>n.connected));
+  renderConv(); pollAnoms();
+  if(!ctlChoicesLoaded){
+    const prim=FLEET.nodes.find(n=>n.connected);
+    if(prim){ const s=await api('/api/status?node='+prim.name);
+      if(s && s.focusModes){ fillSel($('#fMode'),s.focusModes,s.focusMode);
+        fillSel($('#zSet'),s.zoomSettings,s.zoomSetting); ctlChoicesLoaded=true; } }
+  }
+}
+$('#fMode').onchange=()=>api('/api/focus/mode',{mode:+$('#fMode').value});
+$('#zSet').onchange=()=>api('/api/zoom/setting',{value:+$('#zSet').value});
+$('#fPos').oninput=()=>$('#fPosV').textContent=$('#fPos').value;
+$('#fPos').onchange=()=>api('/api/focus/position',{value:+$('#fPos').value});
+$('#zPos').oninput=()=>$('#zPosV').textContent=$('#zPos').value;
+$('#zPos').onchange=()=>api('/api/zoom/position',{value:+$('#zPos').value});
+holdButton($('#fNear'),()=>api('/api/focus/drive',{step:-(+$('#fStep').value)}),()=>api('/api/focus/drive',{step:0}));
+holdButton($('#fFar'), ()=>api('/api/focus/drive',{step:+(+$('#fStep').value)}),()=>api('/api/focus/drive',{step:0}));
+holdButton($('#zWide'),()=>api('/api/zoom/drive',{speed:-(+$('#zSpd').value)}),()=>api('/api/zoom/drive',{speed:0}));
+holdButton($('#zTele'),()=>api('/api/zoom/drive',{speed:+(+$('#zSpd').value)}),()=>api('/api/zoom/drive',{speed:0}));
+
+// ---- events ---------------------------------------------------------------
+let evSeq=0;
+async function pollEvents(){
+  const sev=$('#evSev').value;
+  const r=await api('/api/events?since='+evSeq+'&sev='+sev);
+  if(!r.events)return; evSeq=r.next;
+  const l=$('#evList');
+  r.events.forEach(e=>{
+    const d=new Date(e.ts*1000).toISOString().slice(11,19);
+    l.insertAdjacentHTML('afterbegin',`<div class="ev ${e.sev}"><span class="t">${d}</span>
+      <span class="sev">${e.sev}</span><span class="mono muted">${e.kind}</span>
+      <span>${e.node?('['+e.node+'] '):''}${escapeHtml(e.msg)}</span></div>`);
+  });
+  while(l.children.length>400) l.removeChild(l.lastChild);
+}
+$('#evSev').onchange=()=>{evSeq=0;$('#evList').innerHTML='';};
+
+// ---- helpers + loops ------------------------------------------------------
+function kvrow(k,v){return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;}
+function fmt(v,n){return v==null||isNaN(v)?'—':(+v).toFixed(n);}
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+pollFleet(); pollEvents();
+setInterval(pollFleet, 2000);
+setInterval(()=>{ if(TAB==='review') pollReview(); }, 1200);
+setInterval(()=>{ if(TAB==='nav') pollNav(); }, 1500);
+// The IMU streams at ~200 Hz. Pull a batch a few times a second and paint from
+// it on every animation frame: 60 fps of motion for ~5 requests/s, instead of
+// 60 round trips a second through rigd and piagent.
+setInterval(()=>{ if(TAB==='imu') pollImuWindow(); }, 200);
+requestAnimationFrame(function imuFrame(){ if(TAB==='imu') renderImu(); requestAnimationFrame(imuFrame); });
+// Live view has to refresh faster than the anomaly list, and pollControls does
+// both plus the lens-choice population - calling pollAnoms here instead left the
+// Controls tab permanently showing "no cameras connected".
+setInterval(()=>{ if(TAB==='controls') pollControls(); }, 1000);
+setInterval(pollEvents, 2000);
+</script>
+</body>
+</html>

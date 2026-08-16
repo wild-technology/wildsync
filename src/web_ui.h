@@ -60,6 +60,17 @@ static const char* kIndexHtml = R"HTML(<!doctype html>
   .hint{font-size:11.5px;color:var(--dim)}
   .bar{height:6px;border-radius:3px;background:var(--panel2);overflow:hidden}
   .bar > i{display:block;height:100%;background:var(--accent);width:0}
+  .shotwrap{position:relative;background:#000;aspect-ratio:3/2;outline:none}
+  .shotwrap:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  #shotImg{width:100%;height:100%;display:block;object-fit:contain}
+  .burn{position:absolute;top:10px;left:10px;background:rgba(4,8,10,.74);
+        border:1px solid rgba(255,255,255,.14);border-radius:7px;padding:8px 11px;
+        pointer-events:none;font-family:"SF Mono",Menlo,monospace}
+  .burn .be{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums;
+            text-shadow:0 2px 8px rgba(0,0,0,.9)}
+  .burn .bs{font-size:11px;color:var(--dim);margin-top:2px}
+  .burn .bn{font-size:13px;font-weight:600;color:var(--accent);margin-top:3px;
+            max-width:34ch;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -81,6 +92,36 @@ static const char* kIndexHtml = R"HTML(<!doctype html>
       <h2>Live view</h2>
       <img id="lv" alt="live view" style="display:none">
       <div class="lvmsg" id="lvmsg">Live view starts once the camera is connected</div>
+    </div>
+    <div class="card">
+      <h2>Captures</h2>
+      <div class="shotwrap" id="shotWrap" tabindex="0">
+        <img id="shotImg" alt="" style="display:none">
+        <div class="lvmsg" id="shotMsg">No JPEGs yet - shoot a frame</div>
+        <div class="burn" id="burn" style="display:none">
+          <div class="be" id="burnExp">--</div>
+          <div class="bs" id="burnSub"></div>
+          <div class="bn" id="burnNote"></div>
+        </div>
+      </div>
+      <div class="body">
+        <div class="row">
+          <button id="shotPrev" title="previous frame">&larr;</button>
+          <button id="shotNext" title="next frame">&rarr;</button>
+          <button id="shotLast" title="jump to newest">Newest</button>
+          <span style="flex:1"></span>
+          <span class="big" id="shotIdx">0 / 0</span>
+        </div>
+        <div class="row">
+          <input id="shotNote" placeholder="tag this frame - e.g. flash 1/32" style="flex:1">
+          <button id="shotTag">Tag</button>
+          <label class="hint" style="display:flex;align-items:center;gap:5px">
+            <input type="checkbox" id="shotFollow" checked> follow
+          </label>
+        </div>
+        <div class="hint">Click the frame, then <b>&larr; &rarr;</b> to step.
+          Exposure is read from each file's EXIF; tags are kept in this browser.</div>
+      </div>
     </div>
     <div class="card">
       <h2>Activity</h2>
@@ -527,8 +568,173 @@ window.addEventListener('pagehide', () => {
   navigator.sendBeacon('/api/focus/drive', JSON.stringify({step:0}));
 });
 
+// --- captures ----------------------------------------------------------
+// Frames the camera sent to the PC, reviewable without leaving the page. Each
+// file is fetched once; its EXIF is parsed from the same bytes the <img> shows,
+// so the exposure shown is what the camera recorded, not what we asked for.
+let shots = [], shotAt = 0, shotFollow = true;
+const shotCache = new Map();   // name -> {url, exp}
+const SHOT_KEEP = 12;
+
+function shotTags(){ try { return JSON.parse(localStorage.getItem('ilxTags') || '{}'); }
+                     catch(e){ return {}; } }
+function setShotTag(name, text){
+  const t = shotTags();
+  if(text) t[name] = text; else delete t[name];
+  try { localStorage.setItem('ilxTags', JSON.stringify(t)); } catch(e){}
+}
+
+// Minimal Exif reader: JPEG APP1 -> TIFF IFD0 -> Exif sub-IFD. We only want the
+// exposure triple, so this walks tags rather than building a full parser.
+function readExif(buf){
+  const dv = new DataView(buf);
+  const out = {};
+  if(dv.getUint16(0) !== 0xFFD8) return out;
+  let p = 2;
+  while(p < dv.byteLength - 4){
+    if(dv.getUint8(p) !== 0xFF) break;
+    const marker = dv.getUint8(p + 1), len = dv.getUint16(p + 2);
+    if(marker === 0xE1){
+      const base = p + 10;                                  // past "Exif\0\0"
+      if(base + 8 > dv.byteLength) return out;
+      const le = dv.getUint16(base) === 0x4949;
+      // Bounds-safe reads: a truncated or malformed APP1 can point an offset
+      // (especially a big-type value-offset `vo`) past end-of-buffer, and an
+      // unchecked getUint32 there throws RangeError, which would reject loadShot
+      // and silently freeze the capture pane. Out-of-range reads return 0.
+      const u16 = o => (o >= 0 && o + 2 <= dv.byteLength) ? dv.getUint16(o, le) : 0;
+      const u32 = o => (o >= 0 && o + 4 <= dv.byteLength) ? dv.getUint32(o, le) : 0;
+      const rat = o => u32(o + 4) ? u32(o) / u32(o + 4) : 0;
+      const walk = (off, want) => {
+        if(off + 2 > dv.byteLength) return;
+        const n = u16(off);
+        for(let i = 0; i < n; i++){
+          const e = off + 2 + i * 12;
+          if(e + 12 > dv.byteLength) return;
+          const tag = u16(e), typ = u16(e + 2);
+          const big = (typ === 5 || typ === 10);
+          const vo = big ? base + u32(e + 8) : e + 8;
+          if(want[tag]) want[tag](big ? rat(vo) : u16(vo), vo);
+        }
+      };
+      walk(base + u32(base + 4), {
+        0x8769: (_v, vo) => walk(base + u32(vo), {
+          0x829A: v => out.exposure = v,
+          0x829D: v => out.fnumber  = v,
+          0x8827: v => out.iso      = v,
+        })
+      });
+      return out;
+    }
+    if(marker === 0xD9 || marker === 0xDA) break;
+    p += 2 + len;
+  }
+  return out;
+}
+
+function shutterText(sec){
+  if(!sec) return '--';
+  return sec < 1 ? '1/' + Math.round(1 / sec) : (+sec.toFixed(1)) + '"';
+}
+
+async function loadShot(name){
+  if(shotCache.has(name)) return shotCache.get(name);
+  const res = await fetch('/shot/' + encodeURIComponent(name));
+  if(!res.ok) throw new Error('shot ' + name + ': HTTP ' + res.status);
+  const buf = await res.arrayBuffer();
+  // Never cache a non-JPEG body (e.g. a transient 404 JSON) — it would show a
+  // broken image under this name for the life of the page. Let the caller retry.
+  if(buf.byteLength < 2 || new DataView(buf).getUint16(0) !== 0xFFD8)
+    throw new Error('shot ' + name + ': not a JPEG yet');
+  const ex = readExif(buf);
+  const entry = {
+    url: URL.createObjectURL(new Blob([buf], {type:'image/jpeg'})),
+    exp: [shutterText(ex.exposure),
+          ex.fnumber ? 'f/' + (+ex.fnumber.toFixed(1)) : '--',
+          ex.iso ? 'ISO ' + ex.iso : '--'].join('   ')
+  };
+  shotCache.set(name, entry);
+  while(shotCache.size > SHOT_KEEP){                     // blobs are not free
+    const oldest = shotCache.keys().next().value;
+    URL.revokeObjectURL(shotCache.get(oldest).url);
+    shotCache.delete(oldest);
+  }
+  return entry;
+}
+
+async function showShot(){
+  const s = shots[shotAt];
+  $('#shotIdx').textContent = shots.length ? (shotAt + 1) + ' / ' + shots.length : '0 / 0';
+  if(!s){
+    $('#shotImg').style.display = 'none'; $('#burn').style.display = 'none';
+    $('#shotMsg').style.display = 'block'; return;
+  }
+  $('#shotMsg').style.display = 'none';
+  let e;
+  try {
+    e = await loadShot(s.name);
+  } catch (err) {
+    // A frame still being written 404s or arrives non-JPEG; leave the pane as
+    // is and let the next poll retry rather than crashing the update loop.
+    return;
+  }
+  if(shots[shotAt] !== s) return;                        // moved on while loading
+  $('#shotImg').src = e.url; $('#shotImg').style.display = 'block';
+  $('#burn').style.display = 'block';
+  $('#burnExp').textContent = e.exp;
+  $('#burnSub').textContent = s.name + '   ' + Math.round(s.size / 1024) + ' KB';
+  $('#burnNote').textContent = shotTags()[s.name] || '';
+  $('#shotNote').value = shotTags()[s.name] || '';
+  for(const n of [shotAt + 1, shotAt - 1])
+    if(shots[n]) loadShot(shots[n].name).catch(() => {});   // prefetch, ignore
+}
+
+function stepShot(d){
+  if(!shots.length) return;
+  shotFollow = false; $('#shotFollow').checked = false;
+  shotAt = Math.max(0, Math.min(shots.length - 1, shotAt + d));
+  showShot();
+}
+
+async function pollShots(){
+  try {
+    const next = await (await fetch('/api/shots')).json();
+    const grew = next.length !== shots.length;
+    const cur = shots[shotAt] && shots[shotAt].name;
+    shots = next;
+    if(shotFollow && grew) shotAt = shots.length - 1;
+    else {
+      const at = shots.findIndex(s => s.name === cur);
+      shotAt = at >= 0 ? at : Math.min(shotAt, shots.length - 1);
+    }
+    if(shotAt < 0) shotAt = 0;
+    if(grew || !$('#shotImg').src) showShot();
+  } catch(e){ /* server busy; next tick */ }
+  setTimeout(pollShots, 1200);
+}
+
+$('#shotPrev').onclick = () => stepShot(-1);
+$('#shotNext').onclick = () => stepShot(1);
+$('#shotLast').onclick = () => { shotAt = shots.length - 1; showShot(); };
+$('#shotFollow').onchange = e => { shotFollow = e.target.checked;
+                                   if(shotFollow){ shotAt = shots.length - 1; showShot(); } };
+$('#shotTag').onclick = () => {
+  const s = shots[shotAt]; if(!s) return;
+  setShotTag(s.name, $('#shotNote').value.trim()); showShot();
+};
+$('#shotNote').addEventListener('keydown', e => {
+  if(e.key === 'Enter'){ $('#shotTag').click(); e.preventDefault(); }
+  e.stopPropagation();                                   // digits are not frame steps
+});
+addEventListener('keydown', e => {
+  if(/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+  if(e.key === 'ArrowLeft'){ stepShot(-1); e.preventDefault(); }
+  else if(e.key === 'ArrowRight'){ stepShot(1); e.preventDefault(); }
+});
+
 poll();
 pumpLiveView();
+pollShots();
 </script>
 </body>
 </html>
