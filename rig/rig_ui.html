@@ -74,6 +74,21 @@
   .anom{border-left:3px solid var(--warn);padding:8px 10px;margin:6px 0;background:var(--panel2);border-radius:4px}
   .anom.bad{border-left-color:var(--bad)}
   canvas{display:block;max-width:100%}
+  /* An exposure control the operator has edited but not yet applied. Without
+     this marker the panel is indistinguishable from one showing the fleet's
+     real settings, and "Apply" becomes a guess about what it will push. */
+  input.edited,select.edited{border-color:var(--warn);color:var(--warn)}
+  /* Clipped, not wrapped: a long anomaly kind must not push the clock out of
+     the header. The full list is in the pill's tooltip. */
+  #hAnom{cursor:pointer;max-width:26ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pill.flash{animation:pillflash 900ms ease-in-out 3}
+  @keyframes pillflash{50%{opacity:.2}}
+  /* Pre-flight checklist rows (Start run). */
+  .pf{display:flex;gap:10px;align-items:baseline;padding:2px 0;font-size:12.5px}
+  .pf .pfk{flex:0 0 92px;color:var(--muted);font-family:var(--mono);font-size:10.5px;
+           text-transform:uppercase;letter-spacing:.06em}
+  .pf .pfv{font-family:var(--mono)}
+  .pf.ok .pfv{color:var(--ok)} .pf.warn .pfv{color:var(--warn)} .pf.bad .pfv{color:var(--bad)}
 </style>
 </head>
 <body>
@@ -83,6 +98,9 @@
   <span id="hNodes" class="pill">— nodes</span>
   <span id="hTime" class="pill">time —</span>
   <span id="hNav" class="pill">nav —</span>
+  <!-- Global alert surface: anomalies are polled on their own timer, so a fault
+       is visible from every tab, not only while Controls happens to be open. -->
+  <span id="hAnom" class="pill" title="anomalies">anomalies —</span>
   <span style="flex:1"></span>
   <span class="clock" id="hClock">—</span>
 </header>
@@ -205,6 +223,9 @@
           <button class="act stop" id="btnStop">■ Stop run</button>
           <button class="act" id="btnCap">Capture one</button>
         </div>
+        <!-- Pre-flight: what this run is about to record with. Filled by
+             Start run before anything is written to disk. -->
+        <div id="preflight" style="margin-top:10px"></div>
         <div id="runInfo" class="small muted" style="margin-top:10px"></div>
       </div>
       <div class="card">
@@ -213,17 +234,23 @@
           <label>Mode
             <select id="sExpMode"><option value="manual">Manual (default)</option>
               <option value="auto">Auto (ISO servo)</option></select></label>
-          <label>Aperture f/<input id="sAp" type="number" value="8" step="0.1" style="width:70px"></label>
-          <label>Shutter 1/<input id="sSh" type="number" value="200" style="width:70px"></label>
-          <label>ISO<input id="sIso" type="number" value="400" style="width:80px"></label>
+          <!-- Choice lists come from the camera itself (ilxctl shutterChoices /
+               isoChoices / apertureChoices), so every value the panel can send
+               is one the body accepts - including multi-second shutters and
+               ISO AUTO, neither of which the old 1/N and free-number boxes
+               could express. Options are raw Sony encodings. -->
+          <label>Aperture<select id="sAp" style="min-width:92px"></select></label>
+          <label>Shutter<select id="sSh" style="min-width:110px"></select></label>
+          <label>ISO<select id="sIso" style="min-width:118px"></select></label>
         </div>
         <div class="row" style="margin-top:10px">
           <span class="muted small">EV bump:</span>
           <button class="act" id="evDn">−⅓</button>
-          <span id="evVal" class="mono">0 mEV</span>
+          <span id="evVal" class="mono">— mEV</span>
           <button class="act" id="evUp">+⅓</button>
           <button class="act" id="btnApply" style="margin-left:auto">Apply to fleet</button>
         </div>
+        <div id="applyNote" class="small muted" style="margin-top:8px">reading fleet settings…</div>
         <div id="convInfo" class="small" style="margin-top:10px"></div>
       </div>
       <div class="card" style="grid-column:1/-1">
@@ -248,11 +275,18 @@ const $ = s => document.querySelector(s);
 const api = (p, body) => fetch(p, body ? {method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify(body)} : {}).then(r=>r.json()).catch(e=>({ok:false,error:String(e)}));
 let TAB = 'review';
-document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
-  TAB=b.dataset.t;
-  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active',x===b));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.id==='tab-'+TAB));
-});
+// One entry point for tab switching so anything can navigate — the header
+// anomaly pill jumps straight to the anomalies pane. Paint the newly-shown tab
+// immediately instead of leaving it blank until its own interval comes round.
+function showTab(t){
+  TAB=t;
+  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active',x.dataset.t===t));
+  document.querySelectorAll('.tab').forEach(s=>s.classList.toggle('active',s.id==='tab-'+t));
+  if(t==='controls'){ pollControls(); hydrateSettings(); }
+  if(t==='imu') pollImuWindow();
+  if(t==='review') renderReviewFrames();
+}
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.t));
 
 // ---- header + clock -------------------------------------------------------
 setInterval(()=>{ $('#hClock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+'Z'; },1000);
@@ -328,11 +362,18 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowLeft'){Object.values(view).forEach(v=>v.idx=Math.min((v.shots.length-1),v.idx+1));renderReviewFrames();}
   if(e.key==='ArrowRight'){Object.values(view).forEach(v=>v.idx=Math.max(0,v.idx-1));renderReviewFrames();}
 });
+// Rebuild is keyed on WHICH cameras are connected, never on how many. One
+// camera being lost in the same 2 s poll another is claimed leaves the count
+// unchanged, and the old count test then kept the departed camera's column —
+// its stale frames under its own name — while the newly live camera had no
+// column at all, and every $('#exp-…') below threw on the missing element.
+function connKey(live){ return live.map(n=>n.cam_num+':'+n.name).join(','); }
 function renderReviewHeaders(){
   const c=$('#reviewCams');
   const live=FLEET.nodes.filter(n=>n.connected);
-  if(!c.dataset.n || +c.dataset.n!==live.length){
-    c.dataset.n=live.length; c.innerHTML='';
+  const key=connKey(live);
+  if(c.dataset.key!==key){
+    c.dataset.key=key; c.innerHTML='';
     live.forEach(n=>{
       c.insertAdjacentHTML('beforeend',`<div class="camcol" id="cam-${n.name}">
         <div class="hd"><b>Cam${n.cam_num} · ${n.name}</b><span class="exp" id="exp-${n.name}"></span></div>
@@ -341,18 +382,21 @@ function renderReviewHeaders(){
       view[n.name]=view[n.name]||{shots:[],idx:0,cache:{}};
     });
   }
-  live.forEach(n=>{ $('#exp-'+n.name).textContent =
-    n.connected?((n.aperture||'?')+' · '+(n.shutter||'?')+' · '+(n.iso||'?')):''; });
+  live.forEach(n=>{ const e=$('#exp-'+n.name); if(!e) return;
+    e.textContent = (n.aperture||'?')+' · '+(n.shutter||'?')+' · '+(n.iso||'?'); });
 }
 async function pollReview(){
   const live=FLEET.nodes.filter(n=>n.connected);
   for(const n of live){
-    if(LIVE){ const img=$('#img-'+n.name);
+    if(LIVE){ const img=$('#img-'+n.name), b=$('#burn-'+n.name), c=$('#cnt-'+n.name);
       if(img){ img.src='/api/liveview?node='+n.name+'&_='+Date.now();
-        $('#burn-'+n.name).textContent='LIVE'; $('#cnt-'+n.name).textContent=''; }
+        if(b) b.textContent='LIVE'; if(c) c.textContent=''; }
       continue; }
     const shots=await api('/api/shots?node='+n.name);
-    if(Array.isArray(shots)){
+    // view[] is created alongside the column; a camera claimed between the
+    // fleet poll and this one has no entry yet, and awaiting it here means the
+    // set can change underneath the loop.
+    if(Array.isArray(shots) && view[n.name]){
       const v=view[n.name]; const names=shots.map(s=>s.name).sort().reverse(); // newest first
       const wasNew = v.shots[0]!==names[0];
       v.shots=names; if(wasNew && v.idx>0) v.idx++; // keep pointing at same frame as new arrive
@@ -362,12 +406,13 @@ async function pollReview(){
 }
 function renderReviewFrames(){
   FLEET.nodes.filter(n=>n.connected).forEach(n=>{
-    const v=view[n.name]; if(!v||!v.shots.length){ $('#burn-'+n.name)&&($('#burn-'+n.name).textContent='no frames'); return; }
+    const burn=$('#burn-'+n.name), cnt=$('#cnt-'+n.name);
+    const v=view[n.name]; if(!v||!v.shots.length){ if(burn) burn.textContent='no frames'; return; }
     v.idx=Math.max(0,Math.min(v.idx,v.shots.length-1));
     const name=v.shots[v.idx]; const img=$('#img-'+n.name);
     if(img && img.dataset.name!==name){ img.dataset.name=name; img.src='/api/frame?node='+n.name+'&name='+encodeURIComponent(name); }
-    $('#burn-'+n.name).textContent = (n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||'?');
-    $('#cnt-'+n.name).textContent = (v.idx+1)+' / '+v.shots.length+' · '+name;
+    if(burn) burn.textContent = (n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||'?');
+    if(cnt) cnt.textContent = (v.idx+1)+' / '+v.shots.length+' · '+name;
   });
 }
 
@@ -439,6 +484,7 @@ function headingCardinal(d){const n=['N','NE','E','SE','S','SW','W','NW'];
 // mush.
 const accelBuf=[], gyroBuf=[];
 let IMU_LAST=null, IMU_T0=0, IMU_RATE=0, IMU_KV_AT=0, IMU_RX=0, IMU_RX_AT=0;
+let IMU_NODE=null;     // last node rigd actually got samples from — never assumed
 
 // Network side: one batched fetch, several times a second.
 async function pollImuWindow(){
@@ -457,7 +503,10 @@ async function pollImuWindow(){
   const now=Date.now()/1000;
   IMU_RX+=samples.length;
   if(now-IMU_RX_AT>=1.0){ IMU_RATE=IMU_RX/(now-IMU_RX_AT); IMU_RX=0; IMU_RX_AT=now; }
-  if(w.node) IMU_LAST.node=w.node;
+  // rigd discovers the IMU host by probing the fleet; take its answer. Guarded
+  // because every sample in the batch can be older than IMU_T0 (a re-poll with
+  // nothing new), which leaves IMU_LAST null on the very first window.
+  if(w.node){ IMU_NODE=w.node; if(IMU_LAST) IMU_LAST.node=w.node; }
 }
 
 // Display side: runs on every animation frame so the horizon and compass move
@@ -479,15 +528,29 @@ function renderImu(){
   IMU_KV_AT=now;
   if(live){
     const age=Date.now()/1000-s.epoch;
-    badge.innerHTML=`<span class="dot ok"></span> IMU live · ${s.node||'yb-mra02'} · `+
+    badge.innerHTML=`<span class="dot ok"></span> IMU live · ${escapeHtml(s.node||IMU_NODE||'yb-mra02')} · `+
       `${IMU_RATE.toFixed(0)} Hz · age ${age.toFixed(2)}s`;
     kv.innerHTML=kvrow('Pitch',fmt(s.pitch,2)+'°')+kvrow('Roll',fmt(s.roll,2)+'°')+
       kvrow('Yaw',fmt(s.yaw,2)+'°')+kvrow('Heading',fmt(s.heading,1)+'°')+
       kvrow('Temp',fmt(s.temp,1)+'°C')+kvrow('Sample rate',IMU_RATE.toFixed(0)+' Hz');
   } else {
-    badge.innerHTML=`<span class="dot warn"></span> waiting for IMU — plug the YB-MRA02 into a cam3 <b>USB-A</b> port (the Pi 5 USB-C is power-only); piagent auto-detects it`;
+    badge.innerHTML=`<span class="dot warn"></span> waiting for IMU — ${imuHint()}`;
     kv.innerHTML='<div class="muted small">no samples yet</div>';
   }
+}
+// Never name a node the code has not just observed. The IMU can be moved to any
+// Pi, and this string used to send the operator to a slot that has no hardware
+// in it at all. The carrier is whichever node reports imu.present in /api/fleet,
+// or whichever one rigd last pulled a window from.
+function imuHint(){
+  const carrier=(FLEET.nodes||[]).find(n=>n.imu&&n.imu.present) ||
+                (FLEET.nodes||[]).find(n=>n.name===IMU_NODE);
+  if(carrier) return `${escapeHtml(carrier.name)} reports an IMU but no fresh samples `+
+    `reached rigd — check piagent on that node and the YB-MRA02's <b>USB-A</b> lead`;
+  const names=(FLEET.nodes||[]).filter(n=>n.state!=='OFFLINE').map(n=>n.name);
+  return `no node is serving samples${names.length?' ('+escapeHtml(names.join(', '))+' probed)':''} — `+
+    `plug the YB-MRA02 into a <b>USB-A</b> port on the node that carries it `+
+    `(the Pi's USB-C is power-only); piagent auto-detects it`;
 }
 // Artificial horizon: sky/ground with pitch ladder, roll arc + bank pointer,
 // and a fixed aircraft reference. Clipped to a rounded instrument bezel.
@@ -554,23 +617,329 @@ function drawTrace(id,buf,range,colors,live){
 }
 
 // ---- controls -------------------------------------------------------------
+// The exposure panel is a VIEW of rigd's one desired vector, not a form with
+// defaults of its own. It used to boot showing f/8 · 1/200 · ISO 400 whatever
+// the fleet was really set to, and Apply pushed all three unconditionally —
+// which silently converted a survey running ISO AUTO (16777215) to a fixed
+// ISO 400, with convergence still reporting "synced". Two rules now:
+//   1. the controls are hydrated from GET /api/settings and re-hydrated after
+//      every Apply, so what is on screen is what the fleet is on;
+//   2. Apply sends ONLY the fields the operator actually edited, so an
+//      untouched control can never overwrite desired with a page default.
 let EV=0;
+let DESIRED=null;         // last desired vector read back from rigd
+let CHOICES={};           // primary camera's legal values, straight from ilxctl
+const DIRTY=new Set();    // exposure fields edited since the last hydrate
+let SET_AT=0;             // epoch ms of the last successful hydrate
+
+// Value labels for anything the camera did not label for us: a body that is
+// offline (so we have no choice list) or a node that reports bare numeric
+// choices. Mirrors formatIso / formatShutterSpeed / formatFNumber in
+// src/camera.cpp so the panel can never disagree with the camera's own readout.
+// The body's own label always wins when it sends one, so the two Sony oddities
+// these do not reproduce — the MFNR ISO prefix and Bulb/"--" shutter — can only
+// appear via ilxctl, which labels them itself.
+const ISO_AUTO=16777215;
+function labIso(v){ const val=v&0x00FFFFFF; return val===ISO_AUTO?'ISO AUTO':'ISO '+val; }
+function labShutter(v){ const num=(v>>>16)&0xFFFF, den=v&0xFFFF;
+  if(!den) return '—';
+  if(num===1) return '1/'+den;                       // 1/200 = 65736
+  if(num%den===0) return (num/den)+'"';              // 2" = (2<<16)|1
+  return Math.floor(num/den)+'.'+(num%den)+'"'; }    // 1.3" = (13<<16)|10
+function labAperture(v){ return 'F'+(v%100?(v/100).toFixed(1):(v/100)); }
+function labSet(d){ return (d&&d.aperture!=null)
+  ? labAperture(d.aperture)+' · '+labShutter(d.shutter)+' · '+labIso(d.iso)+
+    ' · EV '+(d.expcomp||0)+' mEV'
+  : '—'; }
+
+function selVal(sel){ const v=sel&&sel.value; return (v===''||v==null)?null:+v; }
+// ilxctl emits choices as {v,l} pairs; the fake node emits bare numbers. Accept
+// both. Always carry the value rigd currently wants, even when the body did not
+// offer it — otherwise the select would show a DIFFERENT setting than the fleet
+// is actually on, which is the whole failure this panel is being fixed for.
+function normChoices(list,cur,lab){
+  const out=[];
+  (list||[]).forEach(c=>{ const v=(c&&typeof c==='object')?+c.v:+c;
+    if(!isFinite(v))return;
+    out.push({v:v,l:(c&&typeof c==='object'&&c.l)?c.l:lab(v)}); });
+  if(cur!=null && isFinite(cur) && !out.some(o=>o.v===+cur))
+    out.push({v:+cur,l:lab(+cur)+' (current)'});
+  return out;
+}
+function fillChoice(sel,list,cur,lab){
+  if(!sel)return;
+  const ch=normChoices(list,cur,lab), sig=ch.map(o=>o.v).join(',');
+  if(sel.dataset.sig!==sig){ sel.dataset.sig=sig; sel.innerHTML='';
+    ch.forEach(o=>{const e=document.createElement('option');
+      e.value=o.v; e.textContent=o.l; sel.appendChild(e);}); }
+  if(cur!=null && isFinite(cur)) sel.value=String(+cur);
+}
+function syncExpControls(){
+  const d=DESIRED||{};
+  // A field the operator has edited keeps ITS value across a repopulation;
+  // everything else follows the server.
+  fillChoice($('#sAp'),CHOICES.apertureChoices,
+             DIRTY.has('aperture')?selVal($('#sAp')):d.aperture, labAperture);
+  fillChoice($('#sSh'),CHOICES.shutterChoices,
+             DIRTY.has('shutter')?selVal($('#sSh')):d.shutter, labShutter);
+  fillChoice($('#sIso'),CHOICES.isoChoices,
+             DIRTY.has('iso')?selVal($('#sIso')):d.iso, labIso);
+}
+async function hydrateSettings(){
+  const d=await api('/api/settings');
+  if(!d || d.aperture==null) return;   // keep what is on screen; never invent
+  DESIRED=d; SET_AT=Date.now();
+  EV=+d.expcomp||0; $('#evVal').textContent=EV+' mEV';
+  if(!DIRTY.has('expmode')) $('#sExpMode').value=d._auto?'auto':'manual';
+  syncExpControls(); updateDirtyUi();
+}
+function markDirty(f,el){ DIRTY.add(f); if(el) el.classList.add('edited'); updateDirtyUi(); }
+function clearDirty(){ DIRTY.clear();
+  ['#sAp','#sSh','#sIso','#sExpMode'].forEach(s=>$(s).classList.remove('edited')); }
+function updateDirtyUi(){
+  const n=DIRTY.size, note=$('#applyNote');
+  $('#btnApply').textContent = n?('Apply to fleet ('+n+')'):'Apply to fleet';
+  if(n) note.innerHTML='<span style="color:var(--warn)">edited, not yet pushed: '+
+    [...DIRTY].join(', ')+'</span>';
+  else note.innerHTML='<span class="muted">fleet desired: '+
+    (DESIRED?labSet(DESIRED):'reading…')+'</span>';
+}
+$('#sAp').onchange=()=>markDirty('aperture',$('#sAp'));
+$('#sSh').onchange=()=>markDirty('shutter',$('#sSh'));
+$('#sIso').onchange=()=>markDirty('iso',$('#sIso'));
+$('#sExpMode').onchange=()=>markDirty('expmode',$('#sExpMode'));
+
 $('#evUp').onclick=()=>bumpEv(1); $('#evDn').onclick=()=>bumpEv(-1);
-async function bumpEv(s){ const r=await api('/api/ev',{steps:s}); if(r.ok){EV=r.expcomp_mev;$('#evVal').textContent=EV+' mEV';} }
+async function bumpEv(s){ const r=await api('/api/ev',{steps:s});
+  if(r.ok){ EV=r.expcomp_mev; $('#evVal').textContent=EV+' mEV';
+    if(DESIRED) DESIRED.expcomp=EV; updateDirtyUi(); } }
+
 $('#btnApply').onclick=async()=>{
-  const enc=(1<<16)|(+$('#sSh').value); // shutter 1/den
-  await api('/api/settings',{aperture:Math.round(+$('#sAp').value*100),
-    shutter:enc, iso:+$('#sIso').value});
-  await api('/api/settings/auto',{on:$('#sExpMode').value==='auto'});
+  const note=$('#applyNote');
+  if(!DIRTY.size){ note.innerHTML='<span class="muted">nothing edited — Apply only '+
+    'pushes fields you touched, so it cannot overwrite the fleet with this page\'s '+
+    'defaults. Current: '+(DESIRED?labSet(DESIRED):'unknown')+'</span>'; return; }
+  const body={};
+  if(DIRTY.has('aperture')) body.aperture=selVal($('#sAp'));
+  if(DIRTY.has('shutter'))  body.shutter =selVal($('#sSh'));
+  if(DIRTY.has('iso'))      body.iso     =selVal($('#sIso'));
+  const btn=$('#btnApply'); btn.disabled=true;
+  const msg=[]; let bad=false;
+  if(Object.keys(body).length){
+    const r=await api('/api/settings',body);
+    if(r && r.ok!==false) msg.push('pushed '+Object.keys(r.applied||body).join(', '));
+    else { bad=true; msg.push('apply failed: '+((r&&r.error)||'no response')); }
+  }
+  if(!bad && DIRTY.has('expmode')){
+    const r=await api('/api/settings/auto',{on:$('#sExpMode').value==='auto'});
+    if(r && r.ok!==false) msg.push('mode '+$('#sExpMode').value);
+    else { bad=true; msg.push('mode failed: '+((r&&r.error)||'no response')); }
+  }
+  btn.disabled=false;
+  if(!bad) clearDirty();
+  await hydrateSettings();          // show what rigd actually holds now
+  note.innerHTML='<span style="color:var(--'+(bad?'bad':'ok')+')">'+escapeHtml(msg.join(' · '))+
+    '</span>'+(bad?'':' <span class="muted">— '+labSet(DESIRED)+'; watch convergence below</span>');
 };
-$('#btnStart').onclick=async()=>{ const r=await api('/api/run/start',{
-  label:$('#cLabel').value, interval_s:+$('#cInt').value, frames:+$('#cFrames').value,
-  auto_capture:$('#cAuto').checked});
-  $('#runInfo').textContent = r.ok?('started '+r.run_id+' → '+r.root):('start failed: '+r.error); };
+
+// ---- run control ----------------------------------------------------------
+// Pre-flight. A run started with one camera, no IMU and no GPS still writes a
+// flight_log — one with half its columns empty and no second view to make a
+// stereo pair from. Nothing downstream can recover that, so the check happens
+// here, before the first frame is written.
+//
+// A row is a label, a severity, the measured value, and — when it is not green
+// — what that costs the survey. An amber row with no reason just teaches the
+// operator to click past it.
+function pfRow(k,cls,v,why){ return {k:k,cls:cls,v:v,why:why}; }
+async function preflight(){
+  const [f,d,an,nv]=await Promise.all([api('/api/fleet'),api('/api/diag'),
+                                       api('/api/anomalies'),api('/api/nav')]);
+  const nodes=(f&&f.nodes)||[], live=nodes.filter(n=>n.connected);
+  const rows=[], hard=[], warn=[];
+  const run=(f&&f.run)||{};
+  const label=$('#cLabel').value.trim(), iv=+$('#cInt').value;
+
+  if(run.active){ hard.push('run '+run.run_id+' is already recording');
+    rows.push(pfRow('run','bad','already recording '+run.run_id)); }
+  if(!label){ hard.push('transect label is empty'); }
+  if(!(iv>0)){ hard.push('interval must be greater than 0 s'); }
+  rows.push(pfRow('transect', label&&iv>0?'ok':'bad',
+    (label||'(no label)')+' · every '+(iv>0?iv:'?')+' s · '+
+    (+$('#cFrames').value>0?(+$('#cFrames').value+' frames'):'until stopped')+
+    ($('#cAuto').checked?' · auto-capture':' · manual capture only')));
+
+  // Cameras. Two is the survey configuration; one still records, but there is
+  // no pair to photogrammetrise.
+  if(!live.length){ hard.push('no camera connected');
+    rows.push(pfRow('cameras','bad','none connected','nothing would be recorded')); }
+  else {
+    if(live.length<2) warn.push('only '+live.length+' camera connected — no stereo pair');
+    rows.push(pfRow('cameras',live.length>=2?'ok':'warn',
+      live.map(n=>'Cam'+n.cam_num+' '+n.name+' ('+(n.model||'?')+')').join(' · '),
+      live.length<2?('only '+live.length+' camera — no stereo pair to photogrammetrise'):null));
+  }
+  // GPIO harness: without it a node fires over USB, 10–80 ms from its partner,
+  // which is 5–8x the <10 ms the survey is specified to.
+  const nogpio=live.filter(n=>!(n.gpio&&n.gpio.available));
+  if(live.length){
+    if(nogpio.length){ warn.push('no GPIO harness on '+nogpio.map(n=>n.name).join(', ')+
+      ' — those frames fire over USB (10–80 ms skew)');
+      rows.push(pfRow('sync','warn','USB firing on '+nogpio.map(n=>n.name).join(', '),
+        'no GPIO harness there: 10–80 ms inter-camera skew instead of ~1 ms')); }
+    else rows.push(pfRow('sync','ok','GPIO harness on all '+live.length+' — scheduled fire'));
+  }
+  // Settings: identical exposure across the pair is what makes the frames
+  // comparable at all.
+  const div=live.filter(n=>n.convergence&&n.convergence.synced===false);
+  const unk=live.filter(n=>!n.convergence||n.convergence.synced==null);
+  if(div.length){ warn.push('settings divergent on '+div.map(n=>n.name+' ('+
+      ((n.convergence.diverged)||[]).join(',')+')').join(', '));
+    rows.push(pfRow('settings','bad','divergent: '+div.map(n=>n.name+' '+
+      ((n.convergence.diverged)||[]).join(',')).join(' · '),
+      'the cameras are NOT identically configured — the pair will not match')); }
+  else if(unk.length) rows.push(pfRow('settings','warn','not verified yet on '+
+      unk.map(n=>n.name).join(', '),'no readback yet — exposure match unconfirmed'));
+  else if(live.length) rows.push(pfRow('settings','ok','all cameras converged'));
+  rows.push(pfRow('exposure', 'ok', (d&&d.desired)?labSet(d.desired):(DESIRED?labSet(DESIRED):'unknown')));
+
+  // IMU — pitch/roll/yaw/accel/gyro columns of every flight_log row.
+  const imun=nodes.filter(n=>n.imu&&n.imu.present);
+  if(!imun.length){ warn.push('no IMU — attitude columns will be empty');
+    rows.push(pfRow('imu','warn','no node reporting an IMU',
+      'pitch/roll/yaw/heading and accel/gyro columns will be empty in flight_log')); }
+  else { const stale=imun.filter(n=>n.imu.age_s!=null&&n.imu.age_s>3);
+    if(stale.length) warn.push('IMU samples stale on '+stale.map(n=>n.name).join(', '));
+    rows.push(pfRow('imu',stale.length?'warn':'ok', imun.map(n=>n.name+' @ '+
+      (n.imu.rate_hz||'?')+' Hz'+(n.imu.age_s!=null?' · age '+n.imu.age_s+'s':'')).join(' · '),
+      stale.length?'samples are stale — attitude will be dropped, not carried over':null)); }
+
+  // Nav — lat/long/utm/depth columns.
+  if(!nv || nv.present===false){ warn.push('no nav source — position and depth columns will be empty');
+    rows.push(pfRow('nav','warn','no nav source',
+      'lat/long/utm/depth columns will be empty for every frame')); }
+  else if(d&&d.nav&&d.nav.online===false){ warn.push('iKonvert sending no data (N2K bus power?)');
+    rows.push(pfRow('nav','bad','gateway silent on '+(d.nav.port||'?'),
+      'the iKonvert draws power from the N2K bus, not USB — check bus power')); }
+  else if(nv.lat==null){ warn.push('no GPS fix — position columns will be empty');
+    rows.push(pfRow('nav','warn','online, no fix'+(nv.sats!=null?' · '+nv.sats+' sats':''),
+      'position columns will be empty until a fix arrives')); }
+  else rows.push(pfRow('nav','ok',fmt(nv.lat,5)+', '+fmt(nv.lon,5)+
+    (nv.sats!=null?' · '+nv.sats+' sats':'')+(nv.depth_m!=null?' · '+fmt(nv.depth_m,1)+' m':'')));
+
+  // Clock. Jetson time still produces a usable log, it is just not disciplined
+  // to the same master as the rest of the survey.
+  const ts=(f&&f.time_source)||'—';
+  if(ts!=='gps'){ warn.push('clock is '+ts+', not GPS-disciplined');
+    rows.push(pfRow('clock','warn',ts+' — no GPS time',
+      'frame times come from the Jetson clock; time_source will read "'+ts+'"')); }
+  else rows.push(pfRow('clock','ok','gps'+((d&&d.time)?' · offset '+fmt(d.time.gps_offset_s,3)+' s':'')));
+
+  // Consumables.
+  const disks=live.filter(n=>n.disk_free_mb!=null);
+  if(disks.length){ const lo=disks.reduce((a,b)=>a.disk_free_mb<b.disk_free_mb?a:b);
+    if(lo.disk_free_mb<2000) warn.push(lo.name+' has '+lo.disk_free_mb+' MB free');
+    rows.push(pfRow('disk',lo.disk_free_mb<2000?'warn':'ok',
+      disks.map(n=>n.name+' '+n.disk_free_mb+' MB').join(' · '),
+      lo.disk_free_mb<2000?(lo.name+' will stop PC-saving mid-transect'):null)); }
+  const batts=live.filter(n=>typeof n.battery==='number');
+  if(batts.length){ const lo=batts.reduce((a,b)=>a.battery<b.battery?a:b);
+    if(lo.battery<=20) warn.push(lo.name+' battery '+lo.battery+'%');
+    rows.push(pfRow('battery',lo.battery<=20?'warn':'ok',
+      batts.map(n=>n.name+' '+n.battery+'%').join(' · '),
+      lo.battery<=20?(lo.name+' may not last the transect'):null)); }
+
+  const alist=(an&&an.anomalies)||[];
+  if(alist.length){ const bad=alist.filter(a=>anomSev(a.kind)==='bad');
+    if(bad.length) warn.push(bad.length+' firing anomal'+(bad.length>1?'ies':'y')+': '+
+      bad.map(a=>a.kind+(a.node?'/'+a.node:'')).join(', '));
+    rows.push(pfRow('anomalies',bad.length?'bad':'warn',
+      alist.map(a=>a.kind+(a.node?'/'+a.node:'')).join(' · '))); }
+  else rows.push(pfRow('anomalies','ok','none firing'));
+
+  return {rows:rows,hard:hard,warn:warn};
+}
+function renderPreflight(pf,extra){
+  $('#preflight').innerHTML = pf.rows.map(r=>
+    `<div class="pf ${r.cls}"><span class="pfk">${escapeHtml(r.k)}</span>`+
+    `<span class="pfv">${escapeHtml(r.v)}${r.why?
+      ('<span class="muted"> — '+escapeHtml(r.why)+'</span>'):''}</span></div>`).join('')
+    + (extra||'');
+}
+$('#btnStart').onclick=async()=>{
+  const btn=$('#btnStart'); btn.disabled=true;
+  $('#preflight').innerHTML='<span class="muted small">pre-flight…</span>';
+  let pf;
+  // A pre-flight that fails must never fall through into a silent start: the
+  // whole point is that nothing records until the operator has seen the state.
+  try{ pf=await preflight(); }
+  catch(e){ $('#preflight').innerHTML='<div class="pf bad"><span class="pfk">pre-flight</span>'+
+      '<span class="pfv">check failed: '+escapeHtml(String(e))+'</span></div>';
+    $('#runInfo').innerHTML='<span style="color:var(--bad)">not started — pre-flight '+
+      'could not read the rig state</span>'; return; }
+  finally { btn.disabled=false; }
+  if(pf.hard.length){
+    renderPreflight(pf,`<div class="pf bad" style="margin-top:6px"><span class="pfk">blocked</span>`+
+      `<span class="pfv">${escapeHtml(pf.hard.join(' · '))}</span></div>`);
+    $('#runInfo').innerHTML='<span style="color:var(--bad)">not started — the rig is not '+
+      'fit to survey. Fix the blocked item(s) above.</span>';
+    return;
+  }
+  if(pf.warn.length){
+    renderPreflight(pf,`<div class="row" style="margin-top:8px">`+
+      `<span class="small" style="color:var(--warn)">${pf.warn.length} warning`+
+      `${pf.warn.length>1?'s':''} — this run will record with the above</span>`+
+      `<button class="act go" id="btnStartAnyway" style="margin-left:auto">Start anyway</button>`+
+      `<button class="act" id="btnStartCancel">Cancel</button></div>`);
+    $('#btnStartAnyway').onclick=()=>{ renderPreflight(pf); startRun(); };
+    $('#btnStartCancel').onclick=()=>{ $('#preflight').innerHTML='';
+      $('#runInfo').textContent='start cancelled'; };
+    $('#runInfo').innerHTML='<span style="color:var(--warn)">not started yet — review the '+
+      'pre-flight above, then Start anyway.</span>';
+    return;
+  }
+  renderPreflight(pf); startRun();
+};
+async function startRun(){
+  $('#runInfo').textContent='starting…';
+  const r=await api('/api/run/start',{label:$('#cLabel').value.trim(),
+    interval_s:+$('#cInt').value, frames:+$('#cFrames').value,
+    auto_capture:$('#cAuto').checked});
+  $('#runInfo').innerHTML = r.ok
+    ? '<span style="color:var(--ok)">started '+escapeHtml(r.run_id||'')+' → '+
+      escapeHtml(r.root||'')+'</span>'
+    : '<span style="color:var(--bad)">start failed: '+escapeHtml(r.error||'unknown')+'</span>';
+}
 $('#btnStop').onclick=async()=>{ const r=await api('/api/run/stop',{});
-  $('#runInfo').textContent = r.ok?('stopped '+r.run_id):('stop: '+(r.error||'')); };
-$('#btnCap').onclick=async()=>{ const r=await api('/api/capture',{});
-  $('#runInfo').textContent = r.ok?('captured: '+Object.keys(r.results||{}).join(', ')):('capture: '+r.error); };
+  if(!r.ok){ $('#runInfo').innerHTML='<span style="color:var(--bad)">stop: '+
+    escapeHtml(r.error||'no active run')+'</span>'; return; }
+  // The per-node summary is the only account of what the transect actually
+  // pulled; printing just the run id threw it away.
+  const s=r.summary||{};
+  const tally=Object.keys(s).map(k=>k+' '+(s[k].pulled||0)+' ok'+
+    (s[k].failed?' / '+s[k].failed+' FAILED':'')).join(' · ');
+  $('#runInfo').innerHTML='<span style="color:var(--ok)">stopped '+escapeHtml(r.run_id||'')+
+    '</span>'+(tally?' <span class="muted">· '+escapeHtml(tally)+'</span>':''); };
+$('#btnCap').onclick=async()=>{
+  const el=$('#runInfo'); el.textContent='firing…';
+  const r=await api('/api/capture',{});
+  const res=r.results||{}, names=Object.keys(res);
+  if(!names.length){ el.innerHTML='<span style="color:var(--bad)">capture failed: '+
+    escapeHtml(r.error||'no camera fired')+'</span>'; return; }
+  // Report per node. A fire that every camera rejected used to render as
+  // "captured: cam1, cam2" — the operator's only feedback said the opposite of
+  // what happened. The path matters too: "usb" means the shot was NOT
+  // hardware-scheduled, so it is not a synchronised pair.
+  const parts=names.map(k=>{ const v=res[k]||{};
+    if(v.ok===false) return '<span style="color:var(--bad)">'+escapeHtml(k)+' FAILED: '+
+      escapeHtml(v.error||'no reason given')+'</span>';
+    const extra=(v.path||'?')+(v.late_ms!=null?' · late '+v.late_ms+' ms':'');
+    return '<span style="color:var(--ok)">'+escapeHtml(k)+' ok</span>'+
+      ' <span class="muted">('+escapeHtml(extra)+')</span>'; });
+  const usb=names.filter(k=>(res[k]||{}).path==='usb');
+  el.innerHTML = parts.join(' · ') + (usb.length
+    ? ' <span style="color:var(--warn)">— '+escapeHtml(usb.join(', '))+
+      ' fired over USB, not GPIO: unsynchronised</span>' : ''); };
 function renderConv(){
   const c=$('#convInfo'); c.innerHTML=FLEET.nodes.filter(n=>n.connected).map(n=>{
     const cv=n.convergence||{}; const ok=cv.synced===true;
@@ -579,11 +948,47 @@ function renderConv(){
       cv.synced===false?'<span class="dot bad"></span> '+ (cv.diverged||[]).join(','):
       '<span class="dot off"></span> —'}</span></div>`;}).join('')||'<span class="muted small">no cameras</span>';
 }
+// ---- anomalies (global, tab-independent) ----------------------------------
+// This is polled on its own timer, not from pollControls. Anomalies used to be
+// fetched only while the Controls tab was open — and because rigd only runs the
+// detectors when /api/anomalies or /api/diag is called, several of them
+// (battery_low, disk_low, jitter_high, camera_absent, nav_gateway_down) were
+// never evaluated at all unless a browser happened to be sitting on that tab.
+let ANOMS=[], ANOM_SIG='';
+// Red for the ones that stop the survey outright — a node gone, a camera not
+// claimed, pulls failing, the N2K gateway dark, battery/disk running out.
+// Amber for the ones that degrade the data but let it continue.
+function anomSev(kind){ return /offline|fail|absent|down|_low/.test(kind||'')?'bad':'warn'; }
 async function pollAnoms(){
-  const r=await api('/api/anomalies'); const el=$('#anoms');
-  const a=r.anomalies||[];
-  el.innerHTML = a.length? a.map(x=>`<div class="anom ${x.kind.includes('offline')||x.kind.includes('fail')?'bad':''}">
-    <b>${x.kind}</b> ${x.node?('· '+x.node):''} — ${x.msg}<br><span class="muted small">→ ${x.suggested_action}</span></div>`).join('')
+  const r=await api('/api/anomalies');
+  if(!r || !Array.isArray(r.anomalies)) return;   // a failed poll is not "all clear"
+  ANOMS=r.anomalies;
+  renderAnomPill();
+  if(TAB==='controls') renderAnoms();
+}
+function renderAnomPill(){
+  const el=$('#hAnom');
+  if(!ANOMS.length){ pill(el,'no anomalies',''); el.title='no detector firing'; ANOM_SIG=''; return; }
+  const bad=ANOMS.filter(a=>anomSev(a.kind)==='bad');
+  const top=bad[0]||ANOMS[0];
+  pill(el,'⚠ '+top.kind+(top.node?(' '+top.node):'')+
+       (ANOMS.length>1?(' +'+(ANOMS.length-1)):''), bad.length?'bad':'warn');
+  el.title=ANOMS.map(a=>(a.node?a.node+': ':'')+a.kind+' — '+a.msg+
+    (a.suggested_action?('\n    → '+a.suggested_action):'')).join('\n');
+  // Flash only when the SET changes, so a fault that is already known does not
+  // blink for the whole run and train the operator to ignore it.
+  const sig=ANOMS.map(a=>a.kind+'/'+(a.node||'')).sort().join(',');
+  if(sig!==ANOM_SIG){ ANOM_SIG=sig;
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }
+}
+$('#hAnom').onclick=()=>{ showTab('controls');
+  const c=$('#anoms'); if(c) c.scrollIntoView({block:'center'}); };
+function renderAnoms(){
+  const el=$('#anoms');
+  el.innerHTML = ANOMS.length ? ANOMS.map(x=>
+    `<div class="anom ${anomSev(x.kind)==='bad'?'bad':''}"><b>${escapeHtml(x.kind)}</b> `+
+    `${x.node?('· '+escapeHtml(x.node)):''} — ${escapeHtml(x.msg)}<br>`+
+    `<span class="muted small">→ ${escapeHtml(x.suggested_action||'')}</span></div>`).join('')
     : '<span class="muted small">none</span>';
 }
 
@@ -598,23 +1003,39 @@ function holdButton(el,onDown,onUp){
 let histPrimary=null;
 function renderCtlLive(){
   const wrap=$('#ctlLive'), live=FLEET.nodes.filter(n=>n.connected);
-  if(!wrap.dataset.n || +wrap.dataset.n!==live.length){
-    wrap.dataset.n=live.length; wrap.innerHTML='';
+  // Keyed on identity, not count — see renderReviewHeaders. A same-poll swap
+  // used to leave the departed camera's last live frame and a frozen histogram
+  // sitting under its own heading while the new camera had no column.
+  const key=connKey(live);
+  if(wrap.dataset.key!==key){
+    wrap.dataset.key=key; wrap.innerHTML='';
     if(!live.length){ wrap.innerHTML='<span class="muted small">no cameras connected</span>';
       histPrimary=null; $('#histCam').textContent='—'; return; }
     live.forEach(n=>wrap.insertAdjacentHTML('beforeend',
       `<div class="camcol"><div class="hd"><b>Cam${n.cam_num} · ${n.name}</b>
         <span class="exp mono" id="clx-${n.name}"></span></div>
         <div class="frame"><img id="lv-${n.name}" alt=""></div></div>`));
-    histPrimary=live[0].name; $('#histCam').textContent='Cam'+live[0].cam_num;
   }
-  live.forEach(n=>{const e=$('#clx-'+n.name); if(e) e.textContent=(n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||'');});
+  if(!live.length) return;
+  // The histogram is bound to one node and that node can leave.
+  if(!histPrimary || !live.some(n=>n.name===histPrimary)){
+    histPrimary=live[0].name; $('#histCam').textContent='Cam'+live[0].cam_num; }
+  const now=Date.now();
+  live.forEach(n=>{const e=$('#clx-'+n.name); if(!e)return;
+    const img=$('#lv-'+n.name), at=(img&&+img.dataset.at)||0;
+    // A live view that stopped updating still shows a picture. Age it, so a
+    // frozen frame reads as frozen rather than as the current scene.
+    const age=at?(now-at)/1000:null;
+    const stale=(age!=null&&age>3)
+      ? ` <span style="color:var(--warn)">· ${age.toFixed(0)}s old</span>` : '';
+    e.innerHTML=escapeHtml((n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||''))+stale;});
 }
 function refreshLive(prefix, nodes){
   nodes.forEach(n=>{const img=$('#'+prefix+n.name); if(!img)return;
     if(img.dataset.busy)return; img.dataset.busy='1';
     const done=()=>{img.dataset.busy='';};
-    img.onload=()=>{done(); if(prefix==='lv-'&&n.name===histPrimary) drawHist(img);};
+    img.onload=()=>{done(); img.dataset.at=Date.now();
+      if(prefix==='lv-'&&n.name===histPrimary) drawHist(img);};
     img.onerror=done;
     img.src='/api/liveview?node='+n.name+'&_='+Date.now();
   });
@@ -645,12 +1066,25 @@ function fillSel(sel,choices,cur){ if(!sel||!choices)return;
 let ctlChoicesLoaded=false;
 async function pollControls(){
   renderCtlLive(); refreshLive('lv-', FLEET.nodes.filter(n=>n.connected));
-  renderConv(); pollAnoms();
+  renderConv(); renderAnoms();
+  // Re-read the desired vector on a slow cadence: an EV bump from another
+  // browser, a second operator, or a rigd restart can move it under us. Fields
+  // the operator has edited are left alone (see hydrateSettings).
+  if(Date.now()-SET_AT>5000) hydrateSettings();
   if(!ctlChoicesLoaded){
     const prim=FLEET.nodes.find(n=>n.connected);
     if(prim){ const s=await api('/api/status?node='+prim.name);
       if(s && s.focusModes){ fillSel($('#fMode'),s.focusModes,s.focusMode);
-        fillSel($('#zSet'),s.zoomSettings,s.zoomSetting); ctlChoicesLoaded=true; } }
+        fillSel($('#zSet'),s.zoomSettings,s.zoomSetting); }
+      // Exposure choice lists come from the primary body, so the panel can only
+      // ever send a value that camera accepts. Not gated on focusModes: a body
+      // with the lens table locked still reports its exposure choices.
+      if(s && (s.shutterChoices||s.isoChoices||s.apertureChoices)){
+        CHOICES={apertureChoices:s.apertureChoices, shutterChoices:s.shutterChoices,
+                 isoChoices:s.isoChoices};
+        syncExpControls(); }
+      if(s && (s.focusModes||s.shutterChoices||s.isoChoices)) ctlChoicesLoaded=true;
+    }
   }
 }
 $('#fMode').onchange=()=>api('/api/focus/mode',{mode:+$('#fMode').value});
@@ -686,18 +1120,26 @@ function kvrow(k,v){return `<div class="kv"><span class="k">${k}</span><span cla
 function fmt(v,n){return v==null||isNaN(v)?'—':(+v).toFixed(n);}
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
-pollFleet(); pollEvents();
+pollFleet(); pollEvents(); pollAnoms(); hydrateSettings();
 setInterval(pollFleet, 2000);
 setInterval(()=>{ if(TAB==='review') pollReview(); }, 1200);
-setInterval(()=>{ if(TAB==='nav') pollNav(); }, 1500);
+// Nav is NOT tab-gated: the header's nav pill is a run-time indicator ("am I
+// still recording a position with every frame?"), and gating it left the pill
+// on its power-up placeholder for anyone who never opened the Nav tab. The
+// track buffer also fills while you are on Review, which is where you are
+// during a transect.
+setInterval(pollNav, 1500);
+// Anomalies on their own timer, independent of the visible tab. rigd only runs
+// the detectors when this endpoint (or /api/diag) is called, so this poll is
+// what makes battery/disk/jitter/absent detection happen at all.
+setInterval(pollAnoms, 2500);
 // The IMU streams at ~200 Hz. Pull a batch a few times a second and paint from
 // it on every animation frame: 60 fps of motion for ~5 requests/s, instead of
 // 60 round trips a second through rigd and piagent.
 setInterval(()=>{ if(TAB==='imu') pollImuWindow(); }, 200);
 requestAnimationFrame(function imuFrame(){ if(TAB==='imu') renderImu(); requestAnimationFrame(imuFrame); });
-// Live view has to refresh faster than the anomaly list, and pollControls does
-// both plus the lens-choice population - calling pollAnoms here instead left the
-// Controls tab permanently showing "no cameras connected".
+// Live view has to refresh faster than the anomaly list; pollControls now only
+// RENDERS the anomalies that the global poll above has already fetched.
 setInterval(()=>{ if(TAB==='controls') pollControls(); }, 1000);
 setInterval(pollEvents, 2000);
 </script>

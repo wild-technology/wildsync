@@ -175,9 +175,24 @@ def http_bytes(url, timeout=20, cap=64 * 1024 * 1024):
     req = urllib.request.Request(url)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            declared = r.headers.get("Content-Length")
             data = r.read(cap + 1)
         if len(data) > cap:
             return None, "frame exceeds %d bytes" % cap
+        # read(n) with an explicit size returns a SHORT buffer without raising
+        # when the connection dies mid-body. Without this check a severed
+        # transfer is indistinguishable from a complete one, and half a JPEG is
+        # written into the survey folder and given a flight_log row - a record
+        # that looks like real data. The node always sends Content-Length, so
+        # compare against it and fail loudly instead.
+        if declared is not None:
+            try:
+                want = int(declared)
+            except ValueError:
+                want = None
+            if want is not None and len(data) != want:
+                return None, ("truncated transfer: got %d of %d bytes"
+                              % (len(data), want))
         return data, None
     except Exception as e:  # noqa: BLE001
         return None, str(e)
@@ -230,6 +245,18 @@ class NodeMonitor(threading.Thread):
                              "node_transition",
                              "%s -> %s" % (self.state, new),
                              node=self.name_, **ctx)
+            if new == self.CONNECTED:
+                # Forget what we believe we pushed to this body. Fields with no
+                # readback key (filetype, imagesize, transsize, expcomp) are
+                # converged optimistically against this cache, so a body that
+                # went away and came back - a power cycle, a USB replug, a
+                # reboot to Sony's RAW+JPEG factory default - is remembered as
+                # already correct and is NEVER re-pushed. The readable fields
+                # snap back and the UI shows "synced", while the camera quietly
+                # shoots the wrong file type for the whole survey. Clearing here
+                # is what makes PROTOCOL.md's "settings re-push + verify after
+                # every reconnect" actually true.
+                self._pushed = {}
             self.state = new
 
     def run(self):
@@ -447,6 +474,25 @@ class SettingsManager:
         pushed = getattr(m, "_pushed", None)
         if pushed is None or force:
             pushed = m._pushed = {}
+        # A body that reset does not announce it. Clearing the blind-field cache
+        # on the OFFLINE->CAM_CONNECTED transition is necessary but NOT
+        # sufficient: a camera can power-cycle entirely between two 2 s polls, so
+        # the monitor never observes a transition at all and the cache survives a
+        # reboot it should not have. The reliable tell is the readable fields -
+        # if aperture/shutter/ISO/drive/store have reverted underneath us, the
+        # body has been reset or hand-nudged, and whatever we believe we pushed
+        # to the fields with NO readback (filetype, imagesize, transsize,
+        # expcomp) is no longer credible either. Sony's factory default is
+        # RAW+JPEG, so the specific consequence of trusting the stale cache is a
+        # whole transect silently shot in the wrong file type while the UI
+        # reports "synced".
+        if not force:
+            reverted = [f for f, (w, k) in CONVERGE_FIELDS.items()
+                        if k and want.get(f) is not None
+                        and status.get(k) is not None
+                        and status.get(k) != want[f]]
+            if reverted:
+                pushed = m._pushed = {}
         for field, (which, key) in CONVERGE_FIELDS.items():
             target = want.get(field)
             if target is None:
