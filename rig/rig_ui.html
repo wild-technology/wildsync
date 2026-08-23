@@ -14,40 +14,54 @@
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
-       font-size:14px;line-height:1.45}
-  header{display:flex;align-items:center;gap:16px;padding:10px 18px;
+       font-size:15px;line-height:1.45}
+  header{display:flex;align-items:center;gap:14px;padding:10px 18px;flex-wrap:wrap;
          border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
   header h1{font-family:var(--mono);font-size:15px;margin:0;letter-spacing:.02em}
   header .clock{font-family:var(--mono);color:var(--muted);font-size:12px}
-  .pill{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:10px;
+  .pill{font-family:var(--mono);font-size:12px;padding:3px 9px;border-radius:10px;
         border:1px solid var(--line);color:var(--muted)}
   .pill.on{color:var(--ok);border-color:var(--ok)}
   .pill.warn{color:var(--warn);border-color:var(--warn)}
   .pill.bad{color:var(--bad);border-color:var(--bad)}
   nav{display:flex;gap:2px;padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line);
-      position:sticky;top:45px;z-index:4;overflow-x:auto}
+      position:sticky;top:49px;z-index:4;overflow-x:auto}
   nav button{background:none;border:none;color:var(--muted);font-family:var(--mono);
-             font-size:12px;padding:10px 14px;cursor:pointer;border-bottom:2px solid transparent}
+             font-size:13px;padding:12px 16px;min-height:44px;cursor:pointer;
+             border-bottom:2px solid transparent}
   nav button.active{color:var(--ink);border-bottom-color:var(--accent)}
+  nav button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  /* A firing red/amber anomaly escalates beyond the 12px header pill: the
+     active tab wears it as a top border, visible from any screen. */
+  body.sev-bad nav{border-top:3px solid var(--bad)}
+  body.sev-warn nav{border-top:3px solid var(--warn)}
   main{padding:16px}
   .tab{display:none} .tab.active{display:block}
   .grid{display:grid;gap:12px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
   .card h2{font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.08em;
            color:var(--muted);margin:0 0 10px}
-  .kv{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
-  .kv .k{color:var(--muted)} .kv .v{font-family:var(--mono)}
+  .kv{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;gap:10px}
+  .kv .k{color:var(--muted)} .kv .v{font-family:var(--mono);text-align:right}
   .big{font-family:var(--mono);font-size:26px;font-weight:600}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   button.act{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
-             border-radius:6px;padding:7px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
+             border-radius:6px;padding:10px 14px;min-height:44px;
+             font-family:var(--mono);font-size:13px;cursor:pointer}
   button.act:hover{border-color:var(--accent)}
-  button.act.go{border-color:var(--ok);color:var(--ok)}
-  button.act.stop{border-color:var(--bad);color:var(--bad)}
+  button.act:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  button.act.go{background:var(--ok);border-color:var(--ok);color:#08120c;font-weight:700}
+  button.act.stop{background:var(--bad);border-color:var(--bad);color:#170707;font-weight:700;position:relative;overflow:hidden}
+  button.act.stop .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(0,0,0,.35)}
+  button.act.toggle.on{background:var(--accent);border-color:var(--accent);color:#0a1420;font-weight:700}
   input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
-               border-radius:6px;padding:6px 8px;font-family:var(--mono);font-size:12px}
+               border-radius:6px;padding:9px 10px;font-family:var(--mono);font-size:13px;min-height:40px}
+  input:focus-visible,select:focus-visible{outline:2px solid var(--accent)}
+  input[type=checkbox]{min-height:0;width:20px;height:20px}
+  input[type=range]{min-height:0;padding:0;height:30px;accent-color:var(--accent)}
+  input[type=range]::-webkit-slider-thumb{width:26px;height:26px}
   label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:3px}
-  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dot{width:11px;height:11px;border-radius:50%;display:inline-block}
   .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
   .dot.bad{background:var(--bad)} .dot.off{background:var(--muted)}
   table{border-collapse:collapse;width:100%;font-size:12.5px}
@@ -56,16 +70,19 @@
   td.n,.mono{font-family:var(--mono)}
   .cams{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
   .camcol{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
-  .camcol .hd{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;
+  .camcol .hd{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;gap:8px;
               border-bottom:1px solid var(--line);background:var(--panel2)}
-  .camcol .hd .exp{font-family:var(--mono);font-size:12px;color:var(--accent)}
+  .camcol .hd .exp{font-family:var(--mono);font-size:12px;color:var(--accent);white-space:nowrap}
   .frame{position:relative;background:#000;aspect-ratio:3/2;display:flex;align-items:center;justify-content:center}
   .frame img{width:100%;height:100%;object-fit:contain}
   .frame .burn{position:absolute;left:8px;top:8px;font-family:var(--mono);font-size:12px;
                background:rgba(0,0,0,.6);padding:3px 7px;border-radius:4px;color:#fff}
   .frame .cnt{position:absolute;right:8px;bottom:8px;font-family:var(--mono);font-size:11px;
               background:rgba(0,0,0,.6);padding:2px 6px;border-radius:4px;color:var(--muted)}
-  .spark{display:block;width:100%;height:34px}
+  .frame.missing{border:2px dashed var(--bad)}
+  .frame.missing .msg{color:var(--bad);font-family:var(--mono);font-size:16px;font-weight:700}
+  .frame.offline .msg{color:var(--muted);font-family:var(--mono);font-size:13px;text-align:center;padding:0 14px}
+  .spark{display:block;width:100%;height:30px}
   .ev{font-family:var(--mono);font-size:12px;padding:2px 0;border-bottom:1px solid var(--grid);display:flex;gap:8px}
   .ev .t{color:var(--muted)} .ev .sev{width:56px}
   .ev.warn .sev{color:var(--warn)} .ev.error .sev,.ev.critical .sev{color:var(--bad)}
@@ -74,31 +91,38 @@
   .anom{border-left:3px solid var(--warn);padding:8px 10px;margin:6px 0;background:var(--panel2);border-radius:4px}
   .anom.bad{border-left-color:var(--bad)}
   canvas{display:block;max-width:100%}
-  /* An exposure control the operator has edited but not yet applied. Without
-     this marker the panel is indistinguishable from one showing the fleet's
-     real settings, and "Apply" becomes a guess about what it will push. */
+  /* An exposure control the operator has edited but the body has not yet
+     echoed back. Cleared the moment the readback agrees. */
   input.edited,select.edited{border-color:var(--warn);color:var(--warn)}
-  /* Clipped, not wrapped: a long anomaly kind must not push the clock out of
-     the header. The full list is in the pill's tooltip. */
   #hAnom{cursor:pointer;max-width:26ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .pill.flash{animation:pillflash 900ms ease-in-out 3}
   @keyframes pillflash{50%{opacity:.2}}
-  /* A camera holding a settings preview is deliberately NOT on the fleet's
-     vector. While that is true the two bodies are shooting different exposures,
-     so it has to be impossible to mistake for a normal live view. */
-  .previewing{outline:2px solid var(--warn);outline-offset:-2px}
-  .pvbadge{position:absolute;left:8px;top:8px;background:rgba(230,169,75,.94);
-           color:#1a1400;font-family:var(--mono);font-size:11px;font-weight:700;
-           padding:3px 7px;border-radius:4px;letter-spacing:.04em;z-index:2}
-  .pvbar{border:1px solid var(--warn);background:rgba(230,169,75,.09);
-         border-radius:6px;padding:9px 11px;margin-top:10px}
-  .pvbar b{color:var(--warn)}
-  .pvdiff{font-family:var(--mono);font-size:12px;margin-top:4px}
-  .pvdiff .from{color:var(--muted);text-decoration:line-through}
-  .pvdiff .to{color:var(--warn)}
+  /* Rig link banner: rigd stopped answering — every number on screen is stale. */
+  #linkLost{display:none;position:sticky;top:0;z-index:9;background:var(--bad);color:#170707;
+            font-family:var(--mono);font-weight:700;font-size:14px;padding:10px 18px;text-align:center}
+  body.linklost #linkLost{display:block}
+  body.linklost .pill{opacity:.45}
+  /* Review pair viewer */
+  .pairwrap{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:stretch}
+  .pairmid{display:flex;flex-direction:column;justify-content:center;align-items:center;gap:8px;min-width:86px}
+  .jit{font-family:var(--mono);font-size:16px;font-weight:700;padding:5px 9px;border-radius:6px;border:1px solid var(--line)}
+  .jit.ok{color:var(--ok);border-color:var(--ok)} .jit.warn{color:var(--warn);border-color:var(--warn)}
+  .jit.bad{color:var(--bad);border-color:var(--bad)} .jit.na{color:var(--muted)}
+  .strobechip{font-family:var(--mono);font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;border:1px solid var(--line)}
+  .strobechip.lit{color:var(--ok);border-color:var(--ok)}
+  .strobechip.miss{color:var(--bad);border-color:var(--bad);animation:pillflash 900ms ease-in-out 3}
+  .strobechip.unk{color:var(--muted)}
+  #pairTitle{font-family:var(--mono);font-size:22px;font-weight:700;letter-spacing:.02em;margin:8px 0 2px}
+  #pairSub{font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:8px}
+  .fname{font-family:var(--mono);font-size:12.5px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hstrip{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line);
+          font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .hstrip b{color:var(--ink);font-weight:600}
+  .hstrip .hbad{color:var(--bad);font-weight:700}
+  .hstrip .hwarn{color:var(--warn)}
   /* Transects browser */
   .runrow{display:flex;gap:10px;justify-content:space-between;align-items:baseline;
-          padding:7px 8px;border-bottom:1px solid var(--grid);cursor:pointer}
+          padding:10px 8px;border-bottom:1px solid var(--grid);cursor:pointer}
   .runrow:hover{background:var(--panel2)}
   .runrow.sel{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
   .runrow .rid{font-family:var(--mono);font-size:12px}
@@ -107,25 +131,38 @@
   .strip i{font-style:normal;color:var(--ok)}
   .strip b{color:var(--bad)}
   .ro{color:var(--muted);font-family:var(--mono);font-size:12px}
+  .pathbox{font-family:var(--mono);font-size:12px;background:var(--panel2);border-radius:6px;
+           padding:8px;user-select:all;-webkit-user-select:all;word-break:break-all}
   /* Pre-flight checklist rows (Start run). */
   .pf{display:flex;gap:10px;align-items:baseline;padding:2px 0;font-size:12.5px}
   .pf .pfk{flex:0 0 92px;color:var(--muted);font-family:var(--mono);font-size:10.5px;
            text-transform:uppercase;letter-spacing:.06em}
   .pf .pfv{font-family:var(--mono)}
   .pf.ok .pfv{color:var(--ok)} .pf.warn .pfv{color:var(--warn)} .pf.bad .pfv{color:var(--bad)}
+  /* Controls: per-camera columns + the fleet-level strip */
+  .ctlgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .ctlsec{border-top:1px solid var(--line);margin-top:10px;padding-top:8px}
+  .ctlsec h3{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+             color:var(--muted);margin:0 0 8px;display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .ctlsec h3 .meta{color:var(--accent);text-transform:none;letter-spacing:0}
+  .ctlbody{padding:0 12px 12px}
+  .neq{font-family:var(--mono);font-size:11px;color:var(--warn);border:1px solid var(--warn);
+       border-radius:6px;padding:1px 6px}
+  .lensnote{font-family:var(--mono);font-size:11px;color:var(--bad);min-height:14px}
 </style>
 </head>
 <body>
+<div id="linkLost">RIG LINK LOST — data is <span id="llAge">?</span>s old, still retrying</div>
 <header>
   <h1>WILD SYNC</h1>
   <span id="hRun" class="pill">no run</span>
   <span id="hNodes" class="pill">— nodes</span>
   <span id="hTime" class="pill">time —</span>
   <span id="hNav" class="pill">nav —</span>
-  <!-- The JETSON's free space: the volume every transect is actually written
-       to. The per-node "Disk" field is a Pi's PC-save spool, which is not where
-       the survey lands. -->
-  <span id="hDisk" class="pill" title="free space on the Jetson volume holding ~/rig-runs">disk —</span>
+  <span id="hStrobe" class="pill" title="strobe">strobe off</span>
+  <!-- The RIGD HOST's free space: the volume every transect is actually
+       written to. The per-node "Disk" field is a Pi's PC-save spool. -->
+  <span id="hDisk" class="pill" title="free space on the volume holding the runs directory">disk —</span>
   <!-- Global alert surface: anomalies are polled on their own timer, so a fault
        is visible from every tab, not only while Controls happens to be open. -->
   <span id="hAnom" class="pill" title="anomalies">anomalies —</span>
@@ -134,7 +171,6 @@
 </header>
 <nav id="tabs">
   <button data-t="review" class="active">Review</button>
-  <button data-t="fleet">Fleet</button>
   <button data-t="transects">Transects</button>
   <button data-t="controls">Controls</button>
   <button data-t="nav">Nav</button>
@@ -142,25 +178,40 @@
   <button data-t="events">Events</button>
 </nav>
 <main>
-  <!-- REVIEW -->
+  <!-- REVIEW — the primary working screen: transect control + the pair. -->
   <section class="tab active" id="tab-review">
-    <div class="row" style="margin-bottom:10px">
-      <button class="act" id="rvLive">Live view: off</button>
-      <button class="act" id="rvNewest">Jump to newest</button>
-      <span class="muted small">← / → step frames · newest first</span>
+    <div class="card" style="margin-bottom:12px">
+      <div class="row">
+        <label>Label<input id="cLabel" value="transect-01" style="width:170px"></label>
+        <label>Interval s<input id="cInt" type="number" value="2" step="0.1" style="width:84px"></label>
+        <label>Frames (0=∞)<input id="cFrames" type="number" value="0" style="width:84px"></label>
+        <label style="flex-direction:row;align-items:center;gap:6px">
+          <input id="cAuto" type="checkbox" checked> auto-capture</label>
+        <span style="flex:1"></span>
+        <button class="act" id="btnCap">Capture one</button>
+        <button class="act go" id="btnStart">▶ Start transect</button>
+        <button class="act stop" id="btnStop" title="hold 1 s to stop"><span class="fill"></span>■ Stop (hold)</button>
+      </div>
+      <div id="preflight" style="margin-top:10px"></div>
+      <div id="runInfo" class="small muted" style="margin-top:8px"></div>
     </div>
-    <div class="cams" id="reviewCams"></div>
-  </section>
 
-  <!-- FLEET -->
-  <section class="tab" id="tab-fleet">
-    <div class="row" style="margin-bottom:10px">
-      <button class="act" id="flLive">Live view: off</button>
-      <span class="muted small">live view takes the same SDK lock as image
-        transfer, so it competes with the capture path — off by default, and
-        never fetched while this tab is hidden</span>
+    <div class="row" style="margin-bottom:4px">
+      <button class="act" id="pvOlder">◀ older</button>
+      <button class="act toggle on" id="pvFollow">following newest</button>
+      <button class="act" id="pvNewer">newer ▶</button>
+      <button class="act toggle" id="rvLive">Live view OFF — tap to enable</button>
+      <span id="rvLiveWarn" class="small" style="color:var(--warn);display:none">
+        live view shares the camera link with frame delivery</span>
+      <span class="muted small">← / → step pairs</span>
     </div>
-    <div class="grid" id="fleetCards" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))"></div>
+    <div id="pairTitle">—</div>
+    <div id="pairSub">looking for frames…</div>
+    <div class="pairwrap" id="pairWrap"></div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>Anomalies</h2><div id="anoms"><span class="muted small">none</span></div>
+    </div>
   </section>
 
   <!-- TRANSECTS -->
@@ -168,11 +219,95 @@
     <div class="grid" style="grid-template-columns:minmax(260px,1fr) 2.4fr">
       <div class="card">
         <h2>Runs — newest first</h2>
-        <div id="runList"><span class="muted small">reading ~/rig-runs…</span></div>
+        <div id="runList"><span class="muted small">reading the runs directory…</span></div>
       </div>
       <div class="card">
         <h2>Transect — <span id="runTitle" class="mono">select a run</span></h2>
         <div id="runDetail"><span class="muted small">nothing selected</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONTROLS — one column per camera; fleet-level strip below. -->
+  <section class="tab" id="tab-controls">
+    <div class="row" style="margin-bottom:8px">
+      <h2 style="font-family:var(--mono);font-size:12px;text-transform:uppercase;
+                 letter-spacing:.08em;color:var(--muted);margin:0">
+        Exposure — live, per camera</h2>
+      <span style="flex:1"></span>
+      <span id="applyNote" class="small muted"></span>
+      <button class="act" id="btnApply">Apply exposure to fleet</button>
+    </div>
+    <div class="ctlgrid" id="ctlCols"><span class="muted small">no cameras</span></div>
+
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));margin-top:12px">
+      <div class="card">
+        <h2>Strobe — scheduled pulse on the strobe node</h2>
+        <div class="row">
+          <label style="flex-direction:row;align-items:center;gap:6px">
+            <input id="stOn" type="checkbox"> enabled</label>
+          <label>Node<select id="stNode"></select></label>
+          <label>δ ms after T<input id="stDelta" type="number" value="10" step="0.5" min="1" max="100" style="width:80px"></label>
+          <label>Pulse ms<input id="stPulse" type="number" value="5" min="1" max="50" style="width:70px"></label>
+        </div>
+        <div id="stInfo" class="small muted" style="margin-top:8px">reading…</div>
+        <!-- δ must land the flash after the LAST camera's curtain opens and
+             before the FIRST one closes: 8–12 ms is the measured-safe window,
+             and the shutter must run 1/30 or slower (strobe-trigger.md §4.1). -->
+        <div class="small muted" style="margin-top:6px">
+          Safe window δ 8–12 ms · shutter 1/30 or slower · verdicts appear
+          between the frames in Review.
+        </div>
+      </div>
+      <div class="card">
+        <h2>Focus mode — fleet</h2>
+        <div class="row">
+          <label>Mode<select id="fMode"></select></label>
+          <span class="muted small">the rig is always MF; this is how it stays MF</span>
+        </div>
+        <div id="lensWarn" class="small" style="color:var(--warn);margin-top:8px"></div>
+      </div>
+      <div class="card">
+        <h2>Recording format — pushed to every camera</h2>
+        <div class="row">
+          <label>File type<select id="sFtype" style="min-width:120px">
+            <option value="1">JPEG</option><option value="2">RAW</option>
+            <option value="3">RAW+JPEG</option><option value="4">RAW+HEIF</option>
+            <option value="5">HEIF</option></select></label>
+          <label>Image size<select id="sIsize" style="min-width:80px">
+            <option value="1">L</option><option value="2">M</option>
+            <option value="3">S</option></select></label>
+          <label>Transfer<select id="sTsize" style="min-width:190px">
+            <option value="0">Original — 60.2 MP, 14.1 MB</option>
+            <option value="1">Small — 1.7 MP, ~320 KB</option></select></label>
+          <label>White balance<select id="sWbMode" style="min-width:130px">
+            <option value="0">Auto (AWB)</option>
+            <option value="17">Daylight</option>
+            <option value="256">Color temp (K)</option></select></label>
+          <label>Kelvin<input id="sColorTemp" type="number" min="2500" max="9900"
+            step="100" value="5600" style="width:5.5em"></label>
+        </div>
+        <!-- Small = 1.7 MP review thumbnail; Original = 60 MP / 14.1 MB, 44x the
+             bytes over the same USB link the capture path uses. No readback on
+             this body: the select shows what rigd pushes, never a confirmation. -->
+        <div class="small muted" style="margin-top:8px">
+          <b>Small is a review thumbnail</b>, not survey imagery.
+          No readback on this body — confirm by delivered frame size.
+          White balance pins the JPEG rendering only (RAW is WB-agnostic) and
+          takes effect on nodes running ilxctl 2026-08-20+; older nodes are
+          skipped quietly until updated.
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="act" id="btnFmt">Apply format to fleet</button>
+          <span id="fmtNote" class="small muted"></span>
+        </div>
+        <h2 style="margin-top:14px">Set on the body only</h2>
+        <div id="bodyOnly" class="ro"></div>
+        <!-- storeDest/pcsave report enableFlag=DisplayOnly on these bodies:
+             not settable over USB, shown read-only so a wrong value is visible. -->
+        <div class="small muted" style="margin-top:6px">
+          Set in the camera's own menu, per body.
+        </div>
       </div>
     </div>
   </section>
@@ -208,162 +343,6 @@
     </div>
   </section>
 
-  <!-- CONTROLS -->
-  <section class="tab" id="tab-controls">
-    <div class="grid" style="grid-template-columns:2fr 1fr;margin-bottom:12px">
-      <div class="card">
-        <h2>Live view — connected cameras</h2>
-        <div class="cams" id="ctlLive"><span class="muted small">no cameras connected</span></div>
-        <!-- The staged-preview surface sits WITH the live view, because the
-             whole point is to see the change on cam1 before the fleet takes
-             it. Filled by renderPreview(). -->
-        <div id="pvPanel"></div>
-      </div>
-      <div class="card">
-        <h2>Histogram — <span id="histCam" class="mono">primary</span></h2>
-        <canvas id="histCanvas" width="256" height="150" style="width:100%;height:auto;background:var(--panel2);border-radius:6px"></canvas>
-        <div id="histStats" class="small muted" style="margin-top:8px"></div>
-      </div>
-    </div>
-    <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:12px">
-      <div class="card">
-        <h2>Focus — all cameras in lock-step</h2>
-        <div class="row">
-          <label>Mode<select id="fMode"></select></label>
-          <label>Step<input id="fStep" type="number" value="50" style="width:70px"></label>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <button class="act" id="fNear">◀ Near</button>
-          <button class="act" id="fFar">Far ▶</button>
-          <span class="muted small">hold to drive</span>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <span class="muted small">Position</span>
-          <input id="fPos" type="range" min="0" max="65535" value="0" style="flex:1">
-          <span id="fPosV" class="mono small">0</span>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Zoom — all cameras in lock-step</h2>
-        <div class="row">
-          <label>Setting<select id="zSet"></select></label>
-          <label>Speed<input id="zSpd" type="number" value="3" min="1" max="8" style="width:60px"></label>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <button class="act" id="zWide">◀ Wide</button>
-          <button class="act" id="zTele">Tele ▶</button>
-          <span class="muted small">hold to drive</span>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <span class="muted small">Position</span>
-          <input id="zPos" type="range" min="0" max="65535" value="0" style="flex:1">
-          <span id="zPosV" class="mono small">0</span>
-        </div>
-      </div>
-    </div>
-    <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="card">
-        <h2>Transect</h2>
-        <div class="row">
-          <label>Label<input id="cLabel" value="transect-01" style="width:160px"></label>
-          <label>Interval s<input id="cInt" type="number" value="2" step="0.1" style="width:80px"></label>
-          <label>Frames (0=∞)<input id="cFrames" type="number" value="0" style="width:80px"></label>
-          <label style="flex-direction:row;align-items:center;gap:6px">
-            <input id="cAuto" type="checkbox" checked> auto-capture</label>
-        </div>
-        <div class="row" style="margin-top:12px">
-          <button class="act go" id="btnStart">▶ Start run</button>
-          <button class="act stop" id="btnStop">■ Stop run</button>
-          <button class="act" id="btnCap">Capture one</button>
-        </div>
-        <!-- Pre-flight: what this run is about to record with. Filled by
-             Start run before anything is written to disk. -->
-        <div id="preflight" style="margin-top:10px"></div>
-        <div id="runInfo" class="small muted" style="margin-top:10px"></div>
-      </div>
-      <div class="card">
-        <h2>Exposure — pushed identically to every camera</h2>
-        <div class="row">
-          <label>Mode
-            <select id="sExpMode"><option value="manual">Manual (default)</option>
-              <option value="auto">Auto (ISO servo)</option></select></label>
-          <!-- Choice lists come from the camera itself (ilxctl shutterChoices /
-               isoChoices / apertureChoices), so every value the panel can send
-               is one the body accepts - including multi-second shutters and
-               ISO AUTO, neither of which the old 1/N and free-number boxes
-               could express. Options are raw Sony encodings. -->
-          <label>Aperture<select id="sAp" style="min-width:92px"></select></label>
-          <label>Shutter<select id="sSh" style="min-width:110px"></select></label>
-          <label>ISO<select id="sIso" style="min-width:118px"></select></label>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <span class="muted small">EV bump:</span>
-          <button class="act" id="evDn">−⅓</button>
-          <span id="evVal" class="mono">— mEV</span>
-          <button class="act" id="evUp">+⅓</button>
-          <!-- Two paths out of this panel. Preview puts the edited values on
-               cam1 ALONE so they can be judged on its live view; Apply commits
-               the fleet. Preview is first because it is the safe one. -->
-          <button class="act" id="btnPreview" style="margin-left:auto">Preview on Cam1</button>
-          <button class="act" id="btnApply">Apply to fleet</button>
-        </div>
-        <div id="applyNote" class="small muted" style="margin-top:8px">reading fleet settings…</div>
-        <div id="convInfo" class="small" style="margin-top:10px"></div>
-      </div>
-      <div class="card">
-        <h2>Recording format — pushed to every camera</h2>
-        <div class="row">
-          <label>File type<select id="sFtype" style="min-width:120px">
-            <option value="1">JPEG</option><option value="2">RAW</option>
-            <option value="3">RAW+JPEG</option><option value="4">RAW+HEIF</option>
-            <option value="5">HEIF</option></select></label>
-          <label>Image size<select id="sIsize" style="min-width:80px">
-            <option value="1">L</option><option value="2">M</option>
-            <option value="3">S</option></select></label>
-          <label>Transfer<select id="sTsize" style="min-width:190px">
-            <option value="0">Original — 60.2 MP, 14.1 MB</option>
-            <option value="1">Small — 1.7 MP, ~320 KB</option></select></label>
-        </div>
-        <div class="small muted" style="margin-top:8px">
-          This is what the host actually receives and what every archived frame
-          is. <b>Small is a review thumbnail</b>, not survey imagery — but
-          Original is 44× the bytes over the same USB link the capture path
-          uses, so change it deliberately and watch the pull rate.
-          These three have <b>no readback</b> on this body: the value shown is
-          what rigd is pushing, not a confirmation from the camera.
-        </div>
-        <div class="row" style="margin-top:8px">
-          <button class="act" id="btnFmt">Apply format to fleet</button>
-          <span id="fmtNote" class="small muted"></span>
-        </div>
-        <h2 style="margin-top:14px">Set on the body only</h2>
-        <div id="bodyOnly" class="ro"></div>
-        <div class="small muted" style="margin-top:6px">
-          <code>storeDest</code> and <code>pcsave</code> report
-          <code>enableFlag=DisplayOnly</code> on these bodies: they
-          <b>cannot</b> be set over USB and must be changed in the camera's own
-          menu, per body. Shown here so you can check them, never to pretend
-          this panel can set them.
-        </div>
-      </div>
-      <div class="card">
-        <h2>Lens — per camera, never fleet-applied</h2>
-        <div id="lensRead" class="ro"></div>
-        <div class="small muted" style="margin-top:6px">
-          Focus and zoom POSITION stay per-camera until lens encoder parity
-          between the two bodies is measured (docs/future-tests.md §1): the same
-          number may not mean the same optical state on both, and a silent focus
-          mismatch changes the interior orientation of the pair. The readings are
-          here so a mismatch is at least <b>visible</b> — compare them after any
-          body power-cycle, because nothing re-asserts these.
-        </div>
-      </div>
-      <div class="card" style="grid-column:1/-1">
-        <h2>Anomalies</h2><div id="anoms"><span class="muted small">none</span></div>
-      </div>
-    </div>
-  </section>
-
   <!-- EVENTS -->
   <section class="tab" id="tab-events">
     <div class="row" style="margin-bottom:8px">
@@ -377,212 +356,335 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const api = (p, body) => fetch(p, body ? {method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify(body)} : {}).then(r=>r.json()).catch(e=>({ok:false,error:String(e)}));
+// Every request carries a timeout: a wedged rigd (or a boat network chewing a
+// cable) must fail a poll, not hang it — the lens command queue in particular
+// may never wait forever on a stop.
+const api = (p, body, tmoMs) => {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), tmoMs || 8000);
+  const opt = body ? {method:'POST',headers:{'Content-Type':'application/json'},
+                      body:JSON.stringify(body), signal:c.signal}
+                   : {signal:c.signal};
+  return fetch(p, opt).then(r=>r.json())
+    .catch(e=>({ok:false,error:String(e),_err:true}))
+    .finally(()=>clearTimeout(t));
+};
 let TAB = 'review';
-// One entry point for tab switching so anything can navigate — the header
-// anomaly pill jumps straight to the anomalies pane. Paint the newly-shown tab
-// immediately instead of leaving it blank until its own interval comes round.
 function showTab(t){
   TAB=t;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active',x.dataset.t===t));
   document.querySelectorAll('.tab').forEach(s=>s.classList.toggle('active',s.id==='tab-'+t));
-  if(t==='controls'){ pollControls(); hydrateSettings(); }
+  if(t==='controls'){ pollControls(); hydrateSettings(); hydrateStrobe(); }
   if(t==='imu') pollImuWindow();
-  if(t==='review') renderReviewFrames();
-  if(t==='fleet') renderFleet();
+  if(t==='review'){ renderPair(); pollPairs(true); }
   if(t==='transects') pollTransects(true);
 }
 // Live view is expensive in a way that is invisible from the browser: ilxctl's
 // liveViewJpeg() takes the same recursive SDK mutex as image transfer, so every
 // live-view GET contends with the pull path on a body that is mid-survey. It is
 // therefore fetched ONLY when a tab that shows it is both selected and visible.
-// A backgrounded browser tab left open used to pull frames from both bodies
-// every 2 s for the entire survey.
 function liveOk(tab){ return TAB===tab && !document.hidden; }
 document.addEventListener('visibilitychange',()=>{ if(!document.hidden){
-  if(TAB==='fleet') renderFleet(); if(TAB==='controls') pollControls(); } });
+  if(TAB==='controls') pollControls(); if(TAB==='review') pollPairs(true); } });
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.t));
 
 // ---- header + clock -------------------------------------------------------
 setInterval(()=>{ $('#hClock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+'Z'; },1000);
-
 function pill(el,txt,cls){ el.textContent=txt; el.className='pill'+(cls?(' '+cls):''); }
 
 // ---- fleet ----------------------------------------------------------------
 let FLEET={nodes:[]};
-let PREVIEW={active:false};   // the staged-settings pin, straight from rigd
 const spark = {}; // name -> [values]
-let FLEET_LIVE=false;         // fleet-tab live view: OFF until asked for
-$('#flLive').onclick=()=>{ FLEET_LIVE=!FLEET_LIVE;
-  $('#flLive').textContent='Live view: '+(FLEET_LIVE?'on':'off');
-  $('#flLive').classList.toggle('go',FLEET_LIVE); renderFleet(); };
+let FLEET_FAILS=0, FLEET_OK_AT=0;
 async function pollFleet(){
-  const f = await api('/api/fleet'); if(!f.nodes) return; FLEET=f;
-  PREVIEW=f.preview||{active:false};
+  const f = await api('/api/fleet');
+  if(!f.nodes){
+    // Rig link health: rigd stopped answering. Every number on screen is
+    // stale from this instant; say so in one unmissable place instead of
+    // letting the operator read a frozen page as a live one.
+    FLEET_FAILS++;
+    if(FLEET_FAILS>=3){
+      document.body.classList.add('linklost');
+      $('#llAge').textContent = FLEET_OK_AT?Math.round(Date.now()/1000-FLEET_OK_AT):'?';
+    }
+    return;
+  }
+  FLEET_FAILS=0; FLEET_OK_AT=Date.now()/1000;
+  document.body.classList.remove('linklost');
+  FLEET=f;
   const run=f.run||{};
   pill($('#hRun'), run.active?('run '+run.run_id+' · '+run.frames+' frm'):'no run', run.active?'on':'');
   const conn=f.nodes.filter(n=>n.connected).length;
-  pill($('#hNodes'), conn+'/'+f.nodes.length+' cameras', conn?'on':'bad');
+  pill($('#hNodes'), conn+'/'+f.nodes.length+' cameras', conn===f.nodes.length?'on':'bad');
   pill($('#hTime'), 'time '+(f.time_source||'—'), f.time_source==='gps'?'on':'warn');
-  // Free space on the Jetson, where ~/rig-runs is. A full volume fails every
-  // frame write and those frames are never retried, so they get no flight_log
-  // row at all — it has to be on screen before it happens, not after.
   const jf=f.jetson_free_mb, lo=f.jetson_disk_low_mb||5000;
   pill($('#hDisk'), jf==null?'disk —':('disk '+(jf>=1024?(jf/1024).toFixed(1)+' GB':jf+' MB')),
        jf==null?'':(jf<lo?'bad':'on'));
-  $('#hDisk').title = jf==null ? 'the Jetson runs volume could not be read'
-    : ('~/rig-runs volume: '+jf+' MB free ('+Math.floor(jf/14.1)+
+  $('#hDisk').title = jf==null ? 'the runs volume could not be read'
+    : ('runs volume: '+jf+' MB free ('+Math.floor(jf/14.1)+
        ' frames at Original size, '+Math.floor(jf/0.32)+' at Small)');
-  renderFleet(); renderReviewHeaders();
-  // Paint the newly-shown tab now rather than waiting out its poll interval.
+  // Jitter history for the per-camera sparkline (rendered in Review's health
+  // strips). Kept here, in the POLL, so rendering has no data side effects.
+  f.nodes.forEach(n=>{
+    (spark[n.name]=spark[n.name]||[]).push(n.stats&&n.stats.interval_jitter_ms||0);
+    if(spark[n.name].length>60) spark[n.name].shift();
+  });
+  renderReviewChrome();
   if(TAB==='controls') pollControls();
   if(TAB==='imu') pollImuWindow();
 }
 function stateCls(s){return s==='CAM_CONNECTED'?'ok':s==='REACHABLE'?'warn':'off';}
-function renderFleet(){
-  const c=$('#fleetCards'); c.innerHTML='';
-  FLEET.nodes.forEach(n=>{
-    (spark[n.name]=spark[n.name]||[]).push(n.stats&&n.stats.interval_jitter_ms||0);
-    if(spark[n.name].length>60) spark[n.name].shift();
-    const conv=n.convergence||{};
-    // The pin itself is the authority (rigd publishes it fleet-wide); the
-    // node's own badge is only a mirror and cannot clear itself if that camera
-    // drops out while pinned.
-    const pinned = PREVIEW.active && PREVIEW.node===n.name;
-    const cs = pinned?'<span class="dot warn"></span> PREVIEW ('+
-        escapeHtml(Object.keys(PREVIEW.pending||{}).join(','))+') — not on the fleet vector'
-      : conv.synced===true?'<span class="dot ok"></span> synced'
-      : conv.synced===false?'<span class="dot bad"></span> divergent: '+(conv.diverged||[]).join(',')
-      : '<span class="dot off"></span> —';
-    const gpio=n.gpio||{}; const imu=n.imu||{};
-    // The <img> is emitted only when this tab is showing AND the operator has
-    // asked for live view. Emitting it unconditionally is what made one open
-    // browser tab pull frames from both bodies every 2 s, forever, through the
-    // same SDK mutex the capture path needs.
-    const wantLive = FLEET_LIVE && liveOk('fleet') && n.connected;
-    c.insertAdjacentHTML('beforeend', `<div class="card${
-        pinned?' previewing':''}">
-      <div class="row" style="justify-content:space-between">
-        <div><span class="dot ${stateCls(n.state)}"></span> <b>${n.name}</b>
-          <span class="muted small">${n.host}</span></div>
-        <span class="muted small mono">${n.state}</span></div>
-      <div class="big" style="margin:6px 0">${n.connected?(n.model||'ILX-LR1'):'—'}</div>
-      ${wantLive?`<div class="frame" style="aspect-ratio:3/2;border-radius:6px;margin:6px 0">
-        <img src="/api/liveview?node=${n.name}&_=${Date.now()}" style="width:100%;height:100%;object-fit:contain"
-             onerror="this.style.opacity=.15"></div>`:''}
-      <div class="kv"><span class="k">Exposure</span><span class="v">${n.connected?
-        ((n.aperture||'?')+' · '+(n.shutter||'?')+' · '+(n.iso||'?')):'—'}</span></div>
-      <div class="kv"><span class="k">Battery</span><span class="v">${n.battery??'—'}%</span></div>
-      <div class="kv"><span class="k">Settings</span><span class="v">${cs}</span></div>
-      ${n.connected?healthRows(n):''}
-      <div class="kv"><span class="k">GPIO</span><span class="v">${gpio.available?
-        ('chip '+(gpio.chip||'?')+(gpio.focus_held?' · FOCUS held':'')+
-         (gpio.monitor_running?' · EXP mon':'')+' · '+(gpio.edges_seen||0)+' edges'):'—'}</span></div>
-      <div class="kv"><span class="k">IMU</span><span class="v">${imu.present?
-        ((imu.age_s!=null?imu.age_s+'s':'')+' @'+(imu.rate_hz||'?')+'Hz'):'—'}</span></div>
-      <div class="kv"><span class="k">Disk</span><span class="v">${n.disk_free_mb??'—'} MB</span></div>
-      <div class="kv"><span class="k">Run pull</span><span class="v">${n.stats&&n.stats.pulled!=null?
-        (n.stats.pulled+' ok / '+(n.stats.failed||0)+' fail · jit '+(n.stats.interval_jitter_ms??'—')+'ms'):'—'}</span></div>
-      ${sparkSvg(spark[n.name])}
-    </div>`);
-  });
-}
-// Camera health that ilxctl reports and that nothing used to show. The card
-// write is the one that matters most: a single frame stuck in the body's write
-// buffer takes the whole camera down — property table locked, no PC delivery,
-// ilxctl wedged — while slotStatus still reads OK, which is exactly why the
-// 2026-08-16 fault looked like a software bug for hours.
-function healthRows(n){
-  const rows=[];
-  const sw=n.slot_writing_label, oh=n.overheating_label, lv=n.live_view_label;
-  const card = sw==='WRITING'
-    ? '<span style="color:var(--bad)">WRITING — if this stays, the card write '+
-      'is stuck and the body is down</span>'
-    : (sw||'—')+(n.slot_status?(' · slot '+escapeHtml(String(n.slot_status))):'');
-  rows.push(kvrow('Card',card));
-  if(oh && oh!=='unknown') rows.push(kvrow('Thermal', oh==='ok'?'ok':
-    '<span style="color:var(--'+(oh==='OVERHEATING'?'bad':'warn')+')">'+
-    escapeHtml(oh)+'</span>'));
-  if(lv && lv!=='unknown') rows.push(kvrow('Live view',escapeHtml(lv)));
-  if(n.priority_key_label && n.priority_key_label!=='--')
-    rows.push(kvrow('Control', n.priority_key_label==='PC remote'
-      ? 'PC remote'
-      : '<span style="color:var(--bad)">'+escapeHtml(n.priority_key_label)+
-        ' — PC control priority lost</span>'));
-  return rows.join('');
-}
 function sparkSvg(vals){
   if(!vals||vals.length<2) return '';
-  const w=280,h=34,mx=Math.max(1,...vals);
+  const w=280,h=30,mx=Math.max(1,...vals);
   const pts=vals.map((v,i)=>`${(i/(vals.length-1))*w},${h-(v/mx)*(h-4)-2}`).join(' ');
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
     <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
 }
+// Camera health that matters at a glance. The card write is the loudest: one
+// frame stuck in the body's write buffer takes the whole camera down while
+// slotStatus still reads OK — the 2026-08-16 fault signature.
+function healthStrip(n){
+  const bits=[];
+  bits.push(`<span class="dot ${stateCls(n.state)}"></span>`);
+  if(!n.connected) return bits.join('')+` <span class="hbad">${escapeHtml(n.state||'OFFLINE')}</span>`
+    + (n.age_s!=null?` <span>last seen ${Math.round(n.age_s)}s</span>`:'');
+  const sw=n.slot_writing_label;
+  bits.push(sw==='WRITING'
+    ? '<span class="hbad">CARD WRITING — stuck if this stays</span>'
+    : `<span>card <b>${escapeHtml(String(sw||'—'))}</b></span>`);
+  if(n.overheating_label && n.overheating_label!=='ok' && n.overheating_label!=='unknown')
+    bits.push(`<span class="hbad">${escapeHtml(n.overheating_label)}</span>`);
+  if(n.priority_key_label && n.priority_key_label!=='PC remote' && n.priority_key_label!=='--')
+    bits.push('<span class="hbad">control lost to body</span>');
+  bits.push(`<span>batt <b>${n.battery??'—'}%</b></span>`);
+  bits.push(`<span>disk <b>${n.disk_free_mb??'—'} MB</b></span>`);
+  const gpio=n.gpio||{};
+  bits.push(gpio.available?`<span>gpio <b>${gpio.edges_seen||0}</b> edges</span>`
+                          :'<span class="hwarn">no harness — USB fire</span>');
+  if(n.stats&&n.stats.pulled!=null)
+    bits.push(`<span>pull <b>${n.stats.pulled}</b> ok${n.stats.failed?(' / <span class="hbad">'+n.stats.failed+' fail</span>'):''} · jit ${n.stats.interval_jitter_ms??'—'}ms</span>`);
+  return bits.join(' ');
+}
 
-// ---- review (multi-cam, newest first) -------------------------------------
+// ---- review: ONE cursor over PAIRS ----------------------------------------
+// The pair list comes from /api/run/shots (grouped by rigd, µs epochs, jitter
+// and strobe verdicts). Sources, in order, stated on screen: the ACTIVE run,
+// else the newest finished run, else the cameras' own spool (name-paired, no
+// jitter), else an empty state.
+let PAIRS={src:null, rid:null, total:0, start:0, list:[], cursor:-1, follow:true};
 let LIVE=false;
-const view = {}; // name -> {shots:[], idx, cache:{}}
-$('#rvLive').onclick=()=>{ LIVE=!LIVE; $('#rvLive').textContent='Live view: '+(LIVE?'on':'off'); };
-$('#rvNewest').onclick=()=>{ Object.values(view).forEach(v=>v.idx=0); renderReviewFrames(); };
+$('#rvLive').onclick=()=>{ LIVE=!LIVE;
+  $('#rvLive').textContent='Live view '+(LIVE?'ON — tap to disable':'OFF — tap to enable');
+  $('#rvLive').classList.toggle('on',LIVE);
+  $('#rvLiveWarn').style.display=(LIVE&&(FLEET.run||{}).active)?'':'none';
+  renderPair(); };
+$('#pvFollow').onclick=()=>{ PAIRS.follow=!PAIRS.follow;
+  if(PAIRS.follow) PAIRS.cursor=PAIRS.total-1;
+  syncFollowBtn(); pollPairs(true); };
+function syncFollowBtn(){
+  const b=$('#pvFollow');
+  b.classList.toggle('on',PAIRS.follow);
+  b.textContent=PAIRS.follow?'following newest':
+    ('−'+Math.max(0,PAIRS.total-1-PAIRS.cursor)+' from newest');
+}
+function stepPair(d){
+  if(PAIRS.total<1) return;
+  if(PAIRS.cursor<0) PAIRS.cursor=PAIRS.total-1;
+  PAIRS.cursor=Math.max(0,Math.min(PAIRS.total-1,PAIRS.cursor+d));
+  PAIRS.follow=(PAIRS.cursor===PAIRS.total-1);
+  syncFollowBtn();
+  if(PAIRS.cursor<PAIRS.start || PAIRS.cursor>=PAIRS.start+PAIRS.list.length)
+    pollPairs(true);
+  else renderPair();
+}
+$('#pvOlder').onclick=()=>stepPair(-1);
+$('#pvNewer').onclick=()=>stepPair(+1);
 document.addEventListener('keydown',e=>{
   if(TAB!=='review')return;
-  if(e.key==='ArrowLeft'){Object.values(view).forEach(v=>v.idx=Math.min((v.shots.length-1),v.idx+1));renderReviewFrames();}
-  if(e.key==='ArrowRight'){Object.values(view).forEach(v=>v.idx=Math.max(0,v.idx-1));renderReviewFrames();}
+  if(e.key==='ArrowLeft') stepPair(-1);
+  if(e.key==='ArrowRight') stepPair(+1);
 });
-// Rebuild is keyed on WHICH cameras are connected, never on how many. One
-// camera being lost in the same 2 s poll another is claimed leaves the count
-// unchanged, and the old count test then kept the departed camera's column —
-// its stale frames under its own name — while the newly live camera had no
-// column at all, and every $('#exp-…') below threw on the missing element.
-function connKey(live){ return live.map(n=>n.cam_num+':'+n.name).join(','); }
-function renderReviewHeaders(){
-  const c=$('#reviewCams');
-  const live=FLEET.nodes.filter(n=>n.connected);
-  const key=connKey(live);
-  if(c.dataset.key!==key){
-    c.dataset.key=key; c.innerHTML='';
-    live.forEach(n=>{
-      c.insertAdjacentHTML('beforeend',`<div class="camcol" id="cam-${n.name}">
-        <div class="hd"><b>Cam${n.cam_num} · ${n.name}</b><span class="exp" id="exp-${n.name}"></span></div>
-        <div class="frame"><img id="img-${n.name}" alt=""><div class="burn" id="burn-${n.name}"></div>
-          <div class="cnt" id="cnt-${n.name}"></div></div></div>`);
-      view[n.name]=view[n.name]||{shots:[],idx:0,cache:{}};
-    });
+let RUNS_HEAD=null;   // newest run id when no run is active
+async function pollPairs(force){
+  if(!force && !liveOk('review')) return;
+  const run=(FLEET.run||{});
+  let rid=null, src=null;
+  if(run.active){ rid=run.run_id; src='live run '+run.run_id; }
+  else {
+    if(RUNS_HEAD===null || force){
+      const r=await api('/api/runs?limit=1');
+      RUNS_HEAD=(r&&r.runs&&r.runs[0])?r.runs[0].run_id:'';
+    }
+    if(RUNS_HEAD){ rid=RUNS_HEAD; src='run '+RUNS_HEAD; }
   }
-  live.forEach(n=>{ const e=$('#exp-'+n.name); if(!e) return;
-    e.textContent = (n.aperture||'?')+' · '+(n.shutter||'?')+' · '+(n.iso||'?'); });
-}
-async function pollReview(){
-  const live=FLEET.nodes.filter(n=>n.connected);
-  for(const n of live){
-    if(LIVE){ const img=$('#img-'+n.name), b=$('#burn-'+n.name), c=$('#cnt-'+n.name);
-      if(img){ img.src='/api/liveview?node='+n.name+'&_='+Date.now();
-        if(b) b.textContent='LIVE'; if(c) c.textContent=''; }
-      continue; }
-    const shots=await api('/api/shots?node='+n.name);
-    // view[] is created alongside the column; a camera claimed between the
-    // fleet poll and this one has no entry yet, and awaiting it here means the
-    // set can change underneath the loop.
-    if(Array.isArray(shots) && view[n.name]){
-      const v=view[n.name]; const names=shots.map(s=>s.name).sort().reverse(); // newest first
-      const wasNew = v.shots[0]!==names[0];
-      v.shots=names; if(wasNew && v.idx>0) v.idx++; // keep pointing at same frame as new arrive
+  if(rid){
+    let q;
+    if(PAIRS.follow || PAIRS.cursor<0) q='offset=-12&limit=12';
+    else q='offset='+Math.max(0,PAIRS.cursor-6)+'&limit=13';
+    const r=await api('/api/run/shots?id='+encodeURIComponent(rid)+'&'+q);
+    if(r && Array.isArray(r.shots)){
+      PAIRS={src:'run', rid, total:r.total, start:r.offset, list:r.shots,
+             cursor: PAIRS.follow||PAIRS.cursor<0 ? r.total-1
+                     : Math.min(PAIRS.cursor, r.total-1),
+             follow:PAIRS.follow, label:src};
+      syncFollowBtn(); renderPair(); return;
     }
   }
-  if(!LIVE) renderReviewFrames();
+  // Spool fallback: whatever sits in the cameras' own save directories —
+  // test fires, bench shots. Paired by rank, NOT by measured epoch, so no
+  // jitter is shown: this is a browse aid, not a transect.
+  const names={}, roster=(FLEET.nodes||[]);
+  for(const n of roster.filter(n=>n.connected)){
+    const shots=await api('/api/shots?node='+n.name);
+    if(Array.isArray(shots)) names[n.name]=shots.map(s=>s.name).sort().reverse();
+  }
+  const depth=Math.max(0,...Object.values(names).map(a=>a.length));
+  const list=[];
+  for(let k=depth-1;k>=0;k--){
+    const files={};
+    roster.forEach(n=>{ const a=names[n.name]||[]; if(a[k]) files[n.name]=a[k]; });
+    if(Object.keys(files).length)
+      list.push({files, missing:roster.filter(n=>!files[n.name]).map(n=>n.name),
+                 spool:true});
+  }
+  PAIRS={src: depth? 'spool':'empty', rid:null, total:list.length, start:0,
+         list, cursor:PAIRS.follow||PAIRS.cursor<0?list.length-1
+                     :Math.min(PAIRS.cursor,list.length-1),
+         follow:PAIRS.follow, label:'camera spool — not a transect'};
+  syncFollowBtn(); renderPair();
 }
-function renderReviewFrames(){
-  FLEET.nodes.filter(n=>n.connected).forEach(n=>{
-    const burn=$('#burn-'+n.name), cnt=$('#cnt-'+n.name);
-    const v=view[n.name]; if(!v||!v.shots.length){ if(burn) burn.textContent='no frames'; return; }
-    v.idx=Math.max(0,Math.min(v.idx,v.shots.length-1));
-    const name=v.shots[v.idx]; const img=$('#img-'+n.name);
-    if(img && img.dataset.name!==name){ img.dataset.name=name; img.src='/api/frame?node='+n.name+'&name='+encodeURIComponent(name); }
-    if(burn) burn.textContent = (n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||'?');
-    if(cnt) cnt.textContent = (v.idx+1)+' / '+v.shots.length+' · '+name;
+function tstamp(ep){ return ep==null?'—'
+  : new Date(ep*1000).toISOString().replace('T',' ').slice(0,21)+'Z'; }
+function jitChip(s){
+  if(!s || s.spool) return '';
+  const v=s.spread_ms;
+  if(v==null) return '<span class="jit na">n/a</span>';
+  const meas = s.spread_src==='index'
+    && Object.values(s.srcs||{}).every(x=>x==='gpio_edge');
+  const cls = !meas?'na': v<5?'ok': v<10?'warn':'bad';
+  return `<span class="jit ${cls}" title="inter-camera exposure spread${
+    meas?' (measured EXPOSURE edges)':' (~ coarse source, not a measurement)'}">${
+    meas?'':'~'}${v.toFixed(2)}ms</span>`;
+}
+function strobeChip(s){
+  const st=s&&s.strobe;
+  if(!st) return '';
+  if(st.ok===true)  return `<span class="strobechip lit" title="strobe inside every camera's exposure window · margin ${st.margin_ms}ms">LIT</span>`;
+  if(st.ok===false) return `<span class="strobechip miss" title="strobe OUTSIDE an exposure window by ${st.margin_ms}ms — frame is unlit">STROBE MISS</span>`;
+  return '<span class="strobechip unk" title="strobe fired but the windows are not measured on every camera">STROBE ?</span>';
+}
+function renderPair(){
+  const wrap=$('#pairWrap'); if(TAB!=='review') return;
+  const roster=(FLEET.nodes||[]);
+  const key=roster.map(n=>n.cam_num+':'+n.name).join(',')+'|'+roster.length;
+  if(wrap.dataset.key!==key){
+    wrap.dataset.key=key; wrap.innerHTML='';
+    roster.forEach((n,i)=>{
+      if(i===1) wrap.insertAdjacentHTML('beforeend','<div class="pairmid" id="pairMid"></div>');
+      wrap.insertAdjacentHTML('beforeend', `<div class="camcol" id="rv-${n.name}">
+        <div class="hd"><b>Cam${n.cam_num} · ${n.name}</b>
+          <span class="fname" id="rvf-${n.name}"></span></div>
+        <div class="hstrip" id="rvh-${n.name}"></div>
+        <div class="frame" id="rvfr-${n.name}"></div>
+        <div id="rvspark-${n.name}"></div></div>`);
+    });
+  }
+  renderReviewChrome();
+  const i=PAIRS.cursor, s=(i>=PAIRS.start)?PAIRS.list[i-PAIRS.start]:null;
+  if(PAIRS.src==='empty'||!s){
+    $('#pairTitle').textContent=LIVE?'live view':'no frames yet';
+    $('#pairSub').textContent=LIVE?'no pairs yet — showing the cameras live'
+      :'Capture one or Start transect — frames appear here as pairs';
+    // LIVE with no pairs still shows the cameras: an operator aiming the rig
+    // before the first shot needs the picture, not an empty box.
+    roster.forEach(n=>{ const fr=$('#rvfr-'+n.name); const fe=$('#rvf-'+n.name);
+      if(!fr) return;
+      if(LIVE && n.connected){ fr.className='frame';
+        if(!fr.querySelector('img')) fr.innerHTML='<img alt=""><div class="burn">LIVE</div>';
+        if(fe) fe.textContent='live view'; }
+      else { fr.className='frame'; fr.innerHTML=''; if(fe) fe.textContent=''; } });
+    const mid=$('#pairMid'); if(mid) mid.innerHTML='';
+    return;
+  }
+  $('#pairTitle').textContent = s.epoch!=null ? tstamp(s.epoch)
+    : Object.values(s.files||{})[0] || '—';
+  $('#pairSub').textContent = 'pair '+(i+1)+' / '+PAIRS.total+' · '+(PAIRS.label||'');
+  const mid=$('#pairMid');
+  if(mid) mid.innerHTML=jitChip(s)+strobeChip(s);
+  roster.forEach(n=>{
+    const fr=$('#rvfr-'+n.name), fe=$('#rvf-'+n.name);
+    if(!fr) return;
+    const f=(s.files||{})[n.name];
+    if(LIVE && n.connected){
+      fr.className='frame';
+      if(!fr.querySelector('img')) fr.innerHTML='<img alt=""><div class="burn">LIVE</div>';
+      if(fe) fe.textContent='live view';
+      return;
+    }
+    if(!n.connected && !f){
+      fr.className='frame offline';
+      fr.innerHTML='<span class="msg">'+escapeHtml(n.name)+' OFFLINE'+
+        (n.age_s!=null?(' — last seen '+Math.round(n.age_s)+'s ago'):'')+'</span>';
+      if(fe) fe.textContent='';
+      return;
+    }
+    if(!f){
+      fr.className='frame missing';
+      fr.innerHTML='<span class="msg">MISSING</span>';
+      if(fe) fe.textContent='no frame for this shot';
+      return;
+    }
+    fr.className='frame';
+    const url = pairFrameUrl(s, n.name, f);
+    let img=fr.querySelector('img');
+    if(!img){ fr.innerHTML='<img alt="">'; img=fr.querySelector('img'); }
+    if(img.dataset.name!==f){
+      // Decode off-screen, then swap: the previous frame stays on screen
+      // until the new one is ready instead of collapsing to blank while a
+      // large JPEG decodes. Run frames are cacheable (ETag) so stepping
+      // back is a 304.
+      img.dataset.name=f;
+      const pre=new Image(); pre.src=url;
+      const swap=()=>{ if(img.dataset.name===f) img.src=url; };
+      (pre.decode?pre.decode().then(swap,swap):(pre.onload=swap, pre.onerror=swap));
+    }
+    if(fe) fe.textContent=f;
+  });
+  prefetchNeighbours(s);
+}
+function pairFrameUrl(s, cam, f){
+  return s.spool ? '/api/frame?node='+encodeURIComponent(cam)+'&name='+encodeURIComponent(f)
+    : '/api/run/frame?id='+encodeURIComponent(PAIRS.rid)+'&cam='+encodeURIComponent(cam)+'&name='+encodeURIComponent(f);
+}
+// Warm the browser cache with the pairs either side of the cursor so the
+// arrow keys land instantly. Run frames are immutable and cacheable; spool
+// frames are not prefetched (they proxy through a node).
+const PREFETCHED=new Map();
+function prefetchNeighbours(cur){
+  if(cur.spool) return;
+  [PAIRS.cursor-1, PAIRS.cursor+1].forEach(i=>{
+    const sh=PAIRS.list[i-PAIRS.start]; if(!sh) return;
+    Object.entries(sh.files||{}).forEach(([cam,f])=>{
+      const u=pairFrameUrl(sh, cam, f);
+      if(PREFETCHED.has(u)) return;
+      if(PREFETCHED.size>64) PREFETCHED.clear();
+      const im=new Image(); im.src=u; PREFETCHED.set(u, im);
+    });
   });
 }
+// Static chrome around the pair: exposure echo + health strip per camera.
+function renderReviewChrome(){
+  (FLEET.nodes||[]).forEach(n=>{
+    const h=$('#rvh-'+n.name);
+    if(h) h.innerHTML=healthStrip(n);
+    const sp=$('#rvspark-'+n.name);
+    if(sp) sp.innerHTML=(FLEET.run||{}).active?sparkSvg(spark[n.name]):'';
+  });
+}
+// Live view refresh for Review (only when toggled on, tab visible).
+setInterval(()=>{ if(LIVE && liveOk('review'))
+  refreshLive('rvfr-', (FLEET.nodes||[]).filter(n=>n.connected), true); },150);
 
 // ---- nav ------------------------------------------------------------------
 const track=[];
@@ -633,7 +735,6 @@ function drawRose(id,deg){
     x.strokeStyle='#5aa9e6';x.lineWidth=3;x.beginPath();
     x.moveTo(c-Math.cos(a)*(R*0.28),cy-Math.sin(a)*(R*0.28));
     x.lineTo(c+Math.cos(a)*(R-16),cy+Math.sin(a)*(R-16));x.stroke();
-    // arrowhead
     x.fillStyle='#e2574c';x.beginPath();
     const hx=c+Math.cos(a)*(R-16),hy=cy+Math.sin(a)*(R-16);
     x.moveTo(hx,hy);x.lineTo(hx-Math.cos(a-0.4)*12,hy-Math.sin(a-0.4)*12);
@@ -647,14 +748,9 @@ function headingCardinal(d){const n=['N','NE','E','SE','S','SW','W','NW'];
   return n[Math.round(((d%360)+360)%360/45)%8];}
 
 // ---- imu ------------------------------------------------------------------
-// Ring buffers of {x,y,z}. At ~200 Hz, 600 entries is about three seconds of
-// trace, which is enough to see a swell period without the canvas turning to
-// mush.
 const accelBuf=[], gyroBuf=[];
 let IMU_LAST=null, IMU_T0=0, IMU_RATE=0, IMU_KV_AT=0, IMU_RX=0, IMU_RX_AT=0;
 let IMU_NODE=null;     // last node rigd actually got samples from — never assumed
-
-// Network side: one batched fetch, several times a second.
 async function pollImuWindow(){
   const w=await api('/api/imu/window?t0='+(IMU_T0||0));
   let samples = (w && w.samples) || [];
@@ -667,18 +763,11 @@ async function pollImuWindow(){
     gyroBuf.push({x:s.gx||0,y:s.gy||0,z:s.gz||0}); if(gyroBuf.length>600)gyroBuf.shift();
     IMU_LAST=s;
   }
-  // Sample rate measured from what actually arrives, not what the driver claims.
   const now=Date.now()/1000;
   IMU_RX+=samples.length;
   if(now-IMU_RX_AT>=1.0){ IMU_RATE=IMU_RX/(now-IMU_RX_AT); IMU_RX=0; IMU_RX_AT=now; }
-  // rigd discovers the IMU host by probing the fleet; take its answer. Guarded
-  // because every sample in the batch can be older than IMU_T0 (a re-poll with
-  // nothing new), which leaves IMU_LAST null on the very first window.
   if(w.node){ IMU_NODE=w.node; if(IMU_LAST) IMU_LAST.node=w.node; }
 }
-
-// Display side: runs on every animation frame so the horizon and compass move
-// at the refresh rate rather than at the poll rate.
 function renderImu(){
   const s=IMU_LAST, kv=$('#imuKv'), badge=$('#imuBadge');
   const live = !!(s && s.epoch!=null && (Date.now()/1000-s.epoch)<2);
@@ -689,8 +778,6 @@ function renderImu(){
   }
   drawTrace('imuAccel',accelBuf,2.0,['#e2574c','#3fbf7f','#5aa9e6'],live);
   drawTrace('imuGyro',gyroBuf,250,['#e2574c','#3fbf7f','#5aa9e6'],live);
-  // Text is throttled: rewriting these nodes 60 times a second is pure DOM
-  // churn, and the numbers are unreadable that fast anyway.
   const now=Date.now();
   if(now-IMU_KV_AT<100) return;
   IMU_KV_AT=now;
@@ -707,9 +794,7 @@ function renderImu(){
   }
 }
 // Never name a node the code has not just observed. The IMU can be moved to any
-// Pi, and this string used to send the operator to a slot that has no hardware
-// in it at all. The carrier is whichever node reports imu.present in /api/fleet,
-// or whichever one rigd last pulled a window from.
+// Pi; the carrier is whichever node reports imu.present in /api/fleet.
 function imuHint(){
   const carrier=(FLEET.nodes||[]).find(n=>n.imu&&n.imu.present) ||
                 (FLEET.nodes||[]).find(n=>n.name===IMU_NODE);
@@ -720,11 +805,9 @@ function imuHint(){
     `plug the YB-MRA02 into a <b>USB-A</b> port on the node that carries it `+
     `(the Pi's USB-C is power-only); piagent auto-detects it`;
 }
-// Artificial horizon: sky/ground with pitch ladder, roll arc + bank pointer,
-// and a fixed aircraft reference. Clipped to a rounded instrument bezel.
 function drawHorizon(pitch,roll,live){
   const cv=$('#imuHorizon'),x=cv.getContext('2d'),W=cv.width,H=cv.height,cx=W/2,cy=H/2;
-  const R=Math.min(W,H)/2-6, ppd=H/60;   // pixels per degree of pitch
+  const R=Math.min(W,H)/2-6, ppd=H/60;
   x.clearRect(0,0,W,H);
   x.save();
   x.beginPath();x.arc(cx,cy,R,0,7);x.clip();
@@ -735,35 +818,29 @@ function drawHorizon(pitch,roll,live){
   const gnd=x.createLinearGradient(0,off,0,H);gnd.addColorStop(0,'#7a5a2d');gnd.addColorStop(1,'#4a3a1d');
   x.fillStyle=gnd;x.fillRect(-W,off,2*W,H);
   x.strokeStyle='#f0f0f0';x.lineWidth=2.5;x.beginPath();x.moveTo(-W,off);x.lineTo(W,off);x.stroke();
-  // pitch ladder
   x.strokeStyle='rgba(255,255,255,.8)';x.fillStyle='rgba(255,255,255,.85)';
   x.lineWidth=1.5;x.font='10px monospace';x.textAlign='center';x.textBaseline='middle';
   for(let p=-30;p<=30;p+=10){ if(p===0)continue; const y=off - p*ppd; const w=Math.abs(p)===30?60:40;
     x.beginPath();x.moveTo(-w/2,y);x.lineTo(w/2,y);x.stroke();
     x.fillText(Math.abs(p), -w/2-12, y); x.fillText(Math.abs(p), w/2+12, y);}
   x.restore();
-  // roll arc + ticks
   x.save();x.translate(cx,cy);
   x.strokeStyle='#e8eaf0';x.lineWidth=2;x.beginPath();x.arc(0,0,R-4,Math.PI*1.15,Math.PI*1.85);x.stroke();
   [-60,-45,-30,-20,-10,0,10,20,30,45,60].forEach(t=>{const a=(-90+t)*Math.PI/180;
     const rr=R-4, ll=(t%30===0)?12:7;
     x.beginPath();x.moveTo(Math.cos(a)*rr,Math.sin(a)*rr);
     x.lineTo(Math.cos(a)*(rr-ll),Math.sin(a)*(rr-ll));x.stroke();});
-  // bank pointer (rotates with roll)
   x.rotate(-roll*Math.PI/180);
   x.fillStyle='#e6a94b';x.beginPath();x.moveTo(0,-(R-4));x.lineTo(-7,-(R-16));x.lineTo(7,-(R-16));x.fill();
   x.restore();
-  // fixed aircraft symbol
   x.strokeStyle='#ffd24a';x.lineWidth=3;x.beginPath();
   x.moveTo(cx-46,cy);x.lineTo(cx-16,cy);x.moveTo(cx-16,cy);x.lineTo(cx-16,cy+8);
   x.moveTo(cx+46,cy);x.lineTo(cx+16,cy);x.moveTo(cx+16,cy);x.lineTo(cx+16,cy+8);x.stroke();
   x.fillStyle='#ffd24a';x.beginPath();x.arc(cx,cy,3,0,7);x.fill();
-  // bezel
   x.strokeStyle='#2a2e37';x.lineWidth=4;x.beginPath();x.arc(cx,cy,R+2,0,7);x.stroke();
   if(!live){x.fillStyle='rgba(14,15,18,.55)';x.beginPath();x.arc(cx,cy,R,0,7);x.fill();
     x.fillStyle='#8b90a0';x.font='12px monospace';x.textAlign='center';x.fillText('awaiting IMU',cx,cy-R/2);}
 }
-// Scrolling 3-axis trace strip.
 function drawTrace(id,buf,range,colors,live){
   const cv=$('#'+id),x=cv.getContext('2d'),W=cv.width,H=cv.height;
   x.clearRect(0,0,W,H);
@@ -784,47 +861,22 @@ function drawTrace(id,buf,range,colors,live){
     x.fillText(ax.toUpperCase()+' '+last[ax].toFixed(2),W-8,12+ci*12);});
 }
 
-// ---- controls -------------------------------------------------------------
-// The exposure panel is a VIEW of rigd's one desired vector, not a form with
-// defaults of its own. It used to boot showing f/8 · 1/200 · ISO 400 whatever
-// the fleet was really set to, and Apply pushed all three unconditionally —
-// which silently converted a survey running ISO AUTO (16777215) to a fixed
-// ISO 400, with convergence still reporting "synced". Two rules now:
-//   1. the controls are hydrated from GET /api/settings and re-hydrated after
-//      every Apply, so what is on screen is what the fleet is on;
-//   2. Apply sends ONLY the fields the operator actually edited, so an
-//      untouched control can never overwrite desired with a page default.
-let EV=0;
-let DESIRED=null;         // last desired vector read back from rigd
-let CHOICES={};           // primary camera's legal values, straight from ilxctl
-const DIRTY=new Set();    // exposure fields edited since the last hydrate
-let SET_AT=0;             // epoch ms of the last successful hydrate
-
-// Value labels for anything the camera did not label for us: a body that is
-// offline (so we have no choice list) or a node that reports bare numeric
-// choices. Mirrors formatIso / formatShutterSpeed / formatFNumber in
-// src/camera.cpp so the panel can never disagree with the camera's own readout.
-// The body's own label always wins when it sends one, so the two Sony oddities
-// these do not reproduce — the MFNR ISO prefix and Bulb/"--" shutter — can only
-// appear via ilxctl, which labels them itself.
+// ---- settings: labels, choices, per-camera exposure ------------------------
+let DESIRED=null;         // fleet desired vector, read back from rigd
+let SET_AT=0;
 const ISO_AUTO=16777215;
 function labIso(v){ const val=v&0x00FFFFFF; return val===ISO_AUTO?'ISO AUTO':'ISO '+val; }
 function labShutter(v){ const num=(v>>>16)&0xFFFF, den=v&0xFFFF;
   if(!den) return '—';
-  if(num===1) return '1/'+den;                       // 1/200 = 65736
-  if(num%den===0) return (num/den)+'"';              // 2" = (2<<16)|1
-  return Math.floor(num/den)+'.'+(num%den)+'"'; }    // 1.3" = (13<<16)|10
+  if(num===1) return '1/'+den;
+  if(num%den===0) return (num/den)+'"';
+  return Math.floor(num/den)+'.'+(num%den)+'"'; }
 function labAperture(v){ return 'F'+(v%100?(v/100).toFixed(1):(v/100)); }
 function labSet(d){ return (d&&d.aperture!=null)
   ? labAperture(d.aperture)+' · '+labShutter(d.shutter)+' · '+labIso(d.iso)+
     ' · EV '+(d.expcomp||0)+' mEV'
   : '—'; }
-
 function selVal(sel){ const v=sel&&sel.value; return (v===''||v==null)?null:+v; }
-// ilxctl emits choices as {v,l} pairs; the fake node emits bare numbers. Accept
-// both. Always carry the value rigd currently wants, even when the body did not
-// offer it — otherwise the select would show a DIFFERENT setting than the fleet
-// is actually on, which is the whole failure this panel is being fixed for.
 function normChoices(list,cur,lab){
   const out=[];
   (list||[]).forEach(c=>{ const v=(c&&typeof c==='object')?+c.v:+c;
@@ -842,30 +894,17 @@ function fillChoice(sel,list,cur,lab){
       e.value=o.v; e.textContent=o.l; sel.appendChild(e);}); }
   if(cur!=null && isFinite(cur)) sel.value=String(+cur);
 }
-function syncExpControls(){
-  const d=DESIRED||{};
-  // A field the operator has edited keeps ITS value across a repopulation;
-  // everything else follows the server.
-  fillChoice($('#sAp'),CHOICES.apertureChoices,
-             DIRTY.has('aperture')?selVal($('#sAp')):d.aperture, labAperture);
-  fillChoice($('#sSh'),CHOICES.shutterChoices,
-             DIRTY.has('shutter')?selVal($('#sSh')):d.shutter, labShutter);
-  fillChoice($('#sIso'),CHOICES.isoChoices,
-             DIRTY.has('iso')?selVal($('#sIso')):d.iso, labIso);
-}
 async function hydrateSettings(){
   const d=await api('/api/settings');
   if(!d || d.aperture==null) return;   // keep what is on screen; never invent
   DESIRED=d; SET_AT=Date.now();
-  if(d._preview) PREVIEW=d._preview;
-  EV=+d.expcomp||0; $('#evVal').textContent=EV+' mEV';
-  if(!DIRTY.has('expmode')) $('#sExpMode').value=d._auto?'auto':'manual';
-  syncExpControls(); syncFmtControls(); updateDirtyUi(); renderPreview();
+  syncFmtControls(); renderCtlCols();
+  $('#applyNote').innerHTML='<span class="muted">fleet desired: '+labSet(DESIRED)+'</span>';
 }
-// Format fields. These have NO readback on this body, so the select shows what
-// rigd is PUSHING, never a confirmation — said out loud in the panel rather
-// than implied by a control that looks like every other one.
-const FMT=[['filetype','#sFtype'],['imagesize','#sIsize'],['transsize','#sTsize']];
+// Format fields: no readback on this body, so the select shows what rigd is
+// PUSHING, never a confirmation.
+const FMT=[['filetype','#sFtype'],['imagesize','#sIsize'],['transsize','#sTsize'],
+           ['wb_mode','#sWbMode'],['colortemp','#sColorTemp']];
 const FMT_DIRTY=new Set();
 function syncFmtControls(){
   const d=DESIRED||{};
@@ -892,151 +931,406 @@ $('#btnFmt').onclick=async()=>{
       ' — no readback on this body, watch the delivered frame size</span>'; }
   await hydrateSettings();
 };
-function markDirty(f,el){ DIRTY.add(f); if(el) el.classList.add('edited'); updateDirtyUi(); }
-function clearDirty(){ DIRTY.clear();
-  ['#sAp','#sSh','#sIso','#sExpMode'].forEach(s=>$(s).classList.remove('edited')); }
-function updateDirtyUi(){
-  const n=DIRTY.size, note=$('#applyNote');
-  $('#btnApply').textContent = n?('Apply to fleet ('+n+')'):'Apply to fleet';
-  if(n) note.innerHTML='<span style="color:var(--warn)">edited, not yet pushed: '+
-    [...DIRTY].join(', ')+'</span>';
-  else note.innerHTML='<span class="muted">fleet desired: '+
-    (DESIRED?labSet(DESIRED):'reading…')+'</span>';
-}
-$('#sAp').onchange=()=>markDirty('aperture',$('#sAp'));
-$('#sSh').onchange=()=>markDirty('shutter',$('#sSh'));
-$('#sIso').onchange=()=>markDirty('iso',$('#sIso'));
-$('#sExpMode').onchange=()=>markDirty('expmode',$('#sExpMode'));
 
-$('#evUp').onclick=()=>bumpEv(1); $('#evDn').onclick=()=>bumpEv(-1);
-async function bumpEv(s){ const r=await api('/api/ev',{steps:s});
-  if(r.ok){ EV=r.expcomp_mev; $('#evVal').textContent=EV+' mEV';
-    if(DESIRED) DESIRED.expcomp=EV; updateDirtyUi(); } }
-
-// ---- staged preview: cam1 first, then the fleet ---------------------------
-// The product goal is "Cam1 allows live preview of settings changes before
-// deploying across fleet". Preview pushes the edited exposure to the PRIMARY
-// camera only and pins it there; the fleet's desired vector is untouched, so
-// cam2 keeps shooting the survey settings and nothing has been overwritten. The
-// operator judges it on cam1's live view + histogram directly above, then
-// deploys or discards. The pin also expires by itself — see the countdown.
-function pvFields(){
-  const body={};
-  if(DIRTY.has('aperture')) body.aperture=selVal($('#sAp'));
-  if(DIRTY.has('shutter'))  body.shutter =selVal($('#sSh'));
-  if(DIRTY.has('iso'))      body.iso     =selVal($('#sIso'));
-  return body;
-}
-function pvLabel(f,v){ return f==='aperture'?labAperture(v)
-  : f==='shutter'?labShutter(v) : f==='iso'?labIso(v) : (v+' mEV'); }
-function renderPreview(){
-  const el=$('#pvPanel'); if(!el) return;
-  if(!PREVIEW || !PREVIEW.active){ el.innerHTML=''; return; }
-  const p=PREVIEW.pending||{}, d=PREVIEW.desired||{};
-  const diff=Object.keys(p).sort().map(f=>
-    `<div class="pvdiff">${escapeHtml(f)}: <span class="from">${
-      escapeHtml(pvLabel(f,d[f]))}</span> → <span class="to">${
-      escapeHtml(pvLabel(f,p[f]))}</span></div>`).join('');
-  el.innerHTML=`<div class="pvbar">
-    <b>PREVIEW on ${escapeHtml(PREVIEW.node||'?')}</b>
-    <span class="muted small">— this camera only. The fleet is still on its
-      saved settings, and the pair is NOT matched while this is held.</span>
-    ${diff}
-    <div class="row" style="margin-top:8px">
-      <button class="act go" id="pvDeploy">Deploy to fleet</button>
-      <button class="act stop" id="pvDiscard">Discard</button>
-      <span class="muted small">auto-releases in
-        <span class="mono" id="pvLeft">${Math.round(PREVIEW.expires_in_s||0)}</span> s
-        — a forgotten preview cannot cost more than that</span>
-    </div>
-    <div id="pvNote" class="small" style="margin-top:6px"></div></div>`;
-  $('#pvDeploy').onclick=async()=>{
-    $('#pvNote').textContent='deploying…';
-    const r=await api('/api/settings/commit',{});
-    $('#pvNote').innerHTML = r && r.ok
-      ? '<span style="color:var(--ok)">deployed '+
-        escapeHtml(Object.keys(r.applied||{}).join(', '))+' to the fleet</span>'
-      : '<span style="color:var(--bad)">'+escapeHtml((r&&r.error)||'failed')+'</span>';
-    clearDirty(); PREVIEW={active:false}; await hydrateSettings(); pollFleet();
-  };
-  $('#pvDiscard').onclick=async()=>{
-    $('#pvNote').textContent='discarding…';
-    await api('/api/settings/discard',{});
-    PREVIEW={active:false}; await hydrateSettings(); pollFleet();
-  };
-}
-$('#btnPreview').onclick=async()=>{
-  const note=$('#applyNote'), body=pvFields();
-  if(!Object.keys(body).length){ note.innerHTML='<span class="muted">edit an '+
-    'exposure control first — Preview sends only what you touched, to Cam1 '+
-    'alone</span>'; return; }
-  const btn=$('#btnPreview'); btn.disabled=true;
-  const r=await api('/api/settings/preview',body);
-  btn.disabled=false;
-  if(r && r.ok){ PREVIEW=r.preview||PREVIEW;
-    note.innerHTML='<span style="color:var(--warn)">previewing on '+
-      escapeHtml(r.node||'cam1')+' — judge it on the live view above, then '+
-      'Deploy or Discard</span>';
-    renderPreview(); pollFleet();
-  } else {
-    const why=(r&&r.error)||'no response';
-    const det=Object.entries((r&&r.rejected)||{}).concat(
-      Object.entries((r&&r.failed)||{}))
-      .map(([k,v])=>k+': '+v).join(' · ');
-    note.innerHTML='<span style="color:var(--bad)">preview failed: '+
-      escapeHtml(why)+(det?(' — '+escapeHtml(det)):'')+'</span>';
+// Per-camera exposure: a change goes LIVE to that body, immediately, via
+// POST /api/exposure {node, which, value}. The fleet vector is untouched —
+// deliberately leaving the two bodies different (balancing them) is a real
+// workflow. "Apply exposure to fleet" copies ONE camera's exposure into the
+// fleet vector: a hard whitelist, nothing else can ride along.
+const EXP_ALLOWED=['aperture','shutter','iso','expcomp'];
+const CHOICES_BY={};   // node -> its own choice lists (fetched per body)
+const EV_LEDGER={};    // node -> mEV pushed (expcomp has no readback)
+let LAST_EDITED=null;  // the column Apply uses as its source
+async function nodeExposure(node, which, value, noteEl){
+  const r=await api('/api/exposure',{node,which,value},6000);
+  if(!r || r.ok===false){
+    if(noteEl) noteEl.innerHTML='<span style="color:var(--bad)">'+which+' refused: '+
+      escapeHtml((r&&r.error)||'no response')+'</span>';
+    return false;
   }
-};
+  LAST_EDITED=node;
+  if(noteEl) noteEl.innerHTML='<span class="muted">'+which+' → '+escapeHtml(node)+'</span>';
+  syncApplyBtn();
+  return true;
+}
+function syncApplyBtn(){
+  $('#btnApply').textContent='Apply '+(LAST_EDITED?LAST_EDITED+"'s":'')+' exposure to fleet';
+}
 $('#btnApply').onclick=async()=>{
   const note=$('#applyNote');
-  if(!DIRTY.size && PREVIEW.active){
-    // Nothing edited but a preview is held: Apply means "deploy that".
-    const r=await api('/api/settings/commit',{});
-    await hydrateSettings(); pollFleet();
-    note.innerHTML = r && r.ok
-      ? '<span style="color:var(--ok)">deployed the preview to the fleet</span>'
-      : '<span style="color:var(--bad)">'+escapeHtml((r&&r.error)||'failed')+'</span>';
-    return;
-  }
-  if(!DIRTY.size){ note.innerHTML='<span class="muted">nothing edited — Apply only '+
-    'pushes fields you touched, so it cannot overwrite the fleet with this page\'s '+
-    'defaults. Current: '+(DESIRED?labSet(DESIRED):'unknown')+'</span>'; return; }
-  const body=pvFields();
+  const src=(FLEET.nodes||[]).find(n=>n.name===LAST_EDITED&&n.connected)
+        || (FLEET.nodes||[]).find(n=>n.connected);
+  if(!src){ note.innerHTML='<span class="muted">no camera connected</span>'; return; }
+  // The source body's own readback, whitelisted: ONLY the exposure section.
+  const body={};
+  if(src.aperture_raw!=null) body.aperture=src.aperture_raw;
+  if(src.shutter_raw!=null)  body.shutter =src.shutter_raw;
+  if(src.iso_raw!=null)      body.iso     =src.iso_raw;
+  if(EV_LEDGER[src.name]!=null) body.expcomp=EV_LEDGER[src.name];
+  Object.keys(body).forEach(k=>{ if(!EXP_ALLOWED.includes(k)) delete body[k]; });
+  if(!Object.keys(body).length){
+    note.innerHTML='<span class="muted">no exposure readback from '+escapeHtml(src.name)+' yet</span>';
+    return; }
   const btn=$('#btnApply'); btn.disabled=true;
-  const msg=[]; let bad=false;
-  if(Object.keys(body).length){
-    const r=await api('/api/settings',body);
-    const rej=Object.keys((r&&r.rejected)||{});
-    // A refused value is the operator's own typo, not a camera fault. Say so
-    // here rather than leaving them to read a red convergence badge.
-    if(rej.length){ bad=true;
-      msg.push('refused: '+rej.map(k=>k+' — '+r.rejected[k]).join(' · ')); }
-    if(r && r.applied && Object.keys(r.applied).length)
-      msg.push('pushed '+Object.keys(r.applied).join(', '));
-    else if(!rej.length){ bad=true;
-      msg.push('apply failed: '+((r&&r.error)||'no response')); }
-  }
-  if(!bad && DIRTY.has('expmode')){
-    const r=await api('/api/settings/auto',{on:$('#sExpMode').value==='auto'});
-    if(r && r.ok!==false) msg.push('mode '+$('#sExpMode').value);
-    else { bad=true; msg.push('mode failed: '+((r&&r.error)||'no response')); }
-  }
+  const r=await api('/api/settings',body);
   btn.disabled=false;
-  if(!bad) clearDirty();
-  await hydrateSettings();          // show what rigd actually holds now
-  note.innerHTML='<span style="color:var(--'+(bad?'bad':'ok')+')">'+escapeHtml(msg.join(' · '))+
-    '</span>'+(bad?'':' <span class="muted">— '+labSet(DESIRED)+'; watch convergence below</span>');
+  const rej=Object.keys((r&&r.rejected)||{});
+  if(rej.length)
+    note.innerHTML='<span style="color:var(--bad)">refused: '+
+      escapeHtml(rej.map(k=>k+' — '+r.rejected[k]).join(' · '))+'</span>';
+  else if(r && r.applied && Object.keys(r.applied).length)
+    note.innerHTML='<span style="color:var(--ok)">fleet now on '+escapeHtml(src.name)+
+      "'s exposure: "+escapeHtml(Object.keys(r.applied).join(', '))+'</span>';
+  else
+    note.innerHTML='<span style="color:var(--bad)">apply failed: '+
+      escapeHtml((r&&r.error)||'no response')+'</span>';
+  await hydrateSettings();
 };
 
-// ---- run control ----------------------------------------------------------
-// Pre-flight. A run started with one camera, no IMU and no GPS still writes a
+// ---- controls: one column per camera ---------------------------------------
+// The column DOM is identity-keyed and NEVER rebuilt while a hold-to-drive
+// button may be held: a wholesale innerHTML rebuild mid-hold orphans the
+// release event and the lens keeps driving. Dynamic text goes through
+// per-element updates instead.
+function connKey(list){ return list.map(n=>n.cam_num+':'+n.name).join(','); }
+function renderCtlCols(){
+  const wrap=$('#ctlCols'); if(!wrap) return;
+  const roster=(FLEET.nodes||[]);
+  if(!roster.length){ wrap.innerHTML='<span class="muted small">no cameras</span>'; return; }
+  const key=connKey(roster);
+  if(wrap.dataset.key!==key){
+    wrap.dataset.key=key; wrap.innerHTML='';
+    roster.forEach(n=>{ wrap.insertAdjacentHTML('beforeend', ctlColHtml(n));
+      bindCtlCol(n.name); });
+  }
+  roster.forEach(n=>updateCtlCol(n));
+}
+function ctlColHtml(n){
+  const nm=n.name;
+  return `<div class="camcol" id="cc-${nm}">
+    <div class="hd"><b>Cam${n.cam_num} · ${nm}</b><span class="exp mono" id="clx-${nm}"></span></div>
+    <div class="hstrip" id="ch-${nm}"></div>
+    <div class="frame"><img id="lv-${nm}" alt=""></div>
+    <div class="ctlbody">
+      <div class="ctlsec"><h3>Exposure — this camera <span class="meta" id="neq-${nm}"></span></h3>
+        <div class="row">
+          <label>Aperture<select id="ap-${nm}" style="min-width:92px" disabled></select></label>
+          <label>Shutter<select id="sh-${nm}" style="min-width:110px" disabled></select></label>
+          <label>ISO<select id="iso-${nm}" style="min-width:118px" disabled></select></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="muted small">EV</span>
+          <button class="act" id="evdn-${nm}">−⅓</button>
+          <span id="ev-${nm}" class="mono small">— mEV</span>
+          <button class="act" id="evup-${nm}">+⅓</button>
+          <span id="note-${nm}" class="small" style="margin-left:auto"></span>
+        </div>
+      </div>
+      <div class="ctlsec"><h3>Focus — this camera only <span class="meta" id="fmeta-${nm}"></span></h3>
+        <div class="row">
+          <button class="act" id="fnear-${nm}">◀ Near</button>
+          <button class="act" id="ffar-${nm}">Far ▶</button>
+          <label>Step<input id="fstep-${nm}" type="number" value="50" style="width:76px"></label>
+          <span class="muted small">hold to drive</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <input id="fpos-${nm}" type="range" min="0" max="65535" value="0" style="flex:1">
+          <span id="fposv-${nm}" class="mono small" style="min-width:5ch"></span>
+        </div>
+        <div class="lensnote" id="fnote-${nm}"></div>
+      </div>
+      <div class="ctlsec"><h3>Zoom — this camera only <span class="meta" id="zmeta-${nm}"></span></h3>
+        <div class="row">
+          <button class="act" id="zwide-${nm}">◀ Wide</button>
+          <button class="act" id="ztele-${nm}">Tele ▶</button>
+          <label>Speed<input id="zspd-${nm}" type="number" value="3" min="1" max="8" style="width:70px"></label>
+          <label>Setting<select id="zset-${nm}" style="min-width:90px"></select></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <input id="zpos-${nm}" type="range" min="0" max="65535" value="0" style="flex:1">
+          <span id="zposv-${nm}" class="mono small" style="min-width:5ch"></span>
+        </div>
+        <div class="lensnote" id="znote-${nm}"></div>
+      </div>
+    </div></div>`;
+}
+
+// ---- the lens command queue (per node+control) ------------------------------
+// One in-flight request per (node, control); the latest wanted value coalesces
+// over anything still queued; a STOP is retried until a response confirms it —
+// a stop may never be outrun by its own start or lost to a timeout. While a
+// drive is held, the value is re-sent every 400 ms as a keepalive.
+const LENS={}, LENS_BUSY={};
+function lensQ(node,kind){ return LENS[node+'|'+kind]=LENS[node+'|'+kind]||
+  {inflight:false, want:null, stopTries:0}; }
+function lensSend(node,kind,path,body,noteEl){
+  const q=lensQ(node,kind);
+  q.want={path,body,isStop:!Object.values(body).some(v=>v)};
+  lensPump(node,kind,noteEl);
+}
+function lensPump(node,kind,noteEl){
+  const q=lensQ(node,kind);
+  if(q.inflight||!q.want) return;
+  const job=q.want; q.want=null; q.inflight=true;
+  LENS_BUSY[node]=Date.now();
+  api(job.path, Object.assign({node:node},job.body), 4000).then(r=>{
+    const failed = !r || r._err || r.ok===false ||
+      (r.results && r.results[node] && r.results[node].ok===false);
+    if(failed){
+      const why=(r&&r.error)||(r&&r.results&&r.results[node]&&r.results[node].error)||'no response';
+      if(noteEl) noteEl.textContent=kind+' refused: '+why;
+      if(job.isStop && q.stopTries<5 && !q.want){
+        q.stopTries++; q.want=job;            // a lost stop MUST be retried
+      }
+    } else {
+      if(job.isStop) q.stopTries=0;
+      if(noteEl) noteEl.textContent='';
+    }
+  }).finally(()=>{
+    q.inflight=false;
+    if(!q.want) LENS_BUSY[node]=0;
+    lensPump(node,kind,noteEl);
+  });
+}
+function holdButton(el,onDown,onUp){
+  if(!el)return; let active=false, keep=null;
+  const dn=e=>{e.preventDefault(); if(active)return; active=true;
+    onDown(); keep=setInterval(onDown,400);};       // keepalive re-send
+  const up=()=>{ if(!active)return; active=false;
+    clearInterval(keep); keep=null; onUp();};
+  el.addEventListener('pointerdown',dn);
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>el.addEventListener(ev,up));
+  // Document-level fallback: if the element ever vanishes mid-hold, the
+  // release must still send the stop.
+  document.addEventListener('pointerup',up);
+  document.addEventListener('pointercancel',up);
+}
+function bindCtlCol(nm){
+  const note=id=>$('#'+id+'-'+nm);
+  // exposure — live to this camera
+  [['ap','aperture',labAperture],['sh','shutter',labShutter],['iso','iso',labIso]]
+  .forEach(([pfx,which])=>{
+    const el=$('#'+pfx+'-'+nm);
+    el.onchange=async()=>{
+      const v=selVal(el); if(v==null) return;
+      el.classList.add('edited');
+      const ok=await nodeExposure(nm,which,v,note('note'));
+      if(!ok) el.classList.remove('edited');
+    };
+  });
+  $('#evdn-'+nm).onclick=()=>bumpNodeEv(nm,-1);
+  $('#evup-'+nm).onclick=()=>bumpNodeEv(nm,+1);
+  // focus/zoom — this camera only, through the command queue
+  holdButton($('#fnear-'+nm),
+    ()=>lensSend(nm,'focus','/api/focus/drive',{step:-(+$('#fstep-'+nm).value||50)},note('fnote')),
+    ()=>lensSend(nm,'focus','/api/focus/drive',{step:0},note('fnote')));
+  holdButton($('#ffar-'+nm),
+    ()=>lensSend(nm,'focus','/api/focus/drive',{step:+(+$('#fstep-'+nm).value||50)},note('fnote')),
+    ()=>lensSend(nm,'focus','/api/focus/drive',{step:0},note('fnote')));
+  holdButton($('#zwide-'+nm),
+    ()=>lensSend(nm,'zoom','/api/zoom/drive',{speed:-(+$('#zspd-'+nm).value||3)},note('znote')),
+    ()=>lensSend(nm,'zoom','/api/zoom/drive',{speed:0},note('znote')));
+  holdButton($('#ztele-'+nm),
+    ()=>lensSend(nm,'zoom','/api/zoom/drive',{speed:+(+$('#zspd-'+nm).value||3)},note('znote')),
+    ()=>lensSend(nm,'zoom','/api/zoom/drive',{speed:0},note('znote')));
+  const fpos=$('#fpos-'+nm), zpos=$('#zpos-'+nm);
+  fpos.oninput=()=>$('#fposv-'+nm).textContent=fpos.value;
+  fpos.onchange=()=>lensSend(nm,'focuspos','/api/focus/position',{value:+fpos.value},note('fnote'));
+  zpos.oninput=()=>$('#zposv-'+nm).textContent=zpos.value;
+  zpos.onchange=()=>lensSend(nm,'zoompos','/api/zoom/position',{value:+zpos.value},note('znote'));
+  $('#zset-'+nm).onchange=()=>lensSend(nm,'zoomset','/api/zoom/setting',
+    {value:+$('#zset-'+nm).value},note('znote'));
+}
+async function bumpNodeEv(nm,dir){
+  // expcomp has NO readback: track what was pushed and say so.
+  const cur=EV_LEDGER[nm]??((DESIRED||{}).expcomp||0);
+  const v=Math.max(-5000,Math.min(5000,cur+dir*333));
+  if(await nodeExposure(nm,'expcomp',v,$('#note-'+nm))){
+    EV_LEDGER[nm]=v;
+    $('#ev-'+nm).textContent=v+' mEV (pushed)';
+  }
+}
+async function updateCtlCol(n){
+  const nm=n.name;
+  const h=$('#ch-'+nm); if(h) h.innerHTML=healthStrip(n);
+  const e=$('#clx-'+nm);
+  if(e){
+    const img=$('#lv-'+nm), at=(img&&+img.dataset.at)||0;
+    const age=at?(Date.now()-at)/1000:null;
+    const stale=(age!=null&&age>3)
+      ? ` <span style="color:var(--warn)">· ${age.toFixed(0)}s old</span>` : '';
+    e.innerHTML=n.connected
+      ? escapeHtml((n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||''))+stale
+      : '<span class="muted">offline</span>';
+  }
+  // choice lists + slider ranges from THIS body, once per connection
+  if(n.connected && !CHOICES_BY[nm]){
+    CHOICES_BY[nm]={pending:true};
+    const s=await api('/api/status?node='+nm);
+    if(s && (s.shutterChoices||s.isoChoices||s.apertureChoices)){
+      CHOICES_BY[nm]=s;
+      const fpos=$('#fpos-'+nm), zpos=$('#zpos-'+nm);
+      if(s.focusPosRange&&fpos){ fpos.min=s.focusPosRange.min; fpos.max=s.focusPosRange.max; }
+      if(s.zoomPosRange&&zpos){ zpos.min=s.zoomPosRange.min; zpos.max=s.zoomPosRange.max; }
+      if(s.zoomSettings) fillChoice($('#zset-'+nm),s.zoomSettings,s.zoomSetting,v=>String(v));
+      if(s.focusModes && !$('#fMode').options.length)
+        fillChoice($('#fMode'),s.focusModes,s.focusMode,v=>'mode '+v);
+      ['ap','sh','iso'].forEach(p=>{const el=$('#'+p+'-'+nm); if(el) el.disabled=false;});
+    } else {
+      delete CHOICES_BY[nm];           // retry on a later poll
+    }
+  } else if(!n.connected && CHOICES_BY[nm]){
+    delete CHOICES_BY[nm];             // reconnect re-fetches (lens may differ)
+    ['ap','sh','iso'].forEach(p=>{const el=$('#'+p+'-'+nm); if(el) el.disabled=true;});
+  }
+  const c=CHOICES_BY[nm]||{};
+  // selects follow the BODY's readback unless the operator's edit has not
+  // echoed yet (edited-class cleared the moment readback agrees)
+  [['ap','aperture_raw',c.apertureChoices,labAperture],
+   ['sh','shutter_raw', c.shutterChoices, labShutter],
+   ['iso','iso_raw',    c.isoChoices,     labIso]].forEach(([pfx,key,list,lab])=>{
+    const el=$('#'+pfx+'-'+nm); if(!el||el.disabled) return;
+    const raw=n[key];
+    if(el.classList.contains('edited')){
+      if(raw!=null && String(raw)===el.value) el.classList.remove('edited');
+      return;                          // operator's value stands until echo
+    }
+    fillChoice(el,list,raw,lab);
+  });
+  if(EV_LEDGER[nm]==null && DESIRED)
+    $('#ev-'+nm).textContent=(DESIRED.expcomp||0)+' mEV';
+  // "≠" chip when this body's exposure differs from its partner's
+  const partner=(FLEET.nodes||[]).find(o=>o.connected&&o.name!==nm);
+  const neq=$('#neq-'+nm);
+  if(neq){
+    const differs = partner && n.connected &&
+      ['aperture_raw','shutter_raw','iso_raw'].some(k=>n[k]!=null&&partner[k]!=null&&n[k]!==partner[k]);
+    neq.innerHTML = differs ? '<span class="neq" title="the two bodies are on different exposures — deliberate is fine, Apply pushes one to the fleet">≠ bodies differ</span>' : '';
+  }
+  // lens metadata into the section headers (never a separate card)
+  const fm=$('#fmeta-'+nm);
+  if(fm) fm.textContent=(n.focus_mode_label||'')+(n.focus_pos!=null?(' · pos '+n.focus_pos):'');
+  const zm=$('#zmeta-'+nm);
+  if(zm) zm.textContent=(n.zoom_pos!=null?('pos '+n.zoom_pos):'')+
+    (n.zoom_setting_label?(' · '+n.zoom_setting_label):'');
+  // position sliders follow readback while the operator is not on them
+  const fpos=$('#fpos-'+nm), zpos=$('#zpos-'+nm);
+  if(fpos && n.focus_pos!=null && document.activeElement!==fpos && !LENS_BUSY[nm]){
+    fpos.value=n.focus_pos; $('#fposv-'+nm).textContent=n.focus_pos; }
+  if(zpos && n.zoom_pos!=null && document.activeElement!==zpos && !LENS_BUSY[nm]){
+    zpos.value=n.zoom_pos; $('#zposv-'+nm).textContent=n.zoom_pos; }
+}
+// cross-body focus mismatch: visible warning, never an auto-correction
+function renderLensWarn(){
+  const live=(FLEET.nodes||[]).filter(n=>n.connected);
+  const fp=live.map(n=>n.focus_pos), differ=live.length>1 &&
+    fp.every(v=>v!=null) && new Set(fp).size>1;
+  $('#lensWarn').textContent = differ
+    ? 'the two bodies report different focus positions — check by eye before '
+      +'the transect; nothing re-asserts these' : '';
+}
+let FMODE_BUSY=false;
+$('#fMode').onchange=async()=>{
+  const v=$('#fMode').value;
+  if(v===''||v==null||isNaN(+v)) return;
+  FMODE_BUSY=true;
+  const r=await api('/api/focus/mode',{mode:+v});
+  FMODE_BUSY=false;
+  const rej=(r&&r.rejected&&r.rejected.focus_mode);
+  if(rej) $('#applyNote').innerHTML='<span style="color:var(--bad)">focus mode '+
+    'refused: '+escapeHtml(rej)+'</span>';
+  await hydrateSettings();
+};
+function refreshLive(prefix, nodes, framed){
+  nodes.forEach(n=>{
+    // A held lens drive shares ilxctl's SDK mutex with live view: while one is
+    // in flight on this node, skip its refresh so the stop is never queued
+    // behind a JPEG grab.
+    if(LENS_BUSY[n.name]) return;
+    const el=$('#'+prefix+n.name);
+    const img=framed ? (el&&el.querySelector('img')) : el;
+    if(!img)return;
+    // The busy latch must not freeze the picture: a load that has hung for
+    // more than 2 s (an SDK stall, a node going away) is abandoned, not
+    // waited on forever under a LIVE badge.
+    if(img.dataset.busy && Date.now()-(+img.dataset.busyAt||0)<2000)return;
+    img.dataset.busy='1'; img.dataset.busyAt=String(Date.now());
+    const done=()=>{img.dataset.busy='';};
+    img.onload=()=>{done(); img.dataset.at=Date.now();};
+    img.onerror=done;
+    // rigd is the throttle (LiveTap: 5 fps idle, 2 fps in a run, shared by
+    // every client) — the UI can ask often and only ever gets what the
+    // policy allows, so a fast timer here costs nothing on the Pi.
+    img.src='/api/liveview?node='+n.name+'&_='+Date.now();
+  });
+}
+async function pollControls(){
+  renderCtlCols();
+  if(!document.hidden) refreshLive('lv-', (FLEET.nodes||[]).filter(n=>n.connected));
+  renderLensWarn(); renderBodyOnly();
+  if(Date.now()-SET_AT>5000) hydrateSettings();
+  const prim=(FLEET.nodes||[]).find(n=>n.connected);
+  if(prim && $('#fMode').options.length && !FMODE_BUSY){
+    const cur=(prim.focus_mode!=null)?prim.focus_mode:(DESIRED||{}).focus_mode;
+    if(cur!=null) $('#fMode').value=String(cur);
+  }
+}
+function renderBodyOnly(){
+  const live=(FLEET.nodes||[]).filter(n=>n.connected), el=$('#bodyOnly');
+  if(!el) return;
+  el.innerHTML=live.length?live.map(n=>{
+    const w=n.writable||{}, ro=w.storeDest===2;
+    return kvrow('Cam'+n.cam_num+' storeDest',
+      escapeHtml(String(n.store_dest_label||n.store_dest||'—'))+
+      (ro?' <span class="muted">(body menu only)</span>':''));
+  }).join(''):'<span class="muted">no cameras</span>';
+}
+
+// ---- strobe ----------------------------------------------------------------
+let STROBE={enabled:false,node:'cam1',delta_ms:10,pulse_ms:5};
+async function hydrateStrobe(){
+  const r=await api('/api/strobe');
+  if(r&&r.strobe){ STROBE=r.strobe; renderStrobe([]); }
+}
+function renderStrobe(warns){
+  $('#stOn').checked=!!STROBE.enabled;
+  const sel=$('#stNode');
+  const names=(FLEET.nodes||[]).map(n=>n.name);
+  if(sel.dataset.sig!==names.join(',')){
+    sel.dataset.sig=names.join(','); sel.innerHTML='';
+    names.forEach(nm=>{const o=document.createElement('option');o.value=nm;o.textContent=nm;sel.appendChild(o);});
+  }
+  if(STROBE.node) sel.value=STROBE.node;
+  if(document.activeElement!==$('#stDelta')) $('#stDelta').value=STROBE.delta_ms;
+  if(document.activeElement!==$('#stPulse')) $('#stPulse').value=STROBE.pulse_ms;
+  const node=(FLEET.nodes||[]).find(n=>n.name===STROBE.node);
+  const st=node&&node.gpio&&node.gpio.strobe;
+  let info=STROBE.enabled
+    ? 'armed on <b>'+escapeHtml(STROBE.node)+'</b> at T+'+STROBE.delta_ms+' ms'
+    : 'off';
+  if(st) info+=' · line BCM'+st.bcm+(st.claimed?' claimed':'')+' · '+
+    (st.fires||0)+' pulses'+(st.error?(' · <span style="color:var(--bad)">'+escapeHtml(st.error)+'</span>'):'');
+  if(warns&&warns.length) info+='<br><span style="color:var(--warn)">'+
+    warns.map(escapeHtml).join('<br>')+'</span>';
+  $('#stInfo').innerHTML=info;
+  pill($('#hStrobe'),'strobe '+(STROBE.enabled?('T+'+STROBE.delta_ms+'ms'):'off'),
+       STROBE.enabled?'on':'');
+}
+async function pushStrobe(changes){
+  const r=await api('/api/strobe',changes);
+  if(r&&r.ok){ STROBE=r.strobe; renderStrobe(r.warnings||[]); }
+  else $('#stInfo').innerHTML='<span style="color:var(--bad)">'+
+    escapeHtml((r&&r.error)||'no response')+'</span>';
+}
+$('#stOn').onchange=()=>pushStrobe({enabled:$('#stOn').checked});
+$('#stNode').onchange=()=>pushStrobe({node:$('#stNode').value});
+$('#stDelta').onchange=()=>pushStrobe({delta_ms:+$('#stDelta').value});
+$('#stPulse').onchange=()=>pushStrobe({pulse_ms:+$('#stPulse').value});
+
+// ---- run control -----------------------------------------------------------
+// Pre-flight: a run started with one camera, no IMU and no GPS still writes a
 // flight_log — one with half its columns empty and no second view to make a
-// stereo pair from. Nothing downstream can recover that, so the check happens
-// here, before the first frame is written.
-//
-// A row is a label, a severity, the measured value, and — when it is not green
-// — what that costs the survey. An amber row with no reason just teaches the
-// operator to click past it.
+// stereo pair from. The check happens BEFORE the first frame is written.
 function pfRow(k,cls,v,why){ return {k:k,cls:cls,v:v,why:why}; }
 async function preflight(){
   const [f,d,an,nv]=await Promise.all([api('/api/fleet'),api('/api/diag'),
@@ -1048,18 +1342,6 @@ async function preflight(){
 
   if(run.active){ hard.push('run '+run.run_id+' is already recording');
     rows.push(pfRow('run','bad','already recording '+run.run_id)); }
-  // A pinned preview means cam1 is deliberately NOT on the fleet vector. Every
-  // pair recorded in that state is shot at two different exposures, and that
-  // is not visible in the frames afterwards — so it blocks the start outright
-  // rather than warning.
-  const pv=(f&&f.preview)||PREVIEW||{};
-  if(pv.active){
-    hard.push('a settings preview is pinned on '+(pv.node||'cam1')+
-      ' — deploy it to the fleet or discard it first');
-    rows.push(pfRow('preview','bad','pinned on '+(pv.node||'cam1')+': '+
-      Object.keys(pv.pending||{}).map(k=>k+'='+pv.pending[k]).join(' '),
-      'the cameras would record at DIFFERENT exposures — not a stereo pair'));
-  }
   if(!label){ hard.push('transect label is empty'); }
   if(!(iv>0)){ hard.push('interval must be greater than 0 s'); }
   rows.push(pfRow('transect', label&&iv>0?'ok':'bad',
@@ -1067,8 +1349,6 @@ async function preflight(){
     (+$('#cFrames').value>0?(+$('#cFrames').value+' frames'):'until stopped')+
     ($('#cAuto').checked?' · auto-capture':' · manual capture only')));
 
-  // Cameras. Two is the survey configuration; one still records, but there is
-  // no pair to photogrammetrise.
   if(!live.length){ hard.push('no camera connected');
     rows.push(pfRow('cameras','bad','none connected','nothing would be recorded')); }
   else {
@@ -1077,8 +1357,6 @@ async function preflight(){
       live.map(n=>'Cam'+n.cam_num+' '+n.name+' ('+(n.model||'?')+')').join(' · '),
       live.length<2?('only '+live.length+' camera — no stereo pair to photogrammetrise'):null));
   }
-  // GPIO harness: without it a node fires over USB, 10–80 ms from its partner,
-  // which is 5–8x the <10 ms the survey is specified to.
   const nogpio=live.filter(n=>!(n.gpio&&n.gpio.available));
   if(live.length){
     if(nogpio.length){ warn.push('no GPIO harness on '+nogpio.map(n=>n.name).join(', ')+
@@ -1087,21 +1365,42 @@ async function preflight(){
         'no GPIO harness there: 10–80 ms inter-camera skew instead of ~1 ms')); }
     else rows.push(pfRow('sync','ok','GPIO harness on all '+live.length+' — scheduled fire'));
   }
-  // Settings: identical exposure across the pair is what makes the frames
-  // comparable at all.
+  // Exposure divergence: with per-camera exposure this may be DELIBERATE, so
+  // it warns (visibly) instead of blocking — the operator decides.
   const div=live.filter(n=>n.convergence&&n.convergence.synced===false);
+  const split=live.filter(n=>((n.convergence||{}).exposure_split||[]).length);
   const unk=live.filter(n=>!n.convergence||n.convergence.synced==null);
   if(div.length){ warn.push('settings divergent on '+div.map(n=>n.name+' ('+
       ((n.convergence.diverged)||[]).join(',')+')').join(', '));
     rows.push(pfRow('settings','bad','divergent: '+div.map(n=>n.name+' '+
       ((n.convergence.diverged)||[]).join(',')).join(' · '),
       'the cameras are NOT identically configured — the pair will not match')); }
+  else if(split.length){
+    warn.push('per-camera exposure split on '+split.map(n=>n.name).join(', '));
+    rows.push(pfRow('settings','warn','exposure split: '+split.map(n=>n.name+' '+
+      ((n.convergence.exposure_split)||[]).join(',')).join(' · '),
+      'the bodies run DIFFERENT exposures — deliberate balancing is fine, '+
+      'an accident is not; Apply exposure to fleet reunifies them')); }
   else if(unk.length) rows.push(pfRow('settings','warn','not verified yet on '+
       unk.map(n=>n.name).join(', '),'no readback yet — exposure match unconfirmed'));
   else if(live.length) rows.push(pfRow('settings','ok','all cameras converged'));
   rows.push(pfRow('exposure', 'ok', (d&&d.desired)?labSet(d.desired):(DESIRED?labSet(DESIRED):'unknown')));
 
-  // IMU — pitch/roll/yaw/accel/gyro columns of every flight_log row.
+  // Strobe: armed and plausible, or off.
+  if(STROBE.enabled){
+    const sn=live.find(n=>n.name===STROBE.node);
+    const sh=(d&&d.desired||{}).shutter, num=sh?((sh>>>16)&0xFFFF):0, den=sh?(sh&0xFFFF):1;
+    const durMs=den?num/den*1000:0;
+    const fast=durMs>0&&durMs<33;
+    if(!sn){ hard.push('strobe is armed on '+STROBE.node+' which is not connected');
+      rows.push(pfRow('strobe','bad','armed on '+STROBE.node+' — not connected')); }
+    else if(fast){ warn.push('strobe armed but shutter is faster than 1/30');
+      rows.push(pfRow('strobe','warn','T+'+STROBE.delta_ms+' ms on '+STROBE.node+
+        ' · shutter '+labShutter(sh),
+        'faster than 1/30: the flash may land after the curtain closes')); }
+    else rows.push(pfRow('strobe','ok','T+'+STROBE.delta_ms+' ms on '+STROBE.node));
+  }
+
   const imun=nodes.filter(n=>n.imu&&n.imu.present);
   if(!imun.length){ warn.push('no IMU — attitude columns will be empty');
     rows.push(pfRow('imu','warn','no node reporting an IMU',
@@ -1112,8 +1411,14 @@ async function preflight(){
       (n.imu.rate_hz||'?')+' Hz'+(n.imu.age_s!=null?' · age '+n.imu.age_s+'s':'')).join(' · '),
       stale.length?'samples are stale — attitude will be dropped, not carried over':null)); }
 
-  // Nav — lat/long/utm/depth columns.
-  if(!nv || nv.present===false){ warn.push('no nav source — position and depth columns will be empty');
+  if(nv && nv.static_fix && nv.lat!=null && (!d||!d.nav||!d.nav.online)){
+    // Operator armed a static position and there is no live NMEA: that is a
+    // deliberate field configuration, not a fault. Say exactly what will be
+    // written into every row.
+    warn.push('no live NMEA — STATIC fix in use');
+    rows.push(pfRow('nav','warn','STATIC fix — '+fmt(nv.lat,5)+', '+fmt(nv.lon,5),
+      (nv.static_fix)+' — every frame gets this one position; depth/heading stay empty')); }
+  else if(!nv || nv.present===false){ warn.push('no nav source — position and depth columns will be empty');
     rows.push(pfRow('nav','warn','no nav source',
       'lat/long/utm/depth columns will be empty for every frame')); }
   else if(d&&d.nav&&d.nav.online===false){ warn.push('iKonvert sending no data (N2K bus power?)');
@@ -1125,28 +1430,23 @@ async function preflight(){
   else rows.push(pfRow('nav','ok',fmt(nv.lat,5)+', '+fmt(nv.lon,5)+
     (nv.sats!=null?' · '+nv.sats+' sats':'')+(nv.depth_m!=null?' · '+fmt(nv.depth_m,1)+' m':'')));
 
-  // Clock. Jetson time still produces a usable log, it is just not disciplined
-  // to the same master as the rest of the survey.
   const ts=(f&&f.time_source)||'—';
   if(ts!=='gps'){ warn.push('clock is '+ts+', not GPS-disciplined');
     rows.push(pfRow('clock','warn',ts+' — no GPS time',
-      'frame times come from the Jetson clock; time_source will read "'+ts+'"')); }
+      'frame times come from the host clock; time_source will read "'+ts+'"')); }
   else rows.push(pfRow('clock','ok','gps'+((d&&d.time)?' · offset '+fmt(d.time.gps_offset_s,3)+' s':'')));
 
-  // Consumables. The Jetson volume FIRST: it is the one the transect is
-  // written to, and when it fills, failed frame writes are never retried, so
-  // those frames get no flight_log row and no nav/IMU correlation at all.
   const jf=(f&&f.jetson_free_mb), jlo=(f&&f.jetson_disk_low_mb)||5000;
   if(jf!=null){
     const frames=Math.floor(jf/0.32), fullsize=Math.floor(jf/14.1);
     const projected=(+$('#cFrames').value>0)?+$('#cFrames').value:0;
     const tight=jf<jlo || (projected && projected*live.length>frames);
-    if(tight) warn.push('Jetson runs volume has only '+jf+' MB free');
-    rows.push(pfRow('jetson disk',tight?'warn':'ok',
+    if(tight) warn.push('the runs volume has only '+jf+' MB free');
+    rows.push(pfRow('host disk',tight?'warn':'ok',
       jf+' MB free · ~'+frames+' frames at Small, '+fullsize+' at Original',
-      tight?('~/rig-runs is on this volume; when it fills, frames fail to '+
+      tight?('the runs volume; when it fills, frames fail to '+
              'write and are NEVER retried — they get no flight_log row'):null));
-  } else rows.push(pfRow('jetson disk','warn','could not read ~/rig-runs',
+  } else rows.push(pfRow('host disk','warn','could not read the runs volume',
     'no capacity check is possible for the volume the survey is written to'));
   const disks=live.filter(n=>n.disk_free_mb!=null);
   if(disks.length){ const lo=disks.reduce((a,b)=>a.disk_free_mb<b.disk_free_mb?a:b);
@@ -1182,8 +1482,6 @@ $('#btnStart').onclick=async()=>{
   const btn=$('#btnStart'); btn.disabled=true;
   $('#preflight').innerHTML='<span class="muted small">pre-flight…</span>';
   let pf;
-  // A pre-flight that fails must never fall through into a silent start: the
-  // whole point is that nothing records until the operator has seen the state.
   try{ pf=await preflight(); }
   catch(e){ $('#preflight').innerHTML='<div class="pf bad"><span class="pfk">pre-flight</span>'+
       '<span class="pfv">check failed: '+escapeHtml(String(e))+'</span></div>';
@@ -1221,27 +1519,42 @@ async function startRun(){
     ? '<span style="color:var(--ok)">started '+escapeHtml(r.run_id||'')+' → '+
       escapeHtml(r.root||'')+'</span>'
     : '<span style="color:var(--bad)">start failed: '+escapeHtml(r.error||'unknown')+'</span>';
+  RUNS_HEAD=null; PAIRS.follow=true; pollPairs(true);
 }
-$('#btnStop').onclick=async()=>{ const r=await api('/api/run/stop',{});
+// Stop is hold-to-confirm: it ends the survey, and it sits an inch from
+// Capture one. The fill animates over the hold; early release cancels.
+(function(){
+  const btn=$('#btnStop'), fill=btn.querySelector('.fill');
+  let t0=null, raf=null;
+  const tick=()=>{ if(t0==null) return;
+    const p=Math.min(1,(Date.now()-t0)/1000);
+    fill.style.width=(p*100)+'%';
+    if(p>=1){ t0=null; fill.style.width='0'; doStop(); return; }
+    raf=requestAnimationFrame(tick); };
+  const dn=e=>{ e.preventDefault(); t0=Date.now(); raf=requestAnimationFrame(tick); };
+  const up=()=>{ if(t0!=null){ t0=null; fill.style.width='0';
+      $('#runInfo').textContent='hold Stop for a full second to end the run'; }
+    if(raf) cancelAnimationFrame(raf); };
+  btn.addEventListener('pointerdown',dn);
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>btn.addEventListener(ev,up));
+})();
+async function doStop(){
+  const r=await api('/api/run/stop',{});
   if(!r.ok){ $('#runInfo').innerHTML='<span style="color:var(--bad)">stop: '+
     escapeHtml(r.error||'no active run')+'</span>'; return; }
-  // The per-node summary is the only account of what the transect actually
-  // pulled; printing just the run id threw it away.
   const s=r.summary||{};
   const tally=Object.keys(s).map(k=>k+' '+(s[k].pulled||0)+' ok'+
     (s[k].failed?' / '+s[k].failed+' FAILED':'')).join(' · ');
   $('#runInfo').innerHTML='<span style="color:var(--ok)">stopped '+escapeHtml(r.run_id||'')+
-    '</span>'+(tally?' <span class="muted">· '+escapeHtml(tally)+'</span>':''); };
+    '</span>'+(tally?' <span class="muted">· '+escapeHtml(tally)+'</span>':'');
+  RUNS_HEAD=null; pollPairs(true);
+}
 $('#btnCap').onclick=async()=>{
   const el=$('#runInfo'); el.textContent='firing…';
   const r=await api('/api/capture',{});
   const res=r.results||{}, names=Object.keys(res);
   if(!names.length){ el.innerHTML='<span style="color:var(--bad)">capture failed: '+
     escapeHtml(r.error||'no camera fired')+'</span>'; return; }
-  // Report per node. A fire that every camera rejected used to render as
-  // "captured: cam1, cam2" — the operator's only feedback said the opposite of
-  // what happened. The path matters too: "usb" means the shot was NOT
-  // hardware-scheduled, so it is not a synchronised pair.
   const parts=names.map(k=>{ const v=res[k]||{};
     if(v.ok===false) return '<span style="color:var(--bad)">'+escapeHtml(k)+' FAILED: '+
       escapeHtml(v.error||'no reason given')+'</span>';
@@ -1251,30 +1564,15 @@ $('#btnCap').onclick=async()=>{
   const usb=names.filter(k=>(res[k]||{}).path==='usb');
   el.innerHTML = parts.join(' · ') + (usb.length
     ? ' <span style="color:var(--warn)">— '+escapeHtml(usb.join(', '))+
-      ' fired over USB, not GPIO: unsynchronised</span>' : ''); };
-function renderConv(){
-  const c=$('#convInfo'); c.innerHTML=FLEET.nodes.filter(n=>n.connected).map(n=>{
-    const cv=n.convergence||{}; const ok=cv.synced===true;
-    return `<div class="kv"><span class="k">${n.name}</span><span class="v">${
-      ok?'<span class="dot ok"></span> synced':
-      cv.synced===false?'<span class="dot bad"></span> '+ (cv.diverged||[]).join(','):
-      '<span class="dot off"></span> —'}</span></div>`;}).join('')||'<span class="muted small">no cameras</span>';
-}
-// ---- anomalies (global, tab-independent) ----------------------------------
-// This is polled on its own timer, not from pollControls. Anomalies used to be
-// fetched only while the Controls tab was open — and because rigd only runs the
-// detectors when /api/anomalies or /api/diag is called, several of them
-// (battery_low, disk_low, jitter_high, camera_absent, nav_gateway_down) were
-// never evaluated at all unless a browser happened to be sitting on that tab.
+      ' fired over USB, not GPIO: unsynchronised</span>' : '');
+  setTimeout(()=>pollPairs(true), 1500);
+};
+
+// ---- anomalies (global, tab-independent) -----------------------------------
+// Polled on its own timer: rigd only runs the detectors when /api/anomalies
+// (or /api/diag) is called, so this poll is what makes battery/disk/jitter/
+// absent detection happen at all. NEVER tab-gate it.
 let ANOMS=[], ANOM_SIG='';
-// Red for the ones that stop the survey outright — a node gone, a camera not
-// claimed, pulls failing, the N2K gateway dark, battery/disk running out.
-// Amber for the ones that degrade the data but let it continue.
-// Severity now travels WITH the anomaly (rigd sets it), because deriving it
-// from the kind's spelling mis-ranked the new detectors: "card_write_stuck" and
-// "camera_overheating" match none of these patterns and would have rendered
-// amber, next to advisories, while taking a body out of the survey. The regex
-// stays as the fallback for an older rigd.
 function anomSev(a){
   if(a && a.sev) return a.sev==='bad'?'bad':'warn';
   const kind=(a && a.kind!==undefined)?(a.kind||''):(a||'');
@@ -1285,27 +1583,27 @@ async function pollAnoms(){
   if(!r || !Array.isArray(r.anomalies)) return;   // a failed poll is not "all clear"
   ANOMS=r.anomalies;
   renderAnomPill();
-  if(TAB==='controls') renderAnoms();
+  renderAnoms();
 }
 function renderAnomPill(){
   const el=$('#hAnom');
-  if(!ANOMS.length){ pill(el,'no anomalies',''); el.title='no detector firing'; ANOM_SIG=''; return; }
   const bad=ANOMS.filter(a=>anomSev(a)==='bad');
+  document.body.classList.toggle('sev-bad',bad.length>0);
+  document.body.classList.toggle('sev-warn',!bad.length&&ANOMS.length>0);
+  if(!ANOMS.length){ pill(el,'no anomalies',''); el.title='no detector firing'; ANOM_SIG=''; return; }
   const top=bad[0]||ANOMS[0];
   pill(el,'⚠ '+top.kind+(top.node?(' '+top.node):'')+
        (ANOMS.length>1?(' +'+(ANOMS.length-1)):''), bad.length?'bad':'warn');
   el.title=ANOMS.map(a=>(a.node?a.node+': ':'')+a.kind+' — '+a.msg+
     (a.suggested_action?('\n    → '+a.suggested_action):'')).join('\n');
-  // Flash only when the SET changes, so a fault that is already known does not
-  // blink for the whole run and train the operator to ignore it.
   const sig=ANOMS.map(a=>a.kind+'/'+(a.node||'')).sort().join(',');
   if(sig!==ANOM_SIG){ ANOM_SIG=sig;
     el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }
 }
-$('#hAnom').onclick=()=>{ showTab('controls');
+$('#hAnom').onclick=()=>{ showTab('review');
   const c=$('#anoms'); if(c) c.scrollIntoView({block:'center'}); };
 function renderAnoms(){
-  const el=$('#anoms');
+  const el=$('#anoms'); if(!el) return;
   el.innerHTML = ANOMS.length ? ANOMS.map(x=>
     `<div class="anom ${anomSev(x)==='bad'?'bad':''}"><b>${escapeHtml(x.kind)}</b> `+
     `${x.node?('· '+escapeHtml(x.node)):''} — ${escapeHtml(x.msg)}<br>`+
@@ -1313,189 +1611,8 @@ function renderAnoms(){
     : '<span class="muted small">none</span>';
 }
 
-// ---- live view + histogram + lens controls --------------------------------
-function holdButton(el,onDown,onUp){
-  if(!el)return; let active=false;
-  const dn=e=>{e.preventDefault(); if(active)return; active=true; onDown();};
-  const up=()=>{ if(!active)return; active=false; onUp();};
-  el.addEventListener('mousedown',dn); el.addEventListener('touchstart',dn,{passive:false});
-  ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>el.addEventListener(ev,up));
-}
-let histPrimary=null;
-function renderCtlLive(){
-  const wrap=$('#ctlLive'), live=FLEET.nodes.filter(n=>n.connected);
-  // Keyed on identity, not count — see renderReviewHeaders. A same-poll swap
-  // used to leave the departed camera's last live frame and a frozen histogram
-  // sitting under its own heading while the new camera had no column.
-  const key=connKey(live);
-  if(wrap.dataset.key!==key){
-    wrap.dataset.key=key; wrap.innerHTML='';
-    if(!live.length){ wrap.innerHTML='<span class="muted small">no cameras connected</span>';
-      histPrimary=null; $('#histCam').textContent='—'; return; }
-    live.forEach(n=>wrap.insertAdjacentHTML('beforeend',
-      `<div class="camcol" id="cc-${n.name}"><div class="hd"><b>Cam${n.cam_num} · ${n.name}</b>
-        <span class="exp mono" id="clx-${n.name}"></span></div>
-        <div class="frame"><div class="pvbadge" id="pvb-${n.name}" style="display:none">PREVIEW</div>
-          <img id="lv-${n.name}" alt=""></div></div>`));
-  }
-  if(!live.length) return;
-  // Mark the previewed camera on the picture itself. The operator is looking
-  // at the frame, not at a badge elsewhere on the page, and a preview that is
-  // not obvious is a stereo pair silently shot at two exposures.
-  live.forEach(n=>{
-    const on=PREVIEW.active && PREVIEW.node===n.name;
-    const col=$('#cc-'+n.name), b=$('#pvb-'+n.name);
-    if(col) col.classList.toggle('previewing',!!on);
-    if(b){ b.style.display=on?'block':'none';
-      b.textContent='PREVIEW '+Object.keys(PREVIEW.pending||{}).map(
-        f=>pvLabel(f,PREVIEW.pending[f])).join(' ');}
-  });
-  // The histogram is bound to one node and that node can leave.
-  if(!histPrimary || !live.some(n=>n.name===histPrimary)){
-    histPrimary=live[0].name; $('#histCam').textContent='Cam'+live[0].cam_num; }
-  const now=Date.now();
-  live.forEach(n=>{const e=$('#clx-'+n.name); if(!e)return;
-    const img=$('#lv-'+n.name), at=(img&&+img.dataset.at)||0;
-    // A live view that stopped updating still shows a picture. Age it, so a
-    // frozen frame reads as frozen rather than as the current scene.
-    const age=at?(now-at)/1000:null;
-    const stale=(age!=null&&age>3)
-      ? ` <span style="color:var(--warn)">· ${age.toFixed(0)}s old</span>` : '';
-    e.innerHTML=escapeHtml((n.aperture||'?')+' '+(n.shutter||'?')+' '+(n.iso||''))+stale;});
-}
-function refreshLive(prefix, nodes){
-  nodes.forEach(n=>{const img=$('#'+prefix+n.name); if(!img)return;
-    if(img.dataset.busy)return; img.dataset.busy='1';
-    const done=()=>{img.dataset.busy='';};
-    img.onload=()=>{done(); img.dataset.at=Date.now();
-      if(prefix==='lv-'&&n.name===histPrimary) drawHist(img);};
-    img.onerror=done;
-    img.src='/api/liveview?node='+n.name+'&_='+Date.now();
-  });
-}
-function drawHist(img){
-  const cv=$('#histCanvas'),x=cv.getContext('2d'),W=cv.width,H=cv.height;
-  const off=drawHist._o||(drawHist._o=document.createElement('canvas'));
-  off.width=192;off.height=120; const ox=off.getContext('2d');
-  try{ox.drawImage(img,0,0,192,120);}catch(e){return;}
-  let d; try{d=ox.getImageData(0,0,192,120).data;}catch(e){return;}
-  const bins=new Array(256).fill(0); let mn=255,mx=0,sum=0,nn=0;
-  for(let i=0;i<d.length;i+=4){const l=Math.round(0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]);
-    bins[l]++; if(l<mn)mn=l; if(l>mx)mx=l; sum+=l; nn++;}
-  const peak=Math.max(1,...bins);
-  x.clearRect(0,0,W,H);
-  x.strokeStyle='#5aa9e6';x.lineWidth=1;x.beginPath();x.moveTo(0,H);
-  for(let i=0;i<256;i++){const px=i/255*W, py=H-(bins[i]/peak)*(H-6);x.lineTo(px,py);}
-  x.lineTo(W,H);x.closePath();x.fillStyle='rgba(90,169,230,.35)';x.fill();x.stroke();
-  const clipLo=(bins[0]/nn*100), clipHi=(bins[255]/nn*100);
-  $('#histStats').textContent=`mean ${Math.round(sum/nn)} · range ${mn}–${mx} · clip ▼${clipLo.toFixed(1)}% ▲${clipHi.toFixed(1)}%`;
-}
-function fillSel(sel,choices,cur){ if(!sel||!choices)return;
-  if(+sel.dataset.n===choices.length && sel.options.length) return;
-  sel.dataset.n=choices.length; sel.innerHTML='';
-  choices.forEach(c=>{const o=document.createElement('option');o.value=c.v;o.textContent=c.l;
-    if(c.v==cur)o.selected=true; sel.appendChild(o);});
-}
-// Per-camera lens readback and the body-menu-only fields. Neither is settable
-// from here — the first because encoder parity is unproven, the second because
-// the bodies report DisplayOnly — but both have to be VISIBLE: a camera that
-// came back from a power cycle at a different focus than its partner ruins the
-// stereo solution invisibly, and a storeDest silently on "card only" means no
-// frame is ever delivered to the host.
-function renderLensAndBody(){
-  const live=FLEET.nodes.filter(n=>n.connected);
-  const lens=$('#lensRead'), body=$('#bodyOnly');
-  if(!live.length){ if(lens) lens.innerHTML='<span class="muted">no cameras</span>';
-    if(body) body.innerHTML='<span class="muted">no cameras</span>'; return; }
-  const fp=live.map(n=>n.focus_pos), differ=live.length>1 &&
-    fp.every(v=>v!=null) && new Set(fp).size>1;
-  if(lens) lens.innerHTML=live.map(n=>kvrow('Cam'+n.cam_num+' '+n.name,
-    'focus '+(n.focus_mode_label?escapeHtml(n.focus_mode_label)+' ':'')+
-    (n.focus_pos??'—')+' · zoom '+(n.zoom_pos??'—')+
-    (n.zoom_setting_label?' ('+escapeHtml(n.zoom_setting_label)+')':''))).join('')
-    + (differ?'<div class="small" style="color:var(--warn);margin-top:4px">'+
-      'the two bodies report different focus positions — check by eye before '+
-      'the transect; nothing re-asserts these</div>':'');
-  if(body) body.innerHTML=live.map(n=>{
-    const w=n.writable||{}, ro=w.storeDest===2;
-    return kvrow('Cam'+n.cam_num+' storeDest',
-      escapeHtml(String(n.store_dest_label||n.store_dest||'—'))+
-      (ro?' <span class="muted">(body menu only)</span>':''));
-  }).join('');
-}
-let ctlChoicesLoaded=false;
-// Keeps the poll from overwriting the focus-mode selector in the window
-// between the operator's click and rigd's answer.
-let FMODE_BUSY=false;
-async function pollControls(){
-  renderCtlLive();
-  // Live view here is the point of the tab, but still only while it is visible.
-  if(!document.hidden) refreshLive('lv-', FLEET.nodes.filter(n=>n.connected));
-  renderConv(); renderAnoms(); renderLensAndBody(); renderPreview();
-  // Re-read the desired vector on a slow cadence: an EV bump from another
-  // browser, a second operator, or a rigd restart can move it under us. Fields
-  // the operator has edited are left alone (see hydrateSettings).
-  if(Date.now()-SET_AT>5000) hydrateSettings();
-  const prim=FLEET.nodes.find(n=>n.connected);
-  // Focus mode is re-rendered from the primary body's LIVE value on every
-  // poll, not latched once at load. It used to be filled a single time and
-  // never corrected, so once the convergence loop pushed the mode back the
-  // selector went on showing the operator's stale choice indefinitely — the UI
-  // asserting a fleet state that was not true.
-  if(prim && $('#fMode') && $('#fMode').options.length && !FMODE_BUSY){
-    const cur=(prim.focus_mode!=null)?prim.focus_mode:(DESIRED||{}).focus_mode;
-    if(cur!=null) $('#fMode').value=String(cur);
-  }
-  if(!ctlChoicesLoaded){
-    if(prim){ const s=await api('/api/status?node='+prim.name);
-      if(s && s.focusModes){ fillSel($('#fMode'),s.focusModes,s.focusMode);
-        fillSel($('#zSet'),s.zoomSettings,s.zoomSetting); }
-      // Exposure choice lists come from the primary body, so the panel can only
-      // ever send a value that camera accepts. Not gated on focusModes: a body
-      // with the lens table locked still reports its exposure choices.
-      if(s && (s.shutterChoices||s.isoChoices||s.apertureChoices)){
-        CHOICES={apertureChoices:s.apertureChoices, shutterChoices:s.shutterChoices,
-                 isoChoices:s.isoChoices};
-        syncExpControls(); }
-      if(s && (s.focusModes||s.shutterChoices||s.isoChoices)) ctlChoicesLoaded=true;
-    }
-  }
-}
-// Focus MODE goes through `desired` now (rigd routes it into SettingsManager),
-// so the choice sticks instead of being pushed back to MF by the reconcile
-// loop 3 s later while this select went on showing it.
-$('#fMode').onchange=async()=>{
-  // An empty select (a body that never reported its focusModes list) would
-  // send mode 0, which is not a mode at all.
-  const v=$('#fMode').value;
-  if(v===''||v==null||isNaN(+v)) return;
-  FMODE_BUSY=true;
-  const r=await api('/api/focus/mode',{mode:+v});
-  FMODE_BUSY=false;
-  const rej=(r&&r.rejected&&r.rejected.focus_mode);
-  if(rej) $('#applyNote').innerHTML='<span style="color:var(--bad)">focus mode '+
-    'refused: '+escapeHtml(rej)+'</span>';
-  await hydrateSettings();
-};
-$('#zSet').onchange=()=>api('/api/zoom/setting',{value:+$('#zSet').value});
-$('#fPos').oninput=()=>$('#fPosV').textContent=$('#fPos').value;
-$('#fPos').onchange=()=>api('/api/focus/position',{value:+$('#fPos').value});
-$('#zPos').oninput=()=>$('#zPosV').textContent=$('#zPos').value;
-$('#zPos').onchange=()=>api('/api/zoom/position',{value:+$('#zPos').value});
-holdButton($('#fNear'),()=>api('/api/focus/drive',{step:-(+$('#fStep').value)}),()=>api('/api/focus/drive',{step:0}));
-holdButton($('#fFar'), ()=>api('/api/focus/drive',{step:+(+$('#fStep').value)}),()=>api('/api/focus/drive',{step:0}));
-holdButton($('#zWide'),()=>api('/api/zoom/drive',{speed:-(+$('#zSpd').value)}),()=>api('/api/zoom/drive',{speed:0}));
-holdButton($('#zTele'),()=>api('/api/zoom/drive',{speed:+(+$('#zSpd').value)}),()=>api('/api/zoom/drive',{speed:0}));
-
-// ---- transects ------------------------------------------------------------
-// "Keep things organized by transect": runs were written to disk and then
-// unreachable — /api/runs 404'd and no view existed. What this has to answer,
-// for a photogrammetry operator, is not "what files are there" but "did BOTH
-// cameras produce a frame for every shot, and where are the holes" — a shot
-// only one camera recorded is not a stereo pair and cannot be processed.
+// ---- transects --------------------------------------------------------------
 let RUNS=[], RUN_SEL=null, RUN_DETAIL=null, RUN_SHOT=null;
-function tstamp(ep){ return ep==null?'—'
-  : new Date(ep*1000).toISOString().replace('T',' ').slice(0,19)+'Z'; }
 async function pollTransects(force){
   if(!force && (TAB!=='transects'||document.hidden)) return;
   const r=await api('/api/runs?limit=100');
@@ -1509,8 +1626,7 @@ async function pollTransects(force){
 }
 function renderRunList(){
   const el=$('#runList');
-  if(!RUNS.length){ el.innerHTML='<span class="muted small">no runs in '+
-    '~/rig-runs yet</span>'; return; }
+  if(!RUNS.length){ el.innerHTML='<span class="muted small">no runs yet</span>'; return; }
   el.innerHTML=RUNS.map(r=>{
     const state=r.interrupted?'<span style="color:var(--warn)">interrupted</span>'
       : r.final?'<span class="muted">final</span>'
@@ -1531,7 +1647,6 @@ function renderRunDetail(){
   const p=d.pairs||{}, cams=p.cams||[];
   const pct=p.shots?Math.round(100*p.complete/p.shots):null;
   const sevc = p.incomplete? (p.incomplete> (p.shots||1)*0.05?'bad':'warn') : 'ok';
-  // The headline number IS the pair completeness. Everything else is context.
   let h=`<div class="row" style="gap:24px;align-items:flex-end">
     <div><div class="muted small">stereo pairs complete</div>
       <div class="big" style="color:var(--${sevc})">${p.complete||0} / ${
@@ -1540,10 +1655,16 @@ function renderRunDetail(){
     <div><div class="muted small">shots missing a camera</div>
       <div class="big" style="color:var(--${p.incomplete?'bad':'muted'})">${
         p.incomplete||0}</div></div>
+    ${p.strobe_missed?`<div><div class="muted small">strobe misses</div>
+      <div class="big" style="color:var(--bad)">${p.strobe_missed}</div></div>`:''}
     <div class="small muted">grouped at ±${p.tolerance_s??'?'} s${
       d.interrupted?' · <span style="color:var(--warn)">this run was '+
       'interrupted; run.json was rebuilt from the flight_logs</span>':''}</div>
+    <span style="flex:1"></span>
+    <button class="act" id="btnOpenRun">Open folder</button>
   </div>`;
+  if(d.path) h+=`<div class="pathbox" style="margin-top:8px" title="the run directory on the rigd host">${escapeHtml(d.path)}</div>`;
+  h+='<div id="openNote" class="small muted" style="margin-top:4px"></div>';
   h+='<div class="small muted" style="margin:10px 0 4px">every shot, oldest '+
      'first — <i>.</i> both cameras, <b>1</b> one camera missing</div>';
   h+='<div class="strip">'+(p.strip||'').split('').map(c=>c==='.'
@@ -1561,7 +1682,6 @@ function renderRunDetail(){
          `<td><a href="/api/run/flight_log?id=${encodeURIComponent(d.run_id)}&cam=${
            encodeURIComponent(c)}" target="_blank" class="muted small">flight_log.csv</a></td></tr>`;
      }).join('')+'</table>';
-  // Where the gaps are — the actionable half.
   const gaps=p.gaps||[];
   h+='<h2 style="margin-top:14px">Gaps</h2>';
   h+= gaps.length ? '<table><tr><th>#</th><th>time</th><th>missing</th>'+
@@ -1572,7 +1692,6 @@ function renderRunDetail(){
       ).join('')+'</table>'+(p.gaps_truncated?
         '<div class="muted small">…more gaps than listed; the counts above are exact</div>':'')
     : '<span class="muted small">none — every shot has a frame from every camera</span>';
-  // The pair viewer, on the tail of the transect.
   const rec=p.recent||[];
   if(rec.length){
     if(RUN_SHOT==null || RUN_SHOT>=rec.length) RUN_SHOT=rec.length-1;
@@ -1583,6 +1702,7 @@ function renderRunDetail(){
       `${s.missing.length?(' · <span style="color:var(--bad)">missing '+
         escapeHtml(s.missing.join(','))+'</span>'):' · pair complete'}`+
       ` · spread ${s.spread_ms} ms</span>`+
+      (s.strobe?('<span style="margin-left:6px">'+strobeChip(s)+'</span>'):'')+
       `<button class="act" id="shNext">▶</button></div>`+
       '<div class="cams" style="margin-top:8px">'+cams.map(c=>{
         const f=(s.files||{})[c];
@@ -1592,17 +1712,24 @@ function renderRunDetail(){
           :'<span style="color:var(--bad)" class="mono">MISSING</span>';
         return '<div class="camcol"><div class="hd"><b>'+escapeHtml(c)+'</b>'+
           '<span class="exp mono">'+(f?escapeHtml(f):'no frame')+'</span></div>'+
-          '<div class="frame">'+body+'</div></div>';
+          '<div class="frame'+(f?'':' missing')+'">'+body+'</div></div>';
       }).join('')+'</div>';
   }
   $('#runDetail').innerHTML=h;
-  const pv=$('#shPrev'), nx=$('#shNext');
+  const pv=$('#shPrev'), nx=$('#shNext'), op=$('#btnOpenRun');
   if(pv) pv.onclick=()=>{ RUN_SHOT=Math.max(0,RUN_SHOT-1); renderRunDetail(); };
   if(nx) nx.onclick=()=>{ RUN_SHOT=Math.min((p.recent||[]).length-1,RUN_SHOT+1);
     renderRunDetail(); };
+  if(op) op.onclick=async()=>{
+    const r=await api('/api/run/open',{id:d.run_id});
+    $('#openNote').innerHTML = r&&r.ok
+      ? '<span style="color:var(--ok)">opened on the rigd host</span>'
+      : '<span style="color:var(--warn)">'+escapeHtml((r&&r.error)||'failed')+
+        (r&&r.path?(' — copy the path above'):'')+'</span>';
+  };
 }
 
-// ---- events ---------------------------------------------------------------
+// ---- events -----------------------------------------------------------------
 let evSeq=0;
 async function pollEvents(){
   const sev=$('#evSev').value;
@@ -1612,55 +1739,41 @@ async function pollEvents(){
   r.events.forEach(e=>{
     const d=new Date(e.ts*1000).toISOString().slice(11,19);
     l.insertAdjacentHTML('afterbegin',`<div class="ev ${e.sev}"><span class="t">${d}</span>
-      <span class="sev">${e.sev}</span><span class="mono muted">${e.kind}</span>
-      <span>${e.node?('['+e.node+'] '):''}${escapeHtml(e.msg)}</span></div>`);
+      <span class="sev">${e.sev}</span><span class="mono muted">${escapeHtml(e.kind)}</span>
+      <span>${e.node?('['+escapeHtml(e.node)+'] '):''}${escapeHtml(e.msg)}</span></div>`);
   });
   while(l.children.length>400) l.removeChild(l.lastChild);
 }
 $('#evSev').onchange=()=>{evSeq=0;$('#evList').innerHTML='';};
 
-// ---- helpers + loops ------------------------------------------------------
+// ---- helpers + loops --------------------------------------------------------
 function kvrow(k,v){return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;}
 function fmt(v,n){return v==null||isNaN(v)?'—':(+v).toFixed(n);}
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
-pollFleet(); pollEvents(); pollAnoms(); hydrateSettings();
+pollFleet(); pollEvents(); pollAnoms(); hydrateSettings(); hydrateStrobe();
+syncApplyBtn();
 setInterval(pollFleet, 2000);
-// Review pulls /api/shots per camera, which makes ilxctl re-list its whole
-// save directory — and in LIVE mode it pulls live-view JPEGs through the SDK
-// mutex the capture path shares. Both stop when the tab is not being looked at.
-setInterval(()=>{ if(liveOk('review')) pollReview(); }, 1200);
-// The transect browser is polled while it is open so a live survey's pair
-// completeness updates as frames land; it reads the Jetson's own disk, never
-// a camera.
+// The pair list reads rigd's own disk (RunBrowser caches on file mtimes), so
+// polling it while Review is visible is cheap; the camera-spool fallback is
+// the only branch that touches a node, and only when no run exists.
+setInterval(()=>{ if(liveOk('review')) pollPairs(); }, 3000);
 setInterval(()=>{ if(liveOk('transects')) pollTransects(); }, 3000);
-// The preview countdown, so "auto-releases in N s" is true rather than
-// whatever it said when the panel was drawn.
-setInterval(()=>{ const el=$('#pvLeft');
-  if(el && PREVIEW.active && PREVIEW.expires_at){
-    const left=Math.max(0,Math.round(PREVIEW.expires_at-Date.now()/1000));
-    el.textContent=left;
-    if(left<=0){ PREVIEW={active:false}; renderPreview(); hydrateSettings(); }
-  }}, 1000);
-// Nav is NOT tab-gated: the header's nav pill is a run-time indicator ("am I
-// still recording a position with every frame?"), and gating it left the pill
-// on its power-up placeholder for anyone who never opened the Nav tab. The
-// track buffer also fills while you are on Review, which is where you are
-// during a transect.
+// Nav is NOT tab-gated: the header's nav pill is a run-time indicator, and the
+// track buffer fills while you are on Review, which is where you are mid-run.
 setInterval(pollNav, 1500);
-// Anomalies on their own timer, independent of the visible tab. rigd only runs
-// the detectors when this endpoint (or /api/diag) is called, so this poll is
-// what makes battery/disk/jitter/absent detection happen at all.
+// Anomalies on their own timer, independent of the visible tab — rigd only
+// runs its detectors when this endpoint is polled.
 setInterval(pollAnoms, 2500);
-// The IMU streams at ~200 Hz. Pull a batch a few times a second and paint from
-// it on every animation frame: 60 fps of motion for ~5 requests/s, instead of
-// 60 round trips a second through rigd and piagent.
 setInterval(()=>{ if(TAB==='imu') pollImuWindow(); }, 200);
 requestAnimationFrame(function imuFrame(){ if(TAB==='imu') renderImu(); requestAnimationFrame(imuFrame); });
-// Live view has to refresh faster than the anomaly list; pollControls now only
-// RENDERS the anomalies that the global poll above has already fetched. Gated
-// on visibility as well as tab: this one fetches live view every second.
+// Controls live view refresh: gated on tab + visibility, and per-node it
+// yields to any in-flight lens command (they share ilxctl's SDK mutex).
 setInterval(()=>{ if(liveOk('controls')) pollControls(); }, 1000);
+// Controls live view at the policy rate (rigd caps it); the rest of
+// pollControls stays at 1 s.
+setInterval(()=>{ if(liveOk('controls') && !document.hidden)
+  refreshLive('lv-', (FLEET.nodes||[]).filter(n=>n.connected)); }, 200);
 setInterval(pollEvents, 2000);
 </script>
 </body>

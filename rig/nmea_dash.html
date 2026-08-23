@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wild Sync — NMEA Bus</title>
+<style>
+  :root{
+    --bg:#0e0f12; --panel:#16181d; --panel2:#1d2027; --line:#2a2e37;
+    --ink:#e8eaf0; --muted:#8b90a0; --accent:#5aa9e6; --ok:#3fbf7f;
+    --warn:#e6a94b; --bad:#e2574c;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:var(--mono);font-size:13px;line-height:1.5}
+  header{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;
+         padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--line);
+         position:sticky;top:0;z-index:3}
+  header h1{font-size:14px;margin:0;letter-spacing:.04em}
+  .pill{font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid var(--line);color:var(--muted)}
+  .pill.on{color:var(--ok);border-color:var(--ok)}
+  .pill.bad{color:var(--bad);border-color:var(--bad)}
+  .pill.warn{color:var(--warn);border-color:var(--warn)}
+  main{padding:14px 18px}
+  table{border-collapse:collapse;width:100%}
+  th,td{text-align:left;padding:5px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+     position:sticky;top:49px;background:var(--bg);z-index:2}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .pgn{font-weight:700}
+  .name{color:var(--accent)}
+  tr.prop .name{color:var(--warn);font-weight:700}
+  tr.unknown .name{color:var(--bad);font-weight:700}
+  .age-ok{color:var(--ok)} .age-warn{color:var(--warn)} .age-bad{color:var(--bad)}
+  .fields{color:var(--ink)}
+  .fields b{color:var(--muted);font-weight:400}
+  .raw{color:var(--muted);word-break:break-all;font-size:11.5px;max-width:34ch;display:inline-block}
+  tr.fresh td{animation:flash .5s ease-out}
+  @keyframes flash{0%{background:rgba(90,169,230,.25)}100%{background:transparent}}
+  .empty{color:var(--muted);padding:30px;text-align:center}
+  .legend{color:var(--muted);font-size:11px;margin:8px 0 0}
+  .legend .name{color:var(--warn)}
+</style>
+</head>
+<body>
+<header>
+  <h1>NMEA 2000 BUS — everything the gateway hears</h1>
+  <span id="gw" class="pill">gateway —</span>
+  <span id="bus" class="pill">bus —</span>
+  <span id="npgn" class="pill">— PGNs</span>
+  <span style="flex:1"></span>
+  <span class="pill" id="tick">3 Hz</span>
+</header>
+<main>
+  <table>
+    <thead><tr>
+      <th>PGN</th><th>Name</th><th>Src</th><th class="num">Hz</th>
+      <th class="num">Count</th><th class="num">Age</th>
+      <th>Decoded fields</th><th>Raw payload (hex)</th>
+    </tr></thead>
+    <tbody id="rows"><tr><td colspan="8" class="empty">listening…</td></tr></tbody>
+  </table>
+  <div class="legend">
+    Every PGN the gateway forwards is listed, whether the rig decodes it or
+    not. <span class="name">Amber names</span> are manufacturer-proprietary
+    ranges — a sonar's private traffic lands there; watch Src to see which
+    device address it comes from. Age is time since that PGN was last heard.
+  </div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+let LAST_AGE={};   // pgn -> last age seen, to flash rows that just updated
+function fmtv(v){
+  if(v==null) return '∅';
+  if(typeof v==='number') return Math.abs(v)>=1000?v.toFixed(1):(+v.toFixed(4)).toString();
+  return String(v);
+}
+function fields(f){
+  if(!f) return '<span style="color:var(--muted)">— not decoded —</span>';
+  return Object.entries(f).map(([k,v])=>`<b>${k}=</b>${fmtv(v)}`).join(' ');
+}
+function ageCls(a){ return a<2?'age-ok':a<10?'age-warn':'age-bad'; }
+function ageTxt(a){ return a<10?a.toFixed(1)+'s':a<120?Math.round(a)+'s':Math.round(a/60)+'m'; }
+async function poll(){
+  let r;
+  try{ r=await fetch('/api/nav/all').then(x=>x.json()); }
+  catch(e){ $('#gw').textContent='rigd unreachable'; $('#gw').className='pill bad'; return; }
+  const h=(r&&r.health)||{};
+  $('#gw').textContent='gateway '+(h.online?'online':'offline')+(h.port?(' · '+h.port.split('/').pop()):'');
+  $('#gw').className='pill '+(h.online?'on':'bad');
+  // $PDGY,000000,<busload%>,<frame-errs>,<dev-count>,<uptime-s>,<addr>,<rej-tx>
+  const st=(h.status||h.last_status||'').split(',');
+  if(st.length>=7 && st[1]==='000000'){
+    const load=st[2],errs=st[3],dev=st[4];
+    $('#bus').textContent='bus '+(load!==''?(load+'% · '+dev+' devices · '+errs+' frame errs'):'NOT ON BUS');
+    $('#bus').className='pill '+(load!==''?(+errs>0?'warn':'on'):'bad');
+  } else { $('#bus').textContent='bus —'; $('#bus').className='pill'; }
+  const pgns=(r&&r.pgns)||[];
+  $('#npgn').textContent=pgns.length+' PGNs';
+  $('#npgn').className='pill '+(pgns.length?'on':'');
+  if(!pgns.length){
+    $('#rows').innerHTML='<tr><td colspan="8" class="empty">no PGNs heard yet — '
+      +'check the N2K bus is powered and the gateway is in RAW mode</td></tr>';
+    return;
+  }
+  $('#rows').innerHTML=pgns.map(p=>{
+    const prop=/PROPRIETARY/.test(p.name), unk=p.name==='unknown';
+    const fresh=(LAST_AGE[p.pgn]!==undefined && p.age_s<LAST_AGE[p.pgn]);
+    LAST_AGE[p.pgn]=p.age_s;
+    return `<tr class="${prop?'prop':''} ${unk?'unknown':''} ${fresh?'fresh':''}">
+      <td class="pgn">${p.pgn}</td>
+      <td class="name">${p.name}${p.decoded?'':' ·raw'}</td>
+      <td>${(p.src||[]).join(',')}→${p.dst}</td>
+      <td class="num">${p.hz??'—'}</td>
+      <td class="num">${p.count}</td>
+      <td class="num ${ageCls(p.age_s)}">${ageTxt(p.age_s)}</td>
+      <td class="fields">${fields(p.fields)}</td>
+      <td><span class="raw">${p.raw_hex??''}</span> <span style="color:var(--muted)">(${p.bytes}B)</span></td>
+    </tr>`;
+  }).join('');
+}
+poll(); setInterval(poll, 333);
+</script>
+</body>
+</html>
