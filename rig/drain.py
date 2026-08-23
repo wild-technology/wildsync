@@ -52,6 +52,11 @@ def _req(url, body=None, timeout=200):
             return json.load(e)
         except Exception:  # noqa: BLE001
             return {"ok": False, "error": "HTTP %d" % e.code}
+    except Exception as e:  # noqa: BLE001 - URLError, socket.timeout
+        # A transient network blip (PoE drop, link stall) must not escape as an
+        # uncaught exception - during a mode switch that would leave the body
+        # stuck in transfer mode. Return it so the caller retries or restores.
+        return {"ok": False, "error": "request failed: %s" % e}
 
 
 def _bytes(url, timeout=300):
@@ -132,38 +137,48 @@ class Drainer:
 
     # -- the drain ----------------------------------------------------------
     def run(self, keep_card=False, formats=(RAW_FORMAT,), limit=None):
-        """Returns a report dict. Deletes each card content only after its
-        RAW copy verifies; on any failure that file is left on the card."""
+        """Returns a report dict. Deletes each card content only after its RAW
+        copy is on host disk, fsynced, AND its sha256 matches the camera's; on
+        any failure that file is left on the card.
+
+        Per-node staging (~/rig-raw/<node>): the two Sony bodies reuse the
+        same DSC/_CA counters and fire together, so their card filenames
+        collide; a single shared directory let a same-named file from cam1
+        stand in for cam2's and its card original be deleted unverified. Kept
+        strictly separate here (audit 2026-08-23, critical). And the WHOLE
+        drain - mode switch, indexing, listing, pulling - is inside one
+        try/finally that always restores shooting mode, so a network blip
+        during indexing can never leave the body stuck in transfer mode
+        (audit 2026-08-23, critical)."""
+        self.dest = os.path.join(self.dest, self.node)
         os.makedirs(self.dest, exist_ok=True)
         rep = {"node": self.node, "pulled": 0, "bytes": 0, "verified": 0,
                "deleted": 0, "skipped": 0, "errors": [], "files": []}
-        files = None
-        for attempt in range(2):
-            self.log("[%s] entering transfer mode%s"
-                     % (self.node, " (retry)" if attempt else ""))
-            m = self.set_mode("transfer")
-            if not m.get("ok"):
-                rep["errors"].append("mode switch failed: %s" % m.get("error"))
-                return rep
-            try:
-                self._wait_index()
-                files = self.card_list()
-                break
-            except RuntimeError as e:
-                self.log("[%s] %s" % (self.node, e))
-                self.set_mode("remote")            # clean the session, then retry
-                time.sleep(2.0)
-                if attempt == 1:
-                    rep["errors"].append(str(e))
-                    return rep
         try:
+            files = None
+            for attempt in range(2):
+                self.log("[%s] entering transfer mode%s"
+                         % (self.node, " (retry)" if attempt else ""))
+                m = self.set_mode("transfer")
+                if not m.get("ok"):
+                    rep["errors"].append("mode switch failed: %s" % m.get("error"))
+                    return rep
+                try:
+                    self._wait_index()
+                    files = self.card_list()
+                    break
+                except Exception as e:  # noqa: BLE001 - timeout/URLError too
+                    self.log("[%s] %s" % (self.node, e))
+                    self.set_mode("remote")        # clean the session, then retry
+                    time.sleep(2.0)
+                    if attempt == 1:
+                        rep["errors"].append(str(e))
+                        return rep
             wanted = [f for f in files if f["format"] in formats]
             if limit:
                 wanted = wanted[:limit]
             self.log("[%s] card holds %d files, %d to drain"
                      % (self.node, len(files), len(wanted)))
-            # group by contentId so a shot's card entry is deleted once, after
-            # every file of it (here just the RAW) has verified.
             for f in wanted:
                 if self._host_free_mb() < self.disk_min_mb:
                     rep["errors"].append("host disk below %d MB - stopping"
@@ -171,40 +186,55 @@ class Drainer:
                     self.log("[%s] STOP: host disk low" % self.node)
                     break
                 dst = os.path.join(self.dest, f["name"])
-                if os.path.exists(dst) and os.path.getsize(dst) == f["size"]:
-                    rep["skipped"] += 1
-                    ok = True                       # already have it, verified below
-                else:
+                # ALWAYS pull and verify before deleting the card original - no
+                # trust-by-size skip. A resumed drain re-pulls (a RAW is <1 s);
+                # trusting a same-size local file was how an unverified card
+                # original could be deleted (audit, critical). A verified local
+                # copy is cheap to re-confirm and never lost.
+                try:
+                    pr = self.pull(f)
+                except Exception as e:  # noqa: BLE001
+                    rep["errors"].append("%s pull: %s" % (f["name"], e))
+                    continue
+                if not pr.get("ok"):
+                    rep["errors"].append("%s pull: %s" % (f["name"], pr.get("error")))
+                    continue
+                try:
+                    data = self.fetch(f["name"])
+                except Exception as e:  # noqa: BLE001
+                    rep["errors"].append("%s fetch: %s" % (f["name"], e))
+                    continue
+                host_sha = hashlib.sha256(data).hexdigest()
+                if host_sha != pr.get("sha256") or len(data) != f["size"]:
+                    rep["errors"].append(
+                        "%s HASH MISMATCH (pi %s host %s, %d/%d B) - kept on card"
+                        % (f["name"], (pr.get("sha256") or "")[:12],
+                           host_sha[:12], len(data), f["size"]))
+                    continue
+                # Durability before deletion: the card is the only backstop for
+                # the irreplaceable RAW, so the host copy MUST survive a crash
+                # before the card copy is erased. fsync the file and its
+                # directory (audit, critical).
+                tmp = dst + ".part"
+                try:
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
                     try:
-                        pr = self.pull(f)
-                    except Exception as e:  # noqa: BLE001
-                        rep["errors"].append("%s pull: %s" % (f["name"], e))
-                        continue
-                    if not pr.get("ok"):
-                        rep["errors"].append("%s pull: %s" % (f["name"], pr.get("error")))
-                        continue
-                    # fetch the pulled file to the host and check the hash the
-                    # Pi computed against the bytes that actually arrived.
-                    try:
-                        data = self.fetch(f["name"])
-                    except Exception as e:  # noqa: BLE001
-                        rep["errors"].append("%s fetch: %s" % (f["name"], e))
-                        continue
-                    host_sha = hashlib.sha256(data).hexdigest()
-                    if host_sha != pr.get("sha256") or len(data) != f["size"]:
-                        rep["errors"].append(
-                            "%s HASH MISMATCH (pi %s host %s, %d/%d B) - kept on card"
-                            % (f["name"], (pr.get("sha256") or "")[:12],
-                               host_sha[:12], len(data), f["size"]))
-                        continue
-                    tmp = dst + ".part"
-                    with open(tmp, "wb") as fh:
-                        fh.write(data)
+                        os.write(fd, data)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
                     os.replace(tmp, dst)
-                    rep["pulled"] += 1
-                    rep["bytes"] += len(data)
-                    self.pi_delete_raw(f["name"])   # free the Pi's -raw staging
-                    ok = True
+                    dirfd = os.open(self.dest, os.O_RDONLY)
+                    try:
+                        os.fsync(dirfd)
+                    finally:
+                        os.close(dirfd)
+                except OSError as e:
+                    rep["errors"].append("%s host write: %s" % (f["name"], e))
+                    continue
+                rep["pulled"] += 1
+                rep["bytes"] += len(data)
+                self.pi_delete_raw(f["name"])       # free the Pi's -raw staging
                 rep["verified"] += 1
                 rep["files"].append(f["name"])
                 if not keep_card:
@@ -217,7 +247,11 @@ class Drainer:
             return rep
         finally:
             self.log("[%s] restoring remote mode" % self.node)
-            self.set_mode("remote")
+            try:
+                self.set_mode("remote")
+            except Exception as e:  # noqa: BLE001
+                self.log("[%s] WARNING could not restore remote mode: %s"
+                         % (self.node, e))
 
 
 def drain_node(node, host=None, dest=DEFAULT_DEST, keep_card=False, log=print,
