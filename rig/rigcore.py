@@ -293,6 +293,7 @@ class NodeMonitor(threading.Thread):
         self.status = {}             # last ilxctl /api/status
         self.health = {}             # last piagent /health
         self.clock = None            # {"offset_s","rtt_ms","at"} vs our clock
+        self.suspend_control = False # True while a card drain owns this node
         self._uptime = None          # piagent uptime_s from the last health
         self.rebooted_at = None      # epoch the node was last seen to restart
         self._connect_after = 0.0    # backoff gate
@@ -409,6 +410,14 @@ class NodeMonitor(threading.Thread):
         if not reachable:
             # Never POST /api/connect at a wedged daemon; just keep probing.
             self._set_state(self.ILX_DOWN)
+            return
+        # While a card drain holds this node it is deliberately in the SDK's
+        # RemoteTransfer mode (not shooting); the monitor must NOT try to
+        # (re)claim it in remote mode - that races the drain on the SDK mutex
+        # and thrashes both (observed 2026-08-23). Report state, do nothing.
+        if getattr(self, "suspend_control", False):
+            self._set_state(self.CONNECTED if bool(status.get("connected"))
+                            else self.REACHABLE)
             return
         connected = bool(status.get("connected"))
         if connected:

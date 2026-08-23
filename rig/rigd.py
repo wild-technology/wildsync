@@ -30,6 +30,7 @@ import rigcore
 from rigcore import (NODES, EventLog, NodeMonitor, RunBrowser, RunsError,
                      SettingsManager, TimeSync, free_mb, http_json, http_bytes)
 from run import RunManager
+import drain as draindrv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("RIGD_PORT", "9090"))
@@ -569,6 +570,8 @@ class Rig:
         self.settings = SettingsManager(self.monitors, self.events)
         self.timesync = TimeSync(self.events)
         self.nav = self._start_nav()
+        self._drain_lock = threading.Lock()
+        self._drain_status = {"active": False, "node": None, "last": None}
         self.runmgr = RunManager(self.monitors, self.settings, self.timesync,
                                  self.events, self.nav)
         self.anomalies = Anomalies(self.monitors, self.runmgr, self.nav,
@@ -676,6 +679,88 @@ class Rig:
                              "back to '%s' whenever there is no live fix"
                              % wrapped.static_label())
         return wrapped
+
+    DRAIN_DEST = os.path.expanduser("~/rig-raw")
+    DRAIN_FLAG = os.path.expanduser("~/rig/auto_drain")
+
+    def auto_drain_default(self):
+        # Auto-drain after a run when ~/rig/auto_drain exists (default: on).
+        return os.path.exists(self.DRAIN_FLAG) or not os.path.exists(
+            os.path.expanduser("~/rig/no_auto_drain"))
+
+    def drain_status(self):
+        with self._drain_lock:
+            return dict(self._drain_status)
+
+    def start_drain(self, nodes, keep=False):
+        with self._drain_lock:
+            if self._drain_status["active"]:
+                return {"ok": False, "error": "a drain is already running on %s"
+                        % self._drain_status["node"]}
+            if self.runmgr.status().get("active"):
+                return {"ok": False, "error": "a run is active - cannot drain"}
+            nodes = [n for n in nodes
+                     if any(m.name_ == n and m.is_connected() for m in self.monitors)]
+            if not nodes:
+                return {"ok": False, "error": "no connected node to drain"}
+            self._drain_status = {"active": True, "node": nodes[0], "last": None,
+                                  "queue": list(nodes)}
+        threading.Thread(target=self._drain_worker, args=(nodes, keep),
+                         daemon=True).start()
+        return {"ok": True, "draining": nodes}
+
+    def _drain_worker(self, nodes, keep):
+        for node in nodes:
+            host = next((m.host for m in self.monitors if m.name_ == node), None)
+            if host is None:
+                continue
+            # Block runs on this node AND stop the monitor from reclaiming
+            # the camera in remote mode while the drain holds it in transfer
+            # mode.
+            self.runmgr.draining = node
+            for m in self.monitors:
+                if m.name_ == node:
+                    m.suspend_control = True
+            with self._drain_lock:
+                self._drain_status["node"] = node
+            self.events.emit("info", "drain", "card drain started on %s" % node,
+                             node=node)
+            try:
+                rep = draindrv.Drainer(
+                    node, host, dest=self.DRAIN_DEST,
+                    log=lambda m: self.events.emit("info", "drain", m)).run(
+                        keep_card=keep)
+                sev = "warn" if rep.get("errors") else "info"
+                self.events.emit(
+                    sev, "drain",
+                    "%s drain done: %d pulled (%.1f GB), %d deleted, %d errors"
+                    % (node, rep["pulled"], rep["bytes"] / 1e9, rep["deleted"],
+                       len(rep["errors"])), node=node,
+                    errors=rep["errors"][:5])
+                with self._drain_lock:
+                    self._drain_status["last"] = {"node": node, "at": time.time(),
+                                                  **{k: rep[k] for k in
+                                                     ("pulled", "bytes", "deleted",
+                                                      "verified")},
+                                                  "errors": len(rep["errors"])}
+                # hand the pulled RAWs to ingest (best-effort; never blocks)
+                try:
+                    import ingest
+                    ingest.ingest(self.DRAIN_DEST, log=lambda *a: None)
+                except Exception as e:  # noqa: BLE001
+                    self.events.emit("warn", "drain",
+                                     "ingest after drain failed: %s" % e)
+            except Exception as e:  # noqa: BLE001
+                self.events.emit("error", "drain",
+                                 "drain on %s failed: %s" % (node, e), node=node)
+            finally:
+                self.runmgr.draining = None
+                for m in self.monitors:
+                    if m.name_ == node:
+                        m.suspend_control = False
+        with self._drain_lock:
+            self._drain_status["active"] = False
+            self._drain_status["node"] = None
 
     def _startup_calibrate(self):
         """Measure per-camera trigger latency once the fleet is up.
@@ -1050,6 +1135,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.imu_window(t0, now))
             elif p == "/api/nav":
                 self._json(RIG.nav_snapshot())
+            elif p == "/api/drain":
+                self._json(RIG.drain_status())
             elif p == "/api/nav/all":
                 # The bus-sniffing table: every PGN seen on the N2K bus with
                 # age/rate/source and raw payload, decoded or not.
@@ -1242,7 +1329,16 @@ class Handler(BaseHTTPRequestHandler):
                                          "record")
                 self._json(RIG.runmgr.start(b or {}))
             elif p == "/api/run/stop":
-                self._json(RIG.runmgr.stop())
+                res = RIG.runmgr.stop()
+                if res.get("ok") and b.get("drain", RIG.auto_drain_default()):
+                    RIG.start_drain([n for n in res.get("summary", {})])
+                    res["drain_started"] = True
+                self._json(res)
+            elif p == "/api/drain":
+                # Manual drain of one node or all connected. Refused during a run.
+                nodes = b.get("nodes") or [m.name_ for m in RIG.monitors
+                                           if m.is_connected()]
+                self._json(RIG.start_drain(nodes, keep=bool(b.get("keep"))))
             elif p == "/api/capture":
                 self._json(RIG.runmgr.capture_once(af=bool(b.get("af"))))
             elif p == "/api/calibrate":

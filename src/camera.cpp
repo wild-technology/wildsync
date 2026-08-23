@@ -120,6 +120,8 @@ std::string timestamp() {
 
 }  // namespace
 
+std::string jsonEscapeStr(const std::string& s) { return jsonEscape(s); }
+
 // ---------------------------------------------------------------------------
 // Formatters (mirroring Sony's RemoteCli display conventions)
 // ---------------------------------------------------------------------------
@@ -370,7 +372,7 @@ std::vector<CameraInfo> Camera::enumerate(int timeoutSec) {
     return out;
 }
 
-bool Camera::connect(int index, std::string& err) {
+bool Camera::connect(int index, std::string& err, SDK::CrSdkControlMode mode) {
     std::unique_lock<std::recursive_mutex> lk(m_sdkMutex);
     if (m_handle) {
         bool pending;
@@ -414,8 +416,17 @@ bool Camera::connect(int index, std::string& err) {
         std::atomic<bool>& f;
         ~ConnectingGuard() { f = false; }
     } connectingGuard{m_connecting};
-    const SDK::CrError e = SDK::Connect(obj, this, &m_handle, SDK::CrSdkControlMode_Remote,
-                                        SDK::CrReconnecting_ON);
+    m_mode = mode;
+    // A RemoteTransfer session must NOT auto-reconnect: the SDK's reconnect
+    // (and any concurrent remote claim) tears the transfer session down a few
+    // seconds in, so the card index never settles and every list answers
+    // 0x8D05 forever (observed 2026-08-23). Transfer sessions are short and
+    // supervised by the drain; remote sessions keep auto-reconnect.
+    const SDK::CrReconnectingSet reconnect =
+        (mode == SDK::CrSdkControlMode_RemoteTransfer) ? SDK::CrReconnecting_OFF
+                                                       : SDK::CrReconnecting_ON;
+    if (mode == SDK::CrSdkControlMode_RemoteTransfer) m_cardIndexReady = false;
+    const SDK::CrError e = SDK::Connect(obj, this, &m_handle, mode, reconnect);
     if (e != SDK::CrError_None) {
         err = "Connect failed: " + crErrorString(e);
         log(err);
@@ -656,6 +667,189 @@ void Camera::OnWarning(CrInt32u warning) {
 
 void Camera::OnPropertyChangedCodes(CrInt32u, CrInt32u*) {
     // The UI polls /api/status, so there is nothing to push here.
+}
+
+// ---------------------------------------------------------------------------
+// Card drain — SDK Remote Transfer
+// ---------------------------------------------------------------------------
+static long long captureDateToEpoch(const SDK::CrCaptureDate& d) {
+    if (d.year < 1970) return 0;
+    std::tm t{};
+    t.tm_year = d.year - 1900;
+    t.tm_mon = d.month - 1;
+    t.tm_mday = d.day;
+    t.tm_hour = d.hour;
+    t.tm_min = d.minute;
+    t.tm_sec = d.sec;
+    return static_cast<long long>(timegm(&t));
+}
+
+bool Camera::cardList(std::vector<CardEntry>& out, std::string& err, int maxNums) {
+    std::unique_lock<std::recursive_mutex> lk(m_sdkMutex);
+    if (!m_handle) {
+        err = "not connected";
+        return false;
+    }
+    out.clear();
+    // The body indexes its card by capture day: ask for the day list, then
+    // the contents of each day. (Type_All with no date is refused with
+    // InvalidParameter on the ILX-LR1.)
+    SDK::CrCaptureDate* dates = nullptr;
+    CrInt32u nd = 0;
+    SDK::CrError e = SDK::GetRemoteTransferCapturedDateList(m_handle, SDK::CrSlotNumber_Slot1,
+                                                            &dates, &nd);
+    if (e != SDK::CrError_None) {
+        err = "GetRemoteTransferCapturedDateList: " + crErrorString(e);
+        return false;
+    }
+    std::vector<SDK::CrCaptureDate> days;
+    for (CrInt32u i = 0; dates && i < nd; ++i) days.push_back(dates[i]);
+    if (dates) SDK::ReleaseRemoteTransferCapturedDateList(m_handle, dates);
+
+    for (auto& day : days) {
+        SDK::CrContentsInfo* list = nullptr;
+        CrInt32u n = 0;
+        // The body indexes the card asynchronously after a mode switch and
+        // answers 0x8D05 (GetContentsInfoListProcessing) until it is done:
+        // retry, releasing the SDK mutex between tries so status keeps
+        // answering.
+        for (int attempt = 0; attempt < 20; ++attempt) {   // ~10 s, then report
+            e = SDK::GetRemoteTransferContentsInfoList(
+                m_handle, SDK::CrSlotNumber_Slot1, SDK::CrGetContentsInfoListType_Range_Day, &day,
+                static_cast<CrInt32u>(maxNums), &list, &n);
+            if (e != SDK::CrError_RemoteTransfer_GetContentsInfoListProcessing) break;
+            lk.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            lk.lock();
+            if (!m_handle) {
+                err = "disconnected while listing";
+                return false;
+            }
+        }
+        if (e != SDK::CrError_None) {
+            err = "GetRemoteTransferContentsInfoList(day): " + crErrorString(e);
+            return false;
+        }
+        for (CrInt32u i = 0; list && i < n; ++i) {
+            const SDK::CrContentsInfo& c = list[i];
+            for (CrInt32u f = 0; c.files && f < c.filesNum; ++f) {
+                const SDK::CrContentsFile& cf = c.files[f];
+                CardEntry ce;
+                ce.contentId = c.contentId;
+                ce.fileId = cf.fileId;
+                ce.fileNumber = c.fileNumber;
+                ce.dirNumber = c.dirNumber;
+                ce.size = static_cast<long long>(cf.fileSize);
+                ce.format = cf.fileFormat;
+                ce.capturedUtc = captureDateToEpoch(c.creationDatetimeUTC);
+                std::string path;
+                if (cf.filePath && cf.filePathLength)
+                    path.assign(reinterpret_cast<const char*>(cf.filePath), cf.filePathLength);
+                while (!path.empty() && path.back() == '\0') path.pop_back();
+                const auto slash = path.find_last_of("/\\");
+                ce.name = slash == std::string::npos ? path : path.substr(slash + 1);
+                out.push_back(ce);
+            }
+        }
+        if (list) SDK::ReleaseRemoteTransferContentsInfoList(m_handle, list);
+        if (static_cast<int>(out.size()) >= maxNums) break;
+    }
+    return true;
+}
+
+bool Camera::cardPull(CrInt32u contentId, CrInt32u fileId, const std::string& dir,
+                      const std::string& fileName, long long& bytes, std::string& err,
+                      int timeoutSec) {
+    {
+        std::lock_guard<std::mutex> rl(m_rtMutex);
+        m_rtResult = 0;
+        m_rtPercent = 0;
+        m_rtFile.clear();
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+        if (!m_handle) {
+            err = "not connected";
+            return false;
+        }
+        if (!makeDirs(dir)) {
+            err = "could not create " + dir;
+            return false;
+        }
+        std::string d = dir, f = fileName;
+        // divisionSize is the transfer chunk; 0 is refused (InvalidParameter).
+        // 8 MB balances round-trips against RAM on the Pi.
+        const CrInt32u kDivision = 8u * 1024u * 1024u;
+        const SDK::CrError e = SDK::GetRemoteTransferContentsDataFile(
+            m_handle, SDK::CrSlotNumber_Slot1, contentId, fileId, kDivision,
+            const_cast<CrChar*>(d.c_str()), const_cast<CrChar*>(f.c_str()));
+        if (e != SDK::CrError_None) {
+            err = "GetRemoteTransferContentsDataFile: " + crErrorString(e);
+            return false;
+        }
+    }
+    // Wait WITHOUT the SDK mutex: the transfer runs on the SDK's thread and
+    // reports through OnNotifyRemoteTransferResult; /api/status must keep
+    // answering meanwhile.
+    std::unique_lock<std::mutex> rl(m_rtMutex);
+    if (!m_rtCv.wait_for(rl, std::chrono::seconds(timeoutSec),
+                         [this] { return m_rtResult != 0; })) {
+        err = "transfer timed out after " + std::to_string(timeoutSec) + " s";
+        return false;
+    }
+    if (m_rtResult != 1) {
+        err = m_rtResult == -2 ? "device busy" : "transfer failed";
+        return false;
+    }
+    const std::string path = dir + "/" + fileName;
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        err = "transfer reported ok but " + path + " is missing";
+        return false;
+    }
+    bytes = static_cast<long long>(st.st_size);
+    return true;
+}
+
+bool Camera::cardDelete(CrInt32u contentId, std::string& err) {
+    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    if (!m_handle) {
+        err = "not connected";
+        return false;
+    }
+    const SDK::CrError e = SDK::DeleteRemoteTransferContentsFile(
+        m_handle, SDK::CrSlotNumber_Slot1, contentId);
+    if (e != SDK::CrError_None) {
+        err = "DeleteRemoteTransferContentsFile: " + crErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+void Camera::OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrChar* filename) {
+    std::lock_guard<std::mutex> rl(m_rtMutex);
+    m_rtPercent = per;
+    if (filename) m_rtFile = reinterpret_cast<const char*>(filename);
+    if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) m_rtResult = 1;
+    else if (notify == SDK::CrNotify_RemoteTransfer_Result_NG) m_rtResult = -1;
+    else if (notify == SDK::CrNotify_RemoteTransfer_Result_DeviceBusy) m_rtResult = -2;
+    else return;                       // InProgress etc.: keep waiting
+    m_rtCv.notify_all();
+}
+
+void Camera::OnNotifyRemoteTransferContentsListChanged(CrInt32u notify, CrInt32u slotNumber,
+                                                       CrInt32u addSize) {
+    // Changed_All = the body finished indexing the card (after a mode switch);
+    // Changed_Add = new content appeared; Changed_Clear = card removed/format.
+    m_cardIndexReady = (notify != SDK::CrNotify_RemoteTransfer_Changed_Clear);
+    log("Card index " + std::string(notify == SDK::CrNotify_RemoteTransfer_Changed_All ? "ready" :
+                                    notify == SDK::CrNotify_RemoteTransfer_Changed_Add ? "added" :
+                                    notify == SDK::CrNotify_RemoteTransfer_Changed_Clear ? "cleared" : "changed") +
+        " (slot " + std::to_string(slotNumber) + ", " + std::to_string(addSize) + ")");
+}
+
+void Camera::OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrInt8u*, CrInt64u) {
+    OnNotifyRemoteTransferResult(notify, per, static_cast<CrChar*>(nullptr));
 }
 
 void Camera::OnCompleteDownload(CrChar* filename, CrInt32u) {
