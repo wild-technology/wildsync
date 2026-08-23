@@ -32,7 +32,9 @@ from collections import deque
 _DEFAULT_NODES = [
     {"name": "cam1", "cam_num": 1, "host": "192.168.1.201"},
     {"name": "cam2", "cam_num": 2, "host": "192.168.1.202"},
-    {"name": "cam3", "cam_num": 3, "host": "192.168.1.203"},
+    # cam3 (192.168.1.203) was an empty slot that fired a permanent
+    # node_offline anomaly and a forever-"2/3" header. A third camera joins
+    # via ~/rig/nodes.json in the field, not a code edit (see below).
 ]
 
 # Hardcoding the addresses assumes every node holds its static lease, and a node
@@ -268,6 +270,13 @@ class NodeMonitor(threading.Thread):
     OFFLINE = "OFFLINE"
     REACHABLE = "REACHABLE"          # piagent/ilxctl answer, camera not claimed
     CONNECTED = "CAM_CONNECTED"      # camera claimed and controllable
+    # piagent answers but ilxctl does not (timeout / refused / garbage): the
+    # daemon is wedged inside an SDK call (HANDOFF §2.2) or dead. This is NOT
+    # "camera not claimed": POSTing /api/connect here strands one of ilxctl's
+    # HTTP workers per attempt behind the stuck mutex, and the stale cached
+    # status kept reporting connected:true so the UI kept requesting live
+    # view — observed live on cam2, 2026-08-23, after a live-view storm.
+    ILX_DOWN = "ILX_DOWN"
 
     def __init__(self, node, events, poll=2.0):
         super().__init__(daemon=True)
@@ -283,6 +292,9 @@ class NodeMonitor(threading.Thread):
         self.state = self.OFFLINE
         self.status = {}             # last ilxctl /api/status
         self.health = {}             # last piagent /health
+        self.clock = None            # {"offset_s","rtt_ms","at"} vs our clock
+        self._uptime = None          # piagent uptime_s from the last health
+        self.rebooted_at = None      # epoch the node was last seen to restart
         self._connect_after = 0.0    # backoff gate
         self._backoff = 5.0
         self.last_seen = 0.0
@@ -320,6 +332,11 @@ class NodeMonitor(threading.Thread):
                 # is what makes PROTOCOL.md's "settings re-push + verify after
                 # every reconnect" actually true.
                 self._pushed = {}
+                # A body that went away may have reset. Exposure is normally
+                # exempt from the continuous reconcile (per-camera between
+                # applies), but a reconnected body gets one forced exposure
+                # pass so a power-cycled camera rejoins the fleet's vector.
+                self._exposure_force = True
             self.state = new
 
     def run(self):
@@ -331,17 +348,67 @@ class NodeMonitor(threading.Thread):
                                  node=self.name_)
 
     def _tick(self):
+        t0 = time.time()
         health = http_json(self.pia + "/health", timeout=4)
+        t1 = time.time()
         status = http_json(self.ilx + "/api/status", timeout=6)
         reachable = not status.get("_unreachable")
         pia_ok = not health.get("_unreachable")
+        # The node's clock offset against ours, bounded by the poll's RTT.
+        # Every scheduled fire and every epoch_hw edge lives on the NODE's
+        # clock, so two nodes disagreeing with each other lands 1:1 in
+        # inter-camera exposure skew — and with no local chrony master that
+        # drift is silent. Sampled here because t0/t1 bracket the request.
+        clock = None
+        if pia_ok and isinstance(health.get("time"), dict) \
+                and health["time"].get("epoch") is not None:
+            clock = {"offset_s": health["time"]["epoch"] - (t0 + t1) / 2.0,
+                     "rtt_ms": (t1 - t0) * 1000.0, "at": t1}
+        # A node that restarts announces nothing; its piagent uptime going
+        # backwards is the only tell. On this rig that means a POWER loss
+        # (PoE budget collapse under synchronized fires took cam1's Pi 5 down
+        # mid-run, 2026-08-23) - the event names it so it is never chased as
+        # a software fault.
+        rebooted = False
+        if pia_ok:
+            # Prefer the HOST uptime (piagent 2026-08-23+): the service's own
+            # uptime resets on every deploy and read as a power loss.
+            up = health.get("host_uptime_s")
+            if up is None:
+                up = health.get("uptime_s")
+            if isinstance(up, (int, float)):
+                if self._uptime is not None and up < self._uptime - 5:
+                    rebooted = True
+                self._uptime = up
         with self._lock:
             self.health = {} if health.get("_unreachable") else health
+            if clock is not None:
+                self.clock = clock
+            if rebooted:
+                self.rebooted_at = time.time()
             if reachable:
                 self.status = status
                 self.last_seen = time.time()
+            elif pia_ok:
+                # ilxctl is not answering while the Pi is. Do not keep serving
+                # the last good status as if it were current: mark it stale and
+                # NOT connected so is_connected(), the pull worker, the live-
+                # view proxy and the UI all stop treating the body as live.
+                self.status = {"connected": False, "stale": True,
+                               "ilx_down": True,
+                               "error": status.get("error") or "ilxctl not answering"}
+        if rebooted:
+            self.events.emit("error", "node_rebooted",
+                             "%s restarted (piagent uptime reset to %.0f s) - "
+                             "power loss: check the PoE budget/port and the "
+                             "cable; both nodes firing in sync can collapse it"
+                             % (self.name_, self._uptime or 0), node=self.name_)
         if not reachable and not pia_ok:
             self._set_state(self.OFFLINE)
+            return
+        if not reachable:
+            # Never POST /api/connect at a wedged daemon; just keep probing.
+            self._set_state(self.ILX_DOWN)
             return
         connected = bool(status.get("connected"))
         if connected:
@@ -357,10 +424,22 @@ class NodeMonitor(threading.Thread):
                                  "attempting camera connect", node=self.name_)
                 r = http_json(self.ilx + "/api/connect", body={}, timeout=30)
                 if r.get("ok") is False or r.get("_unreachable"):
-                    self._backoff = min(self._backoff * 1.6, 60.0)
+                    err = str(r.get("error") or "")
+                    # "already connected" after a USB drop means ilxctl kept a
+                    # dead handle (OnDisconnected leaves m_handle set, so
+                    # Camera::connect refuses). No retry can ever succeed;
+                    # back off to the ceiling and say what actually fixes it.
+                    if "already connected" in err.lower():
+                        self._backoff = 60.0
+                    else:
+                        self._backoff = min(self._backoff * 1.6, 60.0)
                     self._connect_after = now + self._backoff
                     self.events.emit("warn", "reconnect",
-                                     "connect failed: %s" % r.get("error"),
+                                     "connect failed: %s%s" % (
+                                         err,
+                                         " (dead SDK handle - restart ilxctl "
+                                         "on the node)" if "already connected"
+                                         in err.lower() else ""),
                                      node=self.name_, retry_s=round(self._backoff))
                 else:
                     # ok:true only means ilxctl accepted the request. If the body
@@ -422,13 +501,37 @@ CONVERGE_FIELDS = {
     # §1), so pushing one body's encoder count to the other could silently
     # change the stereo pair's interior orientation.
     "focus_mode": (None, "focusMode"),
+    # White balance is fleet state: a stereo pair must render identically, so
+    # the mode (256 = fixed color temperature) and the Kelvin value converge
+    # like any readable field. The readback keys exist only on ilxctl builds
+    # from 2026-08-20 on — the reconcile loop skips a node whose /api/status
+    # lacks the key entirely, so a fleet mid-upgrade stays quiet instead of
+    # alarming on nodes that simply predate the field.
+    "wb_mode": ("wb_mode", "whiteBalance"),
+    "colortemp": ("colortemp", "colorTemp"),
 }
+
+# Fields that older ilxctl builds do not know: absent readback key = node
+# predates the field, skip silently (see CONVERGE_FIELDS note).
+BUILD_GATED_FIELDS = ("wb_mode", "colortemp")
+
+# Exposure is PER-CAMERA between explicit applies. The operator tunes one body
+# live (POST /api/exposure with a node key) and either pushes that exposure to
+# the fleet (POST /api/settings — the force path) or deliberately leaves the
+# two bodies different, e.g. balancing them against unequal strobes or vignette.
+# The continuous 3 s reconcile therefore only READS these fields and reports a
+# split as convergence.exposure_split — information, not a fault. They are
+# still written on: an explicit apply (force=True), a node reconnect (the body
+# may have reset), or the in-pass reboot tell (a NON-exposure readable field
+# reverted underneath us).
+EXPOSURE_FIELDS = ("aperture", "shutter", "iso", "expcomp")
 
 # ilxctl's `writable` map is keyed on the property's own name, which is not
 # always the desired-vector field name. Getting this wrong reads back None and
 # mis-reports a body-menu-only property as an ordinary divergence, re-alarming
 # forever on something the operator cannot fix over USB.
-WRITABLE_KEY = {"store_dest": "storeDest", "focus_mode": "focusMode"}
+WRITABLE_KEY = {"store_dest": "storeDest", "focus_mode": "focusMode",
+                "wb_mode": "whiteBalance", "colortemp": "colorTemp"}
 # enableFlag values from the SDK: 2 = DisplayOnly, i.e. readable but NOT
 # settable over USB. `storeDest` and `pcsave` report this on these bodies.
 ENABLE_DISPLAY_ONLY = 2
@@ -452,6 +555,13 @@ DEFAULT_DESIRED = {
     # bytes per frame over the same USB link the capture path uses).
     "transsize": 1,
     "store_dest": 3,                 # both card + PC
+    # Fixed white balance is rig policy (operator, 2026-08-21): AWB renders the
+    # two bodies of a stereo pair differently shot-to-shot, which fights both
+    # matching and any radiometric use of the JPEGs. 256 = fixed color
+    # temperature mode; 5600 K is the flash/daylight point the survey uses.
+    # RAW is WB-agnostic either way — this pins the JPEG rendering.
+    "wb_mode": 256,
+    "colortemp": 5600,
 }
 
 # Value bounds for the desired vector. Deliberately wide - the body's own choice
@@ -925,13 +1035,19 @@ class SettingsManager:
         # RAW+JPEG, so the specific consequence of trusting the stale cache is a
         # whole transect silently shot in the wrong file type while the UI
         # reports "synced".
+        # Whether exposure fields are written this pass. A deliberate exposure
+        # split must not read as "the body reset", so the in-pass reboot tell
+        # below counts NON-exposure readable fields only.
+        exp_force = bool(force) or bool(getattr(m, "_exposure_force", False))
         if not force:
             reverted = [f for f, (w, k) in CONVERGE_FIELDS.items()
-                        if k and want.get(f) is not None
+                        if k and f not in EXPOSURE_FIELDS
+                        and want.get(f) is not None
                         and status.get(k) is not None
                         and status.get(k) != want[f]]
             if reverted:
                 pushed = m._pushed = {}
+                exp_force = True
         # A push result, judged once, in one place. Three outcomes matter and
         # they used to be conflated:
         #   * unreachable  - the POST never got there. Recording it in the
@@ -957,6 +1073,10 @@ class SettingsManager:
             target = want.get(field)
             if target is None:
                 continue
+            if field in EXPOSURE_FIELDS and not exp_force:
+                continue          # per-camera between applies; still read below
+            if field in BUILD_GATED_FIELDS and key not in status:
+                continue    # node's ilxctl predates this field: skip quietly
             have = status.get(key) if key else None
             if key and have == target and not force:
                 continue
@@ -975,15 +1095,20 @@ class SettingsManager:
             if which:
                 note(field, m.set_exposure(which, target), key, target)
         # expcomp has no readback key either, so it gets the same treatment
-        # rather than an unconditional write on every reconcile.
+        # rather than an unconditional write on every reconcile. It is an
+        # exposure field, so it also honours the per-camera exemption.
         want_ev = want.get("expcomp", 0)
-        if pushed.get("expcomp") != want_ev or force:
+        if exp_force and (pushed.get("expcomp") != want_ev or force):
             r = m.set_exposure("expcomp", want_ev)
-            if r.get("ok") is False \
-                    and "InvalidCalled" in str(r.get("error", "")):
+            err = str(r.get("error", ""))
+            if r.get("ok") is False and ("InvalidCalled" in err
+                                         or "DisplayOnly" in err
+                                         or "read-only" in err):
                 # This body does not expose EV compensation in its current
-                # exposure mode. Cache it so we stop writing; it is not a
-                # divergence the operator can act on.
+                # exposure mode — on the ILX-LR1, full Manual (program=M)
+                # makes expcomp enableFlag=DisplayOnly, and the live fleet
+                # answered exactly that. Cache it so we stop writing; it is
+                # not a divergence the operator can act on.
                 pushed["expcomp"] = want_ev
             else:
                 note("expcomp", r, None, want_ev)
@@ -996,11 +1121,22 @@ class SettingsManager:
         after = http_json(m.ilx + "/api/status", timeout=8)
         if not isinstance(after, dict) or after.get("_unreachable"):
             return                                  # offline: not a divergence
-        still = []
+        # The reconnect flag is consumed by a pass that got far enough to push
+        # and re-read; an unreachable node above keeps it for the next pass.
+        m._exposure_force = False
+        still, exp_split = [], []
         for field, (which, key) in CONVERGE_FIELDS.items():
+            if field in BUILD_GATED_FIELDS and key not in after:
+                continue    # node's ilxctl predates this field: not divergence
             if key and want.get(field) is not None \
                     and after.get(key) != want[field]:
-                still.append(field)
+                # An exposure field left alone this pass is a deliberate
+                # per-camera split: report it as information. One that was
+                # PUSHED and still disagrees is a real divergence.
+                if field in EXPOSURE_FIELDS and not exp_force:
+                    exp_split.append(field)
+                else:
+                    still.append(field)
         # Fold in the fields that have NO readback key and were refused. They
         # are invisible to the check above by construction - "have == target"
         # can never be true for them - so a body that rejects filetype /
@@ -1016,13 +1152,19 @@ class SettingsManager:
         # will never converge, and re-alarming every cycle trains the operator
         # to ignore the alert. Report it once, distinctly.
         writable = after.get("writable") or {}
+        # dict.get evaluates its default eagerly, and expcomp (a blind_fail
+        # candidate) is deliberately absent from CONVERGE_FIELDS — a bare
+        # CONVERGE_FIELDS[f] here raised KeyError, aborted the whole pass,
+        # froze the convergence badge at its previous value and suppressed
+        # every divergence alarm for the node, once per 3 s, forever.
         unsettable = [f for f in still
                       if writable.get(WRITABLE_KEY.get(
-                          f, CONVERGE_FIELDS[f][0] or f))
+                          f, CONVERGE_FIELDS.get(f, (None,))[0] or f))
                       == ENABLE_DISPLAY_ONLY]
         synced = not still
         with m._lock:
             m.convergence = {"synced": synced, "diverged": still,
+                             "exposure_split": exp_split,
                              "unsettable": unsettable,
                              "blind_errors": dict(blind_fail),
                              "last_check": time.time()}
@@ -1335,6 +1477,7 @@ class RunBrowser:
             }
         detail = {
             "run_id": run_id,
+            "path": root,
             "label": doc.get("label"),
             "started": doc.get("started"),
             "final": bool(doc.get("final")),
@@ -1348,25 +1491,56 @@ class RunBrowser:
             "stats": doc.get("stats") or {},
             "frames_indexed": doc.get("frames"),
             "per_camera": percam,
-            "pairs": self._pairs(frames, cams, doc),
             "has_run_json": bool(doc),
         }
+        pairs, shots_full = self._pairs(frames, cams, doc)
+        detail["pairs"] = pairs
+        detail["strobe"] = doc.get("strobe")
         with self._lock:
             if len(self._cache) > 16:
                 self._cache.clear()
-            self._cache[run_id] = (sig, detail)
+            self._cache[run_id] = (sig, detail, shots_full)
         return detail
+
+    def shots(self, run_id, offset=0, limit=200):
+        """The run's full grouped shot list, paginated. offset < 0 counts from
+        the end (offset=-50 → the last 50 shots), which is what a live review
+        screen wants without a prior total-count round trip."""
+        self.detail(run_id)          # refresh the cache off the files' mtimes
+        with self._lock:
+            hit = self._cache.get(run_id)
+        full = hit[2] if hit and len(hit) > 2 else []
+        n = len(full)
+        try:
+            offset, limit = int(offset), int(limit)
+        except (TypeError, ValueError):
+            offset, limit = 0, 200
+        if offset < 0:
+            offset = max(0, n + offset)
+        offset = min(offset, n)
+        limit = max(1, min(limit, 1000))
+        return {"run_id": run_id, "total": n, "offset": offset,
+                "shots": full[offset:offset + limit]}
 
     @staticmethod
     def _pairs(frames, cams, doc):
-        """Group frames into shots and report which shots are incomplete.
+        """Group frames into shots; return (summary, full_shot_list).
 
         This is the whole point of the view: a shot that only one camera
         recorded is not a stereo pair, and the operator needs to know that -
-        and WHERE - while the boat is still on the line."""
+        and WHERE - while the boat is still on the line.
+
+        Where run.json's per-frame index covers a shot, the µs-grade index
+        epochs replace the centisecond-quantised flight_log datetimes for the
+        spread (spread_src says which), and the shot gets a strobe verdict:
+        the acceptance check of docs/strobe-trigger.md §4.2 — the strobe
+        instant must sit inside the INTERSECTION of every member's measured
+        [fall, rise] exposure window, all epoch_hw-derived. A verdict is only
+        computed when every member is src=gpio_edge; a coarser source would
+        make the check a guess wearing a measurement's clothes."""
         if not cams:
-            return {"cams": [], "shots": 0, "complete": 0, "incomplete": 0,
-                    "gaps": [], "tolerance_s": PAIR_TOL_S}
+            return ({"cams": [], "shots": 0, "complete": 0, "incomplete": 0,
+                     "gaps": [], "tolerance_s": PAIR_TOL_S}, [])
         interval = 0.0
         try:
             interval = float((doc.get("config") or {}).get("interval_s") or 0)
@@ -1374,6 +1548,8 @@ class RunBrowser:
             interval = 0.0
         tol = PAIR_TOL_S if interval <= 0 \
             else max(0.05, min(PAIR_TOL_S, interval / 2.0))
+        idx_by_file = {r.get("file"): r for r in (doc.get("index") or [])
+                       if isinstance(r, dict) and r.get("file")}
         frames.sort(key=lambda f: f[0])
         shots = []
         for ep, cam, fname, src in frames:
@@ -1382,37 +1558,76 @@ class RunBrowser:
                 shots[-1]["t1"] = ep
             else:
                 shots.append({"t0": ep, "t1": ep, "have": {cam: fname}})
+
+        def shot_view(s):
+            members = {c: idx_by_file.get(f) for c, f in s["have"].items()}
+            idx_eps = {c: r["epoch"] for c, r in members.items()
+                       if r and r.get("epoch") is not None}
+            srcs = {c: r.get("src") for c, r in members.items() if r}
+            if len(idx_eps) == len(s["have"]) and len(idx_eps) >= 1:
+                spread = (max(idx_eps.values()) - min(idx_eps.values())) * 1000
+                spread_src = "index"
+            else:
+                spread = (s["t1"] - s["t0"]) * 1000
+                spread_src = "flight_log"
+            out = {"epoch": round(s["t0"], 3), "files": dict(s["have"]),
+                   "missing": [c for c in cams if c not in s["have"]],
+                   "spread_ms": round(spread, 2), "spread_src": spread_src,
+                   "srcs": srcs}
+            strobe_ep = next((r["strobe"] for r in members.values()
+                              if r and r.get("strobe") is not None), None)
+            if strobe_ep is not None:
+                windows = [(r["epoch"], r["rise"]) for r in members.values()
+                           if r and r.get("epoch") is not None
+                           and r.get("rise") is not None]
+                measured = (not out["missing"]
+                            and len(windows) == len(s["have"])
+                            and all(v == "gpio_edge" for v in srcs.values())
+                            and len(srcs) == len(s["have"]))
+                if measured:
+                    lo = max(w[0] for w in windows)
+                    hi = min(w[1] for w in windows)
+                    ok = lo <= strobe_ep <= hi
+                    margin = min(strobe_ep - lo, hi - strobe_ep) * 1000
+                    out["strobe"] = {"epoch": round(strobe_ep, 6), "ok": ok,
+                                     "margin_ms": round(margin, 2)}
+                else:
+                    out["strobe"] = {"epoch": round(strobe_ep, 6), "ok": None,
+                                     "margin_ms": None}
+            return out
+
+        full = [shot_view(s) for s in shots]
         gaps, complete = [], 0
-        for i, s in enumerate(shots):
-            missing = [c for c in cams if c not in s["have"]]
-            if not missing:
+        for i, (s, v) in enumerate(zip(shots, full)):
+            if not v["missing"]:
                 complete += 1
             elif len(gaps) < GAPS_MAX:
-                gaps.append({"i": i, "epoch": round(s["t0"], 3),
-                             "have": sorted(s["have"]), "missing": missing,
-                             "files": dict(s["have"]),
-                             "spread_ms": round((s["t1"] - s["t0"]) * 1000, 1)})
-        return {"cams": cams, "shots": len(shots), "complete": complete,
-                "incomplete": len(shots) - complete,
-                # The tail of the transect, with the actual filenames, so the
-                # browser can put the pair on screen side by side - during a
-                # live survey that is "show me what the last shot looks like on
-                # both cameras", which is the check nobody can do from a file
-                # listing.
-                "recent": [{"epoch": round(s["t0"], 3),
-                            "files": dict(s["have"]),
-                            "missing": [c for c in cams if c not in s["have"]],
-                            "spread_ms": round((s["t1"] - s["t0"]) * 1000, 1)}
-                           for s in shots[-12:]],
-                "gaps": gaps, "gaps_truncated": len(shots) - complete
-                > len(gaps), "tolerance_s": round(tol, 3),
-                # Every shot as one character, oldest first: '.' complete,
-                # a digit = how many cameras were missing. Cheap enough to send
-                # on every poll and it draws the whole transect at a glance.
-                "strip": "".join(
-                    "." if len(s["have"]) == len(cams)
-                    else str(min(9, len(cams) - len(s["have"])))
-                    for s in shots[-4000:])}
+                gaps.append({"i": i, "epoch": v["epoch"],
+                             "have": sorted(s["have"]),
+                             "missing": v["missing"],
+                             "files": v["files"],
+                             "spread_ms": v["spread_ms"]})
+        strobe_missed = sum(1 for v in full
+                            if (v.get("strobe") or {}).get("ok") is False)
+        summary = {"cams": cams, "shots": len(shots), "complete": complete,
+                   "incomplete": len(shots) - complete,
+                   # The tail of the transect, with the actual filenames, so
+                   # the browser can put the pair on screen side by side -
+                   # during a live survey that is "show me what the last shot
+                   # looks like on both cameras", which is the check nobody can
+                   # do from a file listing.
+                   "recent": full[-12:],
+                   "strobe_missed": strobe_missed,
+                   "gaps": gaps, "gaps_truncated": len(shots) - complete
+                   > len(gaps), "tolerance_s": round(tol, 3),
+                   # Every shot as one character, oldest first: '.' complete,
+                   # a digit = how many cameras were missing. Cheap enough to
+                   # send on every poll; draws the whole transect at a glance.
+                   "strip": "".join(
+                       "." if len(s["have"]) == len(cams)
+                       else str(min(9, len(cams) - len(s["have"])))
+                       for s in shots[-4000:])}
+        return summary, full
 
     def frame_path(self, run_id, cam, name):
         path = self.child(run_id, cam, name)
