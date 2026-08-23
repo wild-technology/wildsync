@@ -374,9 +374,13 @@ class NodeMonitor(threading.Thread):
         if pia_ok:
             # Prefer the HOST uptime (piagent 2026-08-23+): the service's own
             # uptime resets on every deploy and read as a power loss.
+            # HOST uptime only for the reboot test - never fall back to the
+            # SERVICE uptime (uptime_s), which resets on every deploy and would
+            # read as a power loss. If host_uptime_s is momentarily absent
+            # (older piagent, a truncated read), skip this tick rather than
+            # compare across the two different clocks and false-fire (audit
+            # 2026-08-23).
             up = health.get("host_uptime_s")
-            if up is None:
-                up = health.get("uptime_s")
             if isinstance(up, (int, float)):
                 if self._uptime is not None and up < self._uptime - 5:
                     rebooted = True
