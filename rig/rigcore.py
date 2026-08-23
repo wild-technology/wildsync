@@ -498,6 +498,10 @@ CONVERGE_FIELDS = {
     "filetype": ("filetype", None),
     "imagesize": ("imagesize", None),
     "transsize": ("transsize", None),
+    # RAW compression on the card (CrRAWFileCompressionType: 5 = LossLessL).
+    # Blind (no readback), converged from the last-pushed cache like the other
+    # format fields so both bodies write the same RAW and it survives a reboot.
+    "rawtype": ("rawtype", None),
     "store_dest": (None, "storeDest"),   # set via /api/store, read on storeDest
     # Focus MODE is fleet state (the rig is always MF - never AF, on any path),
     # so it converges like any other field: set via /api/focus/mode, read back on
@@ -571,6 +575,8 @@ DEFAULT_DESIRED = {
     # RAW is WB-agnostic either way — this pins the JPEG rendering.
     "wb_mode": 256,
     "colortemp": 5600,
+    # LossLessL RAW: full quality, ~30-35 MB/frame, drained between runs.
+    "rawtype": 5,
 }
 
 # Value bounds for the desired vector. Deliberately wide - the body's own choice
