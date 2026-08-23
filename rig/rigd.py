@@ -335,10 +335,17 @@ class Anomalies:
             # locks the whole table) or a half-dead SDK session — NOT ten
             # fields that each need attention. Say the one true thing and
             # hush the per-field divergence while it lasts.
+            # A locked property table (the card-stall aftermath): the body
+            # answers connected:true but GetSelectDeviceProperties returns
+            # nothing, so ilxctl emits an EMPTY writable map, iso collapses to
+            # "ISO 0"/isoValue 0, and slotWriting is unreported. Keying on
+            # iso in (None,"","?") never matched real hardware (audit
+            # 2026-08-23) - the body sends "ISO 0", not None.
             locked = (st == NodeMonitor.CONNECTED and status
-                      and not status.get("writable")
-                      and status.get("iso") in (None, "", "?")
-                      and status.get("slotWritingLabel") in (None, "unknown"))
+                      and not (status.get("writable") or {})
+                      and (status.get("isoValue") in (0, None)
+                           or status.get("iso") in ("ISO 0", "0", None, "", "?"))
+                      and status.get("slotWritingLabel") in (None, "unknown", ""))
             if locked:
                 out.append(self._a(
                     "body_locked", m.name_,
@@ -372,7 +379,13 @@ class Anomalies:
                                    "remote priority is still held",
                                    sev="bad"))
             # Camera health that ilxctl now reports and nothing consumed.
-            oh = status.get("overheatingLabel")
+            # ONLY when the node is genuinely CONNECTED and answering: a node
+            # that dropped OFFLINE mid-write keeps its last-good status showing
+            # WRITING/overheating, and firing card_write_stuck on that stale
+            # snapshot doubled up on node_offline/node_rebooted and sent the
+            # operator to reformat a card during a plain power loss (audit
+            # 2026-08-23).
+            oh = status.get("overheatingLabel") if st == NodeMonitor.CONNECTED else None
             if oh in ("pre-overheat", "OVERHEATING"):
                 out.append(self._a("camera_overheating", m.name_,
                                    "body overheating (%s)" % oh,
@@ -383,7 +396,7 @@ class Anomalies:
                                    "cycle, get air over the housing, or stop "
                                    "and cool it now",
                                    sev="bad" if oh == "OVERHEATING" else "warn"))
-            sw = status.get("slotWritingLabel")
+            sw = status.get("slotWritingLabel") if st == NodeMonitor.CONNECTED else None
             if sw == "WRITING":
                 since = self._writing_since.setdefault(m.name_, now)
                 held = now - since
@@ -717,8 +730,18 @@ class Rig:
                      if any(m.name_ == n and m.is_connected() for m in self.monitors)]
             if not nodes:
                 return {"ok": False, "error": "no connected node to drain"}
+            # Claim the nodes for the drain HERE, under the lock, before any
+            # run can observe them free: setting runmgr.draining/suspend only
+            # inside the worker thread left a window where RunManager.start saw
+            # draining=None and fired into a camera about to drop to transfer
+            # mode (audit 2026-08-23, TOCTOU). RunManager.start takes the same
+            # _drain_lock to check.
             self._drain_status = {"active": True, "node": nodes[0], "last": None,
                                   "queue": list(nodes)}
+            self.runmgr.draining = nodes[0]
+            for m in self.monitors:
+                if m.name_ in nodes:
+                    m.suspend_control = True
         threading.Thread(target=self._drain_worker, args=(nodes, keep),
                          daemon=True).start()
         return {"ok": True, "draining": nodes}
@@ -728,13 +751,9 @@ class Rig:
             host = next((m.host for m in self.monitors if m.name_ == node), None)
             if host is None:
                 continue
-            # Block runs on this node AND stop the monitor from reclaiming
-            # the camera in remote mode while the drain holds it in transfer
-            # mode.
+            # draining + suspend_control were claimed in start_drain under
+            # the lock; just point them at the current node.
             self.runmgr.draining = node
-            for m in self.monitors:
-                if m.name_ == node:
-                    m.suspend_control = True
             with self._drain_lock:
                 self._drain_status["node"] = node
             self.events.emit("info", "drain", "card drain started on %s" % node,
@@ -757,10 +776,12 @@ class Rig:
                                                      ("pulled", "bytes", "deleted",
                                                       "verified")},
                                                   "errors": len(rep["errors"])}
-                # hand the pulled RAWs to ingest (best-effort; never blocks)
+                # hand the pulled RAWs to ingest (best-effort; never blocks).
+                # Per-node staging dir - the drain writes ~/rig-raw/<node>/.
                 try:
                     import ingest
-                    ingest.ingest(self.DRAIN_DEST, log=lambda *a: None)
+                    ingest.ingest(os.path.join(self.DRAIN_DEST, node),
+                                  log=lambda *a: None)
                 except Exception as e:  # noqa: BLE001
                     self.events.emit("warn", "drain",
                                      "ingest after drain failed: %s" % e)

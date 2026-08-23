@@ -934,6 +934,30 @@ class RunManager:
                 return {"ok": False, "error": "card drain in progress on %s - "
                         "cannot start a run (the camera is in transfer mode)"
                         % self.draining}
+            monitors = list(self.monitors)
+        # Belt and braces beyond the draining flag: refuse if ANY connected
+        # node's body actually reports transfer control mode. A LIVE probe, not
+        # the ≤2 s-stale monitor cache: firing a transect into a transfer-mode
+        # body records nothing, so a fresh check is worth one HTTP per node at
+        # start (audit 2026-08-23, critical). Outside the lock - it does I/O.
+        stuck = []
+        for m in monitors:
+            st = http_json("http://%s:8080/api/status" % m.host, timeout=5)
+            if isinstance(st, dict) and st.get("controlMode") == "transfer":
+                stuck.append(m.name_)
+        with self._lock:
+            # Re-check under the lock: the probe released it, so a run or a
+            # drain could have started in the gap.
+            if self.active:
+                return {"ok": False, "error": "run already active",
+                        "run_id": self.active["run_id"]}
+            if getattr(self, "draining", None):
+                return {"ok": False, "error": "card drain in progress on %s"
+                        % self.draining}
+            if stuck:
+                return {"ok": False, "error": "%s in transfer mode (card "
+                        "drain / stuck session) - cannot shoot; wait for the "
+                        "drain or power-cycle" % ",".join(stuck)}
             # Latch the timebase for the whole run, before anything is named.
             time_off, time_src = self._live_time_base()
             now = time.time() + time_off
@@ -1148,7 +1172,7 @@ class RunManager:
         with self._lock:
             if not self.active:
                 return {"ok": False, "error": "no active run"}
-            self._stop_capture_loop()
+            self._stop_capture_loop()          # signals _cap_stop only
             if self._calib_stop:
                 # A stopped run must not keep firing calibration frames into a
                 # closed transect, and a calibration polling a node that has
@@ -1157,6 +1181,16 @@ class RunManager:
             self._calib_stop = None
             if self._adopt_stop:
                 self._adopt_stop.set()
+            cap_thread = self._cap_thread
+        # Join the capture LOOP before snapshotting `fired`: _stop_capture_loop
+        # only SETS the event, and a capture_once already dispatched but not
+        # yet counted would otherwise be missed by the fired snapshot and the
+        # grace wait below, dropping the final shot of the transect silently
+        # (audit 2026-08-23). Join outside the lock - the loop's in-flight
+        # capture threads call back into index_frame(), which takes it.
+        if cap_thread is not None:
+            cap_thread.join(timeout=6.0)
+        with self._lock:
             workers = dict(self.workers)
             fired = dict((self.active.get("fired") or {}))
         # A fire's frames take ~0.5-1.5 s to reach the node's spool (card

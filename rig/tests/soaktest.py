@@ -1759,8 +1759,11 @@ def suite_drain(opts):
         check("every RAW pulled verified its sha256",
               rep["pulled"] == n_card and not rep["errors"],
               json.dumps({k: rep[k] for k in ("pulled", "deleted", "errors")}))
-        check("verified files landed on the host",
-              all(os.path.exists(os.path.join(dest, nm)) for nm in rep["files"]),
+        # The drain writes to a PER-NODE subdir (dest/<node>) so the two
+        # bodies' colliding card filenames cannot overwrite each other.
+        check("verified files landed on the host (per-node subdir)",
+              all(os.path.exists(os.path.join(dest, "cam2", nm))
+                  for nm in rep["files"]),
               str(rep["files"][:3]))
         check("each pulled shot was deleted from the card",
               len(a.card) == 0, "%d left" % len(a.card))
@@ -1786,6 +1789,45 @@ def suite_drain(opts):
               r.get("ok") is False and "drain" in (r.get("error") or ""),
               json.dumps(r))
         env.runmgr.draining = None
+
+        # A body left in transfer mode (crashed drain) blocks a run even with
+        # the draining flag clear - the guard reads the observed control mode
+        # (audit 2026-08-23 critical).
+        a.label_override = {"controlMode": "transfer"}
+        env.tick()
+        r2 = env.runmgr.start({"label": "y"})
+        check("a run refuses to start into a body stuck in transfer mode",
+              r2.get("ok") is False and "transfer" in (r2.get("error") or ""),
+              json.dumps(r2))
+        a.label_override = {}
+        env.tick()
+
+        # Two bodies with COLLIDING card filenames must never let one overwrite
+        # or delete the other's original: per-node subdirs keep them apart.
+        b = env.node("cam3")
+        with a._lock:
+            a.card = {900: {2: ("DSC00042.ARW", b"AAA" * 5000, RAW := 0xB101)}}
+        with b._lock:
+            b.card = {900: {2: ("DSC00042.ARW", b"BBB" * 5000, 0xB101)}}
+        from fakenode import loopback_map
+        reps = {}
+        for name in ("cam2", "cam3"):
+            nd = env.node(name)
+            h, port = loopback_map("127.0.0.%d" % (2 if name == "cam2" else 3), 8080)
+            d2 = draindrv.Drainer(name, "%s:%d" % (h, port), dest=dest, log=lambda *a: None)
+            d2.base = "http://%s:%d" % (h, port)
+            reps[name] = d2.run()
+        import hashlib
+        p2 = os.path.join(dest, "cam2", "DSC00042.ARW")
+        p3 = os.path.join(dest, "cam3", "DSC00042.ARW")
+        check("colliding card names land in separate per-node files",
+              os.path.exists(p2) and os.path.exists(p3)
+              and open(p2, "rb").read() != open(p3, "rb").read(),
+              "%s vs %s" % (p2, p3))
+        check("neither camera's original was deleted unverified",
+              reps["cam2"]["deleted"] == 1 and reps["cam3"]["deleted"] == 1
+              and not reps["cam2"]["errors"] and not reps["cam3"]["errors"],
+              json.dumps({k: reps[k]["errors"] for k in reps}))
     finally:
         env.close()
 

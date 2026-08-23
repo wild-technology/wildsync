@@ -419,6 +419,24 @@ class NodeMonitor(threading.Thread):
             self._set_state(self.CONNECTED if bool(status.get("connected"))
                             else self.REACHABLE)
             return
+        # A body left in RemoteTransfer mode with NO drain holding it (a crashed
+        # drain, or a rigd restart mid-drain) reports connected:true but CANNOT
+        # shoot. Do not call it CONNECTED - a run would fire into it and record
+        # nothing (audit 2026-08-23, critical). Recover it: switch it back to
+        # remote once, with backoff, and hold it REACHABLE until it is.
+        if status.get("controlMode") == "transfer":
+            self._set_state(self.REACHABLE)
+            now = time.time()
+            if now >= self._connect_after:
+                self.events.emit("warn", "recover",
+                                 "%s stuck in transfer mode with no drain - "
+                                 "restoring remote (shooting) mode"
+                                 % self.name_, node=self.name_)
+                http_json(self.ilx + "/api/card/mode", body={"mode": "remote"},
+                          timeout=90)
+                self._backoff = min(self._backoff * 1.6, 60.0)
+                self._connect_after = now + self._backoff
+            return
         connected = bool(status.get("connected"))
         if connected:
             self._set_state(self.CONNECTED)

@@ -1982,6 +1982,11 @@ std::string Camera::statusJson() {
         emitNum("menuStatus", menuStatus);
         emitStr("menuLabel", formatMenuStatus(menuStatus));
         emitNum("sdkControlMode", sdkCtlMode);
+        // The host-side authoritative control mode (m_mode, set synchronously
+        // on connect) - not the SDK property above, which can lag. The drain
+        // and the monitor gate on this string.
+        emitStr("controlMode", m_mode == SDK::CrSdkControlMode_RemoteTransfer
+                                    ? "transfer" : "remote");
         os << ",\"writable\":{";
         for (size_t i = 0; i < flags.size(); ++i) {
             if (i) os << ",";
