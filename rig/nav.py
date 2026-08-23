@@ -229,6 +229,47 @@ def parse_pdgy(line):
     return (full["pgn"], full["data"])
 
 
+# Recognition names for the bus-sniffing table (/api/nav/all). Decoding is
+# untouched — these only label what is SEEN so unknown traffic stands out.
+# Proprietary ranges matter most: that is where a sonar's private data lives.
+PGN_NAMES = {
+    59392: "ISO Acknowledgement", 59904: "ISO Request",
+    60160: "ISO TP Data", 60416: "ISO TP Connection",
+    60928: "ISO Address Claim", 65240: "ISO Commanded Address",
+    126208: "NMEA Group Function", 126464: "PGN List",
+    126720: "Proprietary fast-packet (addressed)",
+    126992: "System Time", 126993: "Heartbeat",
+    126996: "Product Information", 126998: "Configuration Information",
+    127245: "Rudder", 127250: "Vessel Heading", 127251: "Rate of Turn",
+    127252: "Heave", 127257: "Attitude", 127258: "Magnetic Variation",
+    127488: "Engine Rapid", 127489: "Engine Dynamic",
+    127505: "Fluid Level", 127508: "Battery Status",
+    128259: "Speed (water referenced)", 128267: "Water Depth",
+    128275: "Distance Log",
+    129025: "Position Rapid", 129026: "COG & SOG Rapid",
+    129029: "GNSS Position", 129033: "Time & Date",
+    129283: "Cross Track Error", 129284: "Navigation Data",
+    129285: "Route/WP Information",
+    129539: "GNSS DOPs", 129540: "GNSS Sats in View",
+    130306: "Wind Data", 130310: "Environmental (obsolete)",
+    130311: "Environmental Parameters", 130312: "Temperature",
+    130313: "Humidity", 130314: "Actual Pressure",
+    130316: "Temperature Extended", 130576: "Trim Tab Status",
+    130577: "Direction Data",
+}
+
+
+def pgn_name(pgn):
+    n = PGN_NAMES.get(pgn)
+    if n:
+        return n
+    if 61184 <= pgn <= 61439 or 65280 <= pgn <= 65535:
+        return "PROPRIETARY single-frame (manufacturer)"
+    if 130816 <= pgn <= 131071:
+        return "PROPRIETARY fast-packet (manufacturer)"
+    return "unknown"
+
+
 def parse_pdgy_full(line):
     """Like parse_pdgy but returns {'pgn','prio','src','dst','timer','data'}
     for data lines, None otherwise.  Never raises."""
@@ -712,6 +753,28 @@ def list_serial_candidates():
     """Every USB serial device visible, with enough detail to tell the
     iKonvert (FTDI FT232R) apart from the Yahboom IMU (CH340)."""
     out = []
+    if sys.platform == "darwin":
+        # macOS has no /dev/serial/by-id. The Apple/FTDI VCP driver names the
+        # port /dev/cu.usbserial-<iSerial> — this rig's gateway enumerates as
+        # cu.usbserial-B400BIHV — and the CH340 IMU lands on cu.wchusbserial*.
+        # Identify by those names; the iSerial match stays the authority.
+        for path in sorted(glob.glob("/dev/cu.*")):
+            name = os.path.basename(path)
+            low = name.lower()
+            if "bluetooth" in low or "debug" in low:
+                continue
+            serial_no = name.split("-", 1)[1] if "-" in name else None
+            if "wchusbserial" in low:
+                kind = "ch340 (IMU?)"
+            elif serial_no and serial_no == IKONVERT_SERIAL_NO:
+                kind = "ikonvert?"
+            elif "usbserial" in low and not IKONVERT_SERIAL_NO:
+                kind = "ikonvert?"
+            else:
+                kind = "other"
+            out.append({"by_id": path, "dev": path, "kind": kind,
+                        "serial_no": serial_no})
+        return out
     for path in sorted(glob.glob(os.path.join(_BY_ID_DIR, "*"))):
         try:
             target = os.path.realpath(path)
@@ -874,9 +937,20 @@ def probe_gateway(port=None, bauds=(IKONVERT_BAUD, 115200, 38400, 4800),
 def _probe_write(ser, cmd):
     try:
         ser.write((cmd + "\r\n").encode("ascii"))
-        ser.flush()
+        _drain(ser)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _drain(ser):
+    """flush() (tcdrain) — except on macOS, where tcdrain on a pty whose
+    master is not being read blocks FOREVER in the kernel (Linux ptys return
+    immediately). The offline suites drive NavReader over ptys, so a bare
+    flush() deadlocks navtest on a Mac before its first assertion. The write
+    itself has already been handed to the kernel; drain is only a nicety."""
+    if sys.platform == "darwin":
+        return
+    ser.flush()
 
 
 def _probe_listen(ser, secs):
@@ -952,6 +1026,7 @@ class NavReader:
     RAPID_STALE_S = 3.0     # 129025, 129026, 127250, 127257
     SLOW_STALE_S = 10.0     # 129029, 126992, 128267, 130306
     INIT_RETRY_S = 3.0
+    OFFBUS_REINIT_S = 10.0  # alive-but-off-bus: re-send INIT,ALL this often
     ONLINE_S = 10.0         # no line for this long => gateway_online False
     HISTORY_S = 300.0       # per-PGN ring depth, seconds
     HISTORY_N = 4096        # per-PGN ring depth, samples
@@ -978,10 +1053,23 @@ class NavReader:
         self._lock = threading.Lock()
         self._latest = {}          # pgn -> (local_epoch, decoded_dict)
         self._hist = {}            # pgn -> deque[(local_epoch, decoded_dict)]
+        # EVERY PGN seen on the bus, decoded or not — the sniffing surface.
+        # A device this driver has never heard of (a sonar, a proprietary
+        # sensor) still shows up here with its raw payload, source address,
+        # rate and age, instead of being silently dropped at decode_pgn().
+        self._bus = {}             # pgn -> {"n","first","last","src","dst",
+        #                                    "prio","raw","times":deque}
         self._seen_pdgy = False    # have we EVER seen a PDGY line
         self._last_rx = None       # local epoch of the last line from the port
         self._last_init_tx = 0.0
         self._last_status_line = None
+        # True while the gateway reports the empty 000000 status: powered and
+        # talking to us but NOT joined to the N2K bus. Legitimate only for a
+        # beat after our own N2NET_OFFLINE; persisting means the INIT,ALL that
+        # follows it was lost, and the reader must re-send it or the gateway
+        # sits commanded-off-bus forever while looking "online".
+        self._offbus = False
+        self._join_backoff = 10.0    # doubles to 60 s; reset on real traffic
         self._last_error = None
         self._line_count = 0
         self._data_count = 0
@@ -1121,10 +1209,17 @@ class NavReader:
         if ser is None:
             return
         ser.write((cmd + "\r\n").encode("ascii"))
-        ser.flush()
+        _drain(ser)      # NOT flush(): tcdrain deadlocks on macOS ptys
 
     def _send_init(self):
-        """OFFLINE (clean state) -> INIT,ALL.  See module docstring."""
+        """OFFLINE (clean state) -> INIT,ALL.  See module docstring.
+
+        Full sequence — for port open and a genuinely silent gateway ONLY.
+        Never use this to re-JOIN an alive-but-off-bus gateway: the leading
+        OFFLINE knocks its bus interface down again on every retry, which
+        strobes the unit's LEDs and can mute it long enough to trip the
+        3 s silent-gateway retry into a permanent reset loop (observed live
+        2026-08-20: all LEDs flashing once per ~3 s on a powered stub)."""
         try:
             self._tx("$PDGY,N2NET_OFFLINE")
             time.sleep(0.3)
@@ -1132,6 +1227,17 @@ class NavReader:
         except Exception as exc:  # noqa: BLE001
             self._last_error = "init write failed: %s" % exc
         self._last_init_tx = time.time()
+
+    def _send_join(self):
+        """INIT,ALL alone — rejoin the bus WITHOUT the OFFLINE knock-down,
+        with exponential backoff so a bare powered stub is asked gently
+        (10 s, 20 s, 40 s, then every 60 s) instead of strobed forever."""
+        try:
+            self._tx("$PDGY,N2NET_INIT,ALL")
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = "join write failed: %s" % exc
+        self._last_init_tx = time.time()
+        self._join_backoff = min(60.0, self._join_backoff * 2.0)
 
     # -- reader thread ------------------------------------------------------
 
@@ -1179,6 +1285,13 @@ class NavReader:
             if not self.gateway_online \
                     and now - self._last_init_tx > self.INIT_RETRY_S:
                 self._send_init()
+            elif self._offbus \
+                    and now - self._last_init_tx > self._join_backoff:
+                # Alive but off-bus: the join was lost, or the backbone is
+                # genuinely absent (a powered stub). Ask again with INIT,ALL
+                # ONLY — no OFFLINE first — and back off, so a stub with no
+                # backbone is nudged occasionally, never strobed.
+                self._send_join()
         if buf:
             self._flush_partial(buf)
 
@@ -1206,12 +1319,33 @@ class NavReader:
                 self._seen_pdgy = True
             if kind in ("status", "status_offbus"):
                 self._last_status_line = line
+                self._offbus = (kind == "status_offbus")
+                if kind == "status":
+                    self._join_backoff = 10.0    # on a real bus again
             elif kind == "nak":
                 self._last_error = "gateway NAK: %s" % line
             elif kind is None:
                 self._bad_line_count += 1
             return
         self._seen_pdgy = True
+        # Record EVERY data line into the bus table before deciding whether we
+        # know how to decode it: hidden traffic is only hidden until listed.
+        with self._lock:
+            ent = self._bus.get(full["pgn"])
+            if ent is None:
+                if len(self._bus) < 512:      # a real bus holds a few dozen
+                    ent = self._bus[full["pgn"]] = {
+                        "n": 0, "first": now,
+                        "src": set(), "dst": full["dst"],
+                        "prio": full["prio"], "raw": b"",
+                        "times": collections.deque(maxlen=12)}
+            if ent is not None:
+                ent["n"] += 1
+                ent["last"] = now
+                if len(ent["src"]) < 8:
+                    ent["src"].add(full["src"])
+                ent["raw"] = full["data"]
+                ent["times"].append(now)
         decoded = decode_pgn(full["pgn"], full["data"])
         if decoded is None:
             return
@@ -1453,6 +1587,41 @@ class NavReader:
                     ("epoch", "local_epoch", "nav_epoch", "age_s", "valid",
                      "stale", "time_source", "gateway_online")})
         return row
+
+    def bus_table(self):
+        """Every PGN observed on the bus — decoded or not — with source
+        address, rate, AGE and the raw payload. The sniffing surface: a device
+        this driver has never heard of still lists here, raw, instead of
+        vanishing at decode_pgn()."""
+        now = time.time()
+        with self._lock:
+            items = [(pgn, {"n": e["n"], "first": e["first"],
+                            "last": e.get("last", e["first"]),
+                            "src": sorted(e["src"]), "dst": e["dst"],
+                            "prio": e["prio"], "raw": e["raw"],
+                            "times": list(e["times"])})
+                     for pgn, e in self._bus.items()]
+            latest = {p: dict(d) for p, (t, d) in self._latest.items()}
+        out = []
+        for pgn, e in sorted(items):
+            t = e["times"]
+            hz = ((len(t) - 1) / (t[-1] - t[0])
+                  if len(t) >= 2 and t[-1] > t[0] else None)
+            raw = e["raw"]
+            out.append({
+                "pgn": pgn, "name": pgn_name(pgn),
+                "decoded": pgn in latest,
+                "fields": latest.get(pgn),
+                "src": e["src"], "dst": e["dst"], "prio": e["prio"],
+                "count": e["n"],
+                "hz": round(hz, 2) if hz else None,
+                "age_s": round(now - e["last"], 2),
+                "bytes": len(raw) if raw else 0,
+                "raw_hex": (raw.hex() if isinstance(raw, (bytes, bytearray))
+                            else None),
+            })
+        return {"present": True, "now": now, "pgns": out,
+                "health": self.health()}
 
     def health(self):
         """Everything rigd needs to explain nav's state in /api/diag."""

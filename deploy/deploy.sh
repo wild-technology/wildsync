@@ -12,14 +12,20 @@
 
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-declare -A NODE_IP=( [cam1]=192.168.1.201 [cam2]=192.168.1.202 [cam3]=192.168.1.203 )
+# Node addresses. A plain case, not an associative array: the rigd host is a
+# Mac now, and macOS ships bash 3.2, which has no `declare -A` (the old form
+# died with "cam1: unbound variable" under set -u).
 
 # Sony's USB bulk-transfer buffer. The Linux default of 16 MB drops the session
 # mid-frame on large transfers; Sony's own guidance is 150 MB.
 USBFS_MB=150
 
 _ip() {
-  local ip="${NODE_IP[$1]:-}"
+  local ip=""
+  case "$1" in
+    cam1) ip=192.168.1.201;;
+    cam2) ip=192.168.1.202;;
+  esac
   [ -n "$ip" ] || { echo "unknown node '$1'" >&2; return 1; }
   echo "$ip"
 }
@@ -96,7 +102,8 @@ echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | \
 sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=gpio || true
 sudo cp /tmp/piagent.service /etc/systemd/system/piagent.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now piagent
+sudo systemctl enable piagent
+sudo systemctl restart piagent   # enable --now is a no-op on a running unit: the new file was never loaded
 sudo systemctl restart ilxctl 2>/dev/null || \
   echo "  note: ilxctl.service not installed here — see docs/HANDOFF.md"
 sleep 4
@@ -118,6 +125,6 @@ case "${1:-}" in
   provision) provision_node "${2:?usage: deploy.sh provision <camN>}";;
   node)      deploy_node "${2:?usage: deploy.sh node <camN>}";;
   jetson)    deploy_jetson;;
-  all)       for n in cam1 cam2 cam3; do deploy_node "$n"; done; deploy_jetson;;
+  all)       for n in cam1 cam2; do deploy_node "$n"; done; deploy_jetson;;
   *) echo "usage: $0 {provision <camN>|node <camN>|jetson|all}"; exit 1;;
 esac

@@ -1,0 +1,35 @@
+#cloud-config
+# Wild Sync node re-provision (macOS host replaces the Jetson), 2026-08-23.
+#
+# Drop this on a node's system-boot partition as `user-data` together with a
+# NEW instance-id in `meta-data` (see install.sh). cloud-init re-runs its
+# per-instance modules on the next boot and:
+#   * adds the Mac host's SSH key alongside the Jetson's (password unchanged);
+#   * re-points chrony: the Jetson master (192.168.1.166) is gone, so the two
+#     nodes now peer each other in orphan mode — a sub-ms mutual lock with no
+#     upstream at sea, and the Ubuntu pool whenever internet is present.
+# Hostname is preserved and no packages are touched or upgraded.
+#
+# Placeholders (install.sh fills them from the card itself and ~/.ssh):
+#   __PASSWD_HASH__   the existing `passwd:` value on the card (unchanged)
+#   __JETSON_KEY__    the existing ssh-ed25519 line on the card (kept)
+#   __MAC_KEY__       this Mac's ~/.ssh/id_ed25519.pub
+preserve_hostname: true
+ssh_deletekeys: false
+users:
+  - name: ubuntu
+    gecos: wildsync camera node
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    passwd: __PASSWD_HASH__
+    groups: [adm, sudo, plugdev, video, dialout, gpio, i2c, spi]
+    ssh_authorized_keys:
+      - __JETSON_KEY__
+      - __MAC_KEY__
+ssh_pwauth: true
+chpasswd:
+  expire: false
+runcmd:
+  # Peer the two nodes; whichever this is, the other is its server.
+  - [ bash, -c, "h=$(hostname); if [ \"$h\" = pi-cam1 ]; then peer=192.168.1.202; else peer=192.168.1.201; fi; printf 'server %s iburst minpoll 4 maxpoll 6\\nlocal stratum 10 orphan\\nallow 192.168.1.0/24\\nmakestep 1.0 3\\n' $peer > /etc/chrony/conf.d/10-jetson.conf; systemctl restart chrony; echo \"resync $(date -Is) peer=$peer\" >> /var/lib/wildsync/.provisioned" ]

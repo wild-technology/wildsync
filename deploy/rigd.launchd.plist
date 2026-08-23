@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd agent for rigd on a macOS host — the systemd unit's equivalent
+     (deploy/rigd.service is the Jetson twin). Install:
+
+       sed "s|__REPO__|$(pwd)|g; s|__HOME__|$HOME|g" deploy/rigd.launchd.plist \
+         > ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
+       launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
+
+     Manage:
+       launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd   # restart
+       launchctl bootout   gui/$(id -u)/org.wildtechnology.wildsync.rigd     # stop+remove
+
+     KeepAlive gives the same crash-restart discipline as Restart=always;
+     rigd finalises an active run on SIGTERM either way. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.wildtechnology.wildsync.rigd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-u</string>
+    <string>__REPO__/rig/rigd.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__/rig</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Interactive exempts rigd from App Nap / timer coalescing. As a default
+       background agent, sleeps between shots wake LATE: measured 2026-08-20,
+       a 2 s capture cadence ran 99/141 shots late (35.5 ms interval jitter)
+       while a 0.5 s cadence — sleeps too short to coalesce — ran 14/337 late
+       (6.1 ms). The capture scheduler needs real-time-ish wakeups. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>ThrottleInterval</key>
+  <integer>3</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/rig/rigd-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/rig/rigd-launchd.log</string>
+</dict>
+</plist>
