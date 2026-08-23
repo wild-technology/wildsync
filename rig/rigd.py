@@ -307,17 +307,19 @@ class Anomalies:
                     "POST /api/spool/prune on the node to recover",
                     sev="bad" if cf > 800 else "warn"))
             pw = h.get("power") or {}
-            if pw.get("undervolt_now") or pw.get("undervolt_since_boot"):
+            # Only alarm on under-voltage happening NOW. The since-boot bit
+            # LATCHES until reboot, so alarming on it kept a permanent warning
+            # up after a single momentary sag and trained the operator to
+            # ignore the pill (audit 2026-08-23). The since-boot history is in
+            # /health for anyone who looks.
+            if pw.get("undervolt_now"):
                 out.append(self._a(
                     "node_undervoltage", m.name_,
-                    "%s reports %s" % (m.name_, "UNDER-VOLTAGE NOW"
-                                       if pw.get("undervolt_now")
-                                       else "an under-voltage since boot"),
+                    "%s UNDER-VOLTAGE NOW" % m.name_,
                     {"throttled": pw.get("throttled")},
                     "the PoE port/cable is sagging under load: this is the "
                     "step before the node reboots mid-run. Fix the power "
-                    "budget before a survey",
-                    sev="bad" if pw.get("undervolt_now") else "warn"))
+                    "budget before a survey", sev="bad"))
             rb = getattr(m, "rebooted_at", None)
             if rb and now - rb < 600:
                 out.append(self._a(
@@ -747,6 +749,7 @@ class Rig:
         return {"ok": True, "draining": nodes}
 
     def _drain_worker(self, nodes, keep):
+      try:
         for node in nodes:
             host = next((m.host for m in self.monitors if m.name_ == node), None)
             if host is None:
@@ -793,6 +796,13 @@ class Rig:
                 for m in self.monitors:
                     if m.name_ == node:
                         m.suspend_control = False
+      finally:
+        # Whatever happened (an exception before the per-node try, a host
+        # lookup miss), release the drain claim so a leaked active flag can
+        # never block every future drain and run (audit 2026-08-23).
+        self.runmgr.draining = None
+        for m in self.monitors:
+            m.suspend_control = False
         with self._drain_lock:
             self._drain_status["active"] = False
             self._drain_status["node"] = None
