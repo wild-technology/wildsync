@@ -292,6 +292,20 @@ class Anomalies:
                     "own timestamps are wrong - the rig's edge times and "
                     "the ingest sidecars are unaffected",
                     sev="warn"))
+            # Pi spool not draining: delete-after-pull frees each frame's
+            # PC-save copy the moment it is on host disk, so cam_frames should
+            # stay small during a run. A climbing count means deletes are
+            # failing (read-only spool, permission) and the Pi WILL fill.
+            cf = h.get("cam_frames")
+            if isinstance(cf, (int, float)) and cf > 400 and run.get("active"):
+                out.append(self._a(
+                    "spool_not_draining", m.name_,
+                    "%s PC-save spool holds %d files during a run" % (m.name_, cf),
+                    {"cam_frames": cf, "disk_free_mb": h.get("disk_free_mb")},
+                    "frames are not being deleted after pull - the Pi will "
+                    "fill. Check the spool is writable; run "
+                    "POST /api/spool/prune on the node to recover",
+                    sev="bad" if cf > 800 else "warn"))
             pw = h.get("power") or {}
             if pw.get("undervolt_now") or pw.get("undervolt_since_boot"):
                 out.append(self._a(

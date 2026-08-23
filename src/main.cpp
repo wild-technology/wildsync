@@ -593,18 +593,30 @@ int main(int argc, char** argv) {
         }
         g_cam.disconnect();
         std::string err;
-        const auto cams = g_cam.enumerate(3);
-        int pick = -1;
-        for (std::size_t i = 0; i < cams.size(); ++i)
-            if (camMatch.empty() || cams[i].id.find(camMatch) != std::string::npos ||
-                cams[i].model.find(camMatch) != std::string::npos) { pick = static_cast<int>(i); break; }
-        if (pick < 0) {
-            fail(res, "no camera found to reconnect in " + mode + " mode", 503);
-            return;
-        }
-        if (!g_cam.connect(pick, err, m)) {
-            fail(res, err, 503);
-            return;
+        if (m == SDK::CrSdkControlMode_RemoteTransfer) {
+            // Bare connect in transfer mode: no PC-save setup (it cannot shoot).
+            const auto cams = g_cam.enumerate(3);
+            int pick = -1;
+            for (std::size_t i = 0; i < cams.size(); ++i)
+                if (camMatch.empty() || cams[i].id.find(camMatch) != std::string::npos ||
+                    cams[i].model.find(camMatch) != std::string::npos) { pick = static_cast<int>(i); break; }
+            if (pick < 0) {
+                fail(res, "no camera found to reconnect in transfer mode", 503);
+                return;
+            }
+            if (!g_cam.connect(pick, err, m)) {
+                fail(res, err, 503);
+                return;
+            }
+        } else {
+            // Back to remote: the FULL connect path, so PC-save (setSaveDir +
+            // PC priority) is restored. A bare connect() here left the body
+            // connected with no save directory and every frame silently failed
+            // to deliver (observed 2026-08-23).
+            if (!doConnect(err)) {
+                fail(res, err, 503);
+                return;
+            }
         }
         ok(res, "\"mode\":\"" + mode + "\"");
     });
