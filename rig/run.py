@@ -191,6 +191,8 @@ class PullWorker(threading.Thread):
         self.retries = 0
         self.skipped_cal = 0              # calibration exposures kept out
         self.orphans = 0                  # fires that produced no frame
+        self.dumped = 0                   # Pi spool copies deleted after pull
+        self.dump_fails = 0               # deletes that did not take
         self._last_cap = None
         # Expected exposure instants, oldest first. A list, not a deque, because
         # note_command inserts in TARGET order: it is called from the per-node
@@ -473,6 +475,22 @@ class PullWorker(threading.Thread):
         except OSError as e:
             return fail("error", "write %s failed: %s" % (fname, e))
         self.pulled += 1
+        # Dump the Pi's spool copy the instant the frame is verified on host
+        # disk (size + JPEG SOI/EOI checked above): the survey delivers a
+        # small JPEG per shot and, unpruned, the Pi's PC-save dir fills over a
+        # long dive. The RAW stays on the camera's card (drained between runs);
+        # only the host copy is authoritative, and it is already written. A
+        # delete that does not take is counted, not retried inline - the disk
+        # guard below escalates if the spool stops draining.
+        try:
+            dr = http_json("http://%s:8080/api/shots/delete" % self.mon.host,
+                           {"confirm": "delete", "name": name}, timeout=5)
+            if dr.get("ok"):
+                self.dumped += 1
+            else:
+                self.dump_fails += 1
+        except Exception:  # noqa: BLE001
+            self.dump_fails += 1
         with self._lock:
             if self._last_cap is not None:
                 self.intervals.append(epoch - self._last_cap)
@@ -683,6 +701,7 @@ class PullWorker(threading.Thread):
                 "retrying": len(self._pending), "retries": self.retries,
                 "skipped_calibration": self.skipped_cal,
                 "orphan_fires": self.orphans, "queued_commands": queued,
+                "dumped": self.dumped, "dump_fails": self.dump_fails,
                 "last_capture": self._last_cap,
                 "interval_mean_s": round(st.mean(iv), 3) if iv else None,
                 "interval_jitter_ms": round(jit, 1) if jit else None}
