@@ -188,6 +188,9 @@ private:
     // OnConnected from that same attempt is ignored rather than resurrecting a
     // dead session (connected==true while m_handle==0).
     std::atomic<bool> m_attemptAbandoned{false};
+    // True from just before SDK::Connect until the attempt concludes; lets
+    // statusJson answer without the SDK mutex while a connect blocks.
+    std::atomic<bool> m_connecting{false};
     // Re-claims PC control priority after a spontaneous SDK reconnect; joined in
     // disconnect() so it never calls into a released SDK core at shutdown.
     std::thread m_priorityThread;
