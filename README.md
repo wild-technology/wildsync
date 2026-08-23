@@ -106,6 +106,25 @@ State on disk:
 
 ## Dependencies
 
+**rigd host.** `rigd` runs on the Jetson **or on macOS** (ported 2026-08-20;
+Python 3.14 works). Same code, three host differences to know:
+
+- the offline suites run everywhere — on macOS the fakes map their
+  `127.0.0.x` aliases to per-process `127.0.0.1` ports automatically
+  (`fakenode.loopback_map`), and nav's `tcdrain` deadlock on Mac ptys is
+  guarded (`nav._drain`);
+- the iKonvert resolves as `/dev/cu.usbserial-<iSerial>` on macOS and
+  `/dev/serial/by-id/...` on Linux, both handled by `nav.py`;
+- **the Pis lose their chrony master when the Jetson leaves the topology.**
+  Free-running they measured 16.8 ms apart — outside the 10 ms pair budget,
+  and invisible in the rig's own skew figures (fires and edges live on the
+  node clocks). rigd now samples node clocks every poll and raises
+  `node_clock_skew`; point both nodes' chrony at ONE reachable master before
+  trusting a survey.
+
+`rig/tests/devrig.py` runs the full rigd + web UI against two in-process fake
+cameras for hardware-free UI work, on any host.
+
 **Jetson (`rigd`):** Python 3.12, `python3-serial` (nav), **`python3-pil`**.
 
 Pillow is easy to miss and fails quietly — it backs the EXIF fallback for a
@@ -147,6 +166,15 @@ deploy/deploy.sh jetson            # install rigd here
 ```
 
 Then open `http://<jetson>:9090`.
+
+On a **macOS host**, rigd installs as a launchd agent instead (KeepAlive =
+the same crash-restart discipline as `Restart=always`):
+
+```sh
+sed "s|__REPO__|$(pwd)|g; s|__HOME__|$HOME|g" deploy/rigd.launchd.plist \
+  > ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
+```
 
 `deploy.sh node` ships `src/*`, `rig/piagent.py` and `rig/imu_yb.py`, rebuilds
 `ilxctl` on the node and restarts both services. It does **not** ship `rigd` —

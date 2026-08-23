@@ -144,6 +144,24 @@ def _install_netguard():
                         getattr(url, "full_url", "")).hostname or ""
         return host.startswith("127.")
 
+    def _remap(url):
+        # Fakes on hosts without loopback aliases (macOS) listen on 127.0.0.1
+        # with per-node ports; rewrite outgoing URLs with the same mapping the
+        # fake used to bind. Identity on Linux. The guard above always judges
+        # the NOMINAL address, so nothing off-loopback can slip through here.
+        if not isinstance(url, str):
+            return url
+        import fakenode as _fk
+        u = urlparse(url)
+        host, port = u.hostname or "", u.port
+        if port is None or not host.startswith("127.") or host == "127.0.0.1":
+            return url
+        h2, p2 = _fk.loopback_map(host, port)
+        if (h2, p2) == (host, port):
+            return url
+        return url.replace("//%s:%d" % (host, port),
+                           "//%s:%d" % (h2, p2), 1)
+
     def _wrap(fn, label):
         def w(url, *a, **kw):
             if not _ok(url):
@@ -151,7 +169,7 @@ def _install_netguard():
                 raise AssertionError(
                     "soaktest netguard: refused %s call to %s (fakes only)"
                     % (label, url))
-            return fn(url, *a, **kw)
+            return fn(_remap(url), *a, **kw)
         return w
 
     _real_urlopen = urllib.request.urlopen
@@ -549,12 +567,33 @@ def suite_monitor(opts):
         node.set_fault("ilx", badjson=True)
         env.tick()
         check("malformed status JSON does not raise out of the monitor",
-              m.state in (m.OFFLINE, m.REACHABLE), m.state)
-        note("a node emitting malformed JSON is classified OFFLINE "
-             "(rigcore.py:167 folds every non-HTTP error into _unreachable), so "
-             "the operator is told 'check power/network' for a software fault")
+              m.state in (m.OFFLINE, m.REACHABLE, m.ILX_DOWN), m.state)
         node.clear_faults()
         env.tick()
+
+        # --- ilxctl wedged while piagent is fine -> ILX_DOWN, no connects ---
+        # cam2 2026-08-23: ilxctl stuck inside an SDK call after a live-view
+        # storm. The old classification (REACHABLE, "camera not claimed")
+        # POSTed /api/connect every backoff, stranding one ilxctl HTTP worker
+        # per attempt, and the stale cached status kept reporting
+        # connected:true so the UI kept asking for live view.
+        env.tick()
+        node.clear_counts()
+        node.set_fault("ilx", hang_s=8.0)
+        env.tick(3)
+        check("ilxctl hung + piagent up -> ILX_DOWN, not REACHABLE",
+              m.state == m.ILX_DOWN, m.state)
+        check("no /api/connect is POSTed at a wedged ilxctl",
+              node.count("POST /api/connect") == 0, str(node.count("POST /api/connect")))
+        snap = m.snapshot()
+        check("the cached status is marked stale and NOT connected",
+              snap["status"].get("connected") is False
+              and snap["status"].get("ilx_down") is True
+              and not m.is_connected(), json.dumps(snap["status"])[:120])
+        node.clear_faults()
+        env.tick(2)
+        check("ilxctl answering again -> CAM_CONNECTED without a restart",
+              m.state == m.CONNECTED, m.state)
         check("monitor recovers after malformed JSON", m.state == m.CONNECTED)
 
         # --- slow / hung node ----------------------------------------------
@@ -668,11 +707,42 @@ def suite_settings(opts):
               and want["aperture"] == 800 and want["store_dest"] == 3)
 
         # --- knocked out of sync -------------------------------------------
-        a.drift(iso=3200, shutter=(1 << 16) | 60, aperture=400, store_dest=2)
+        # Exposure is per-camera between explicit applies (the operator may
+        # deliberately balance the two bodies), so the idle reconcile corrects
+        # NON-exposure fields only and reports an exposure split as
+        # information, never a fault. First consume the one forced exposure
+        # pass every monitor arms on its OFFLINE->CAM_CONNECTED transition.
+        S.reconcile_all(force=False)
+        env.tick()
+        a.drift(store_dest=2)
         env.tick()
         S.reconcile_all(force=False)
         env.tick()
-        check("a hand-nudged camera is pulled back to desired",
+        check("a hand-nudged NON-exposure field is pulled back to desired",
+              a.raw("store_dest") == want["store_dest"],
+              "store=%s" % a.raw("store_dest"))
+        # NOTE a store_dest/drive revert doubles as the in-pass reboot tell and
+        # deliberately re-forces exposure; a genuine per-camera exposure change
+        # touches exposure fields alone, which is what must survive.
+        a.drift(iso=3200, shutter=(1 << 16) | 60, aperture=400)
+        env.tick()
+        S.reconcile_all(force=False)
+        env.tick()
+        check("a per-camera exposure change SURVIVES the idle reconcile",
+              a.raw("iso") == 3200 and a.raw("aperture") == 400,
+              "iso=%s aperture=%s (must stay the operator's values)"
+              % (a.raw("iso"), a.raw("aperture")))
+        S.reconcile_all(force=False)
+        env.tick()
+        check("the split is reported as exposure_split, not as divergence",
+              ma.convergence.get("synced") is True
+              and set(ma.convergence.get("exposure_split") or [])
+              >= {"iso", "aperture"},
+              str(ma.convergence))
+        # An explicit apply is the force path: the fleet converges again.
+        S.reconcile_all(force=True)
+        env.tick()
+        check("an explicit apply re-converges the split camera",
               all(a.raw(k) == want[k] for k in
                   ("iso", "shutter", "aperture", "store_dest")),
               "iso=%s shutter=%s aperture=%s store=%s"
@@ -712,7 +782,7 @@ def suite_settings(opts):
         a.label_override = {"iso": "ISO 400"}
         env.tick()
         a.clear_counts()
-        S.reconcile_all(force=False)
+        S.reconcile_all(force=True)     # exposure writes ride the force path
         env.tick()
         check("a correct-looking label with a wrong raw value IS corrected",
               a.raw("iso") == 400, "iso=%s" % a.raw("iso"))
@@ -742,9 +812,12 @@ def suite_settings(opts):
                  % (pushes, sorted({p[1] for p in a.pushed()})))
 
         # --- reconcile must confirm from the node, not from a stale cache ---
-        a.drift(iso=1600)
-        env.tick()                                   # cache now holds iso=1600
-        S.reconcile_all(force=False)                 # pushes 400, node applies it
+        # drive is a readable NON-exposure field, so the idle pass corrects it;
+        # the contract is that the correction is confirmed by re-reading the
+        # NODE, not the 2 s status cache the diff was computed from.
+        a.drift(drive=2)
+        env.tick()                                   # cache now holds drive=2
+        S.reconcile_all(force=False)                 # pushes 1, node applies it
         contract("reconcile confirms by re-reading the node, not the cache",
                  ma.convergence.get("synced") is True,
                  "rigcore.py:437-451",
@@ -763,14 +836,16 @@ def suite_settings(opts):
               ma.convergence.get("synced") is True, str(ma.convergence))
 
         # --- a field that will not take -------------------------------------
+        # Exposure is only written on the force path now, so the refused-push
+        # alarm is exercised through an explicit apply.
         s0 = env.seq()
         a.drift(iso=6400)
         a.set_fault("ilx", fail_set=["iso"])
         env.tick()
         a.clear_counts()
-        S.reconcile_all(force=False)
+        S.reconcile_all(force=True)
         env.tick()
-        S.reconcile_all(force=False)
+        S.reconcile_all(force=True)
         divergent = env.evs(s0, kind="settings_divergent", node="cam2")
         check("a field that will not take raises settings_divergent for the node",
               bool(divergent) and "iso" in str(divergent[-1]),
@@ -783,7 +858,7 @@ def suite_settings(opts):
               "%d iso writes over 2 reconciles" % len(a.pushed("iso")))
         a.clear_faults()
         env.tick()
-        S.reconcile_all(force=False)
+        S.reconcile_all(force=True)
         env.tick()
         check("the field converges once the camera accepts it again",
               a.raw("iso") == 400, str(a.raw("iso")))
@@ -825,6 +900,38 @@ def suite_settings(opts):
         S.update({"bogus_field": 1})
         check("unknown keys are refused into desired",
               "bogus_field" not in S.get())
+
+        # --- white balance: fleet-converged, and build-gated ----------------
+        # Rig policy is fixed color temperature (mode 256) at 5600 K; the fake
+        # boots in AWB, so convergence must have moved BOTH fields by now.
+        check("white balance converges to fixed 5600 K on every camera",
+              a.raw("wb_mode") == 256 and a.raw("colortemp") == 5600
+              and b.raw("wb_mode") == 256 and b.raw("colortemp") == 5600,
+              "cam2 wb=%s/%s cam3 wb=%s/%s" % (a.raw("wb_mode"),
+              a.raw("colortemp"), b.raw("wb_mode"), b.raw("colortemp")))
+        # An ilxctl build that predates the field reports NO whiteBalance /
+        # colorTemp keys at all. The reconcile loop must skip it quietly —
+        # no pushes, no divergence — instead of alarming on a node that is
+        # simply not upgraded yet (the live fleet's exact state 2026-08-21).
+        with b._lock:
+            b.hide_keys = {"whiteBalance", "colorTemp"}
+            b.settings["wb_mode"] = 0            # body actually in AWB
+        b.clear_counts()
+        S.reconcile_all(force=False)
+        env.tick()
+        S.reconcile_all(force=False)
+        env.tick()
+        conv = env.mon("cam3").snapshot()["convergence"]
+        check("a pre-WB ilxctl build is skipped quietly, not diverged",
+              conv.get("synced") is True
+              and "wb_mode" not in (conv.get("diverged") or [])
+              and "colortemp" not in (conv.get("diverged") or []),
+              json.dumps(conv))
+        check("no wb push was sent to the pre-WB build",
+              not [p for p in b.pushes if p[1] in ("wb_mode", "colortemp")],
+              str(list(b.pushes)[-3:]))
+        with b._lock:
+            b.hide_keys = set()
         cur = S.bump_ev(1)
         check("EV bump moves expcomp by 1/3 stop", cur == 333, str(cur))
         S.bump_ev(-1)
@@ -1152,6 +1259,84 @@ def suite_runmgr(opts):
         a.clear_faults()
         env.runmgr.stop()
 
+        # ---- the LAST fired shot must survive stop -------------------------
+        # A real body takes ~0.5-1.5 s of card write + PC-save before a fired
+        # frame reaches the spool. stop() used to race that pipeline and drop
+        # the FINAL shot of every transect, deterministically (measured live
+        # 2026-08-20: 141 fired/140 archived, 337/336). A fire committed
+        # before stop belongs to the transect: stop waits, bounded, for it.
+        a.save_delay_s = 0.9
+        env.runmgr.start({"label": "transect-grace"})
+        rootg = env.runmgr.active["root"]
+        rg = env.runmgr.capture_once()
+        check("grace-test fire succeeded",
+              ((rg.get("results") or {}).get("cam2") or {}).get("ok") is True,
+              json.dumps(rg)[:140])
+        resg = env.runmgr.stop()      # immediately — frame lands ~0.9 s later
+        a.save_delay_s = 0
+        docg = json.load(open(os.path.join(rootg, "run.json")))
+        pulledg = ((docg.get("stats") or {}).get("cam2") or {}).get("pulled", 0)
+        check("the last fired shot is archived despite an immediate stop",
+              resg.get("ok") is True and pulledg >= 1,
+              "pulled=%s" % pulledg)
+
+        # ---- a node that stops answering fires pauses the grid -------------
+        # cam1 lost power mid-run (PoE collapse, 2026-08-23): its fires timed
+        # out 10 s each, the backlog climbed past 9 shots and cam2 shot an
+        # entire "transect" alone. Fires now fail fast, three in a row marks
+        # the node dead, the grid pauses (no unpaired frames), and it resumes
+        # by itself when the node's health poll is fresh again.
+        b.set_fault("pia", hang_s=30.0)           # piagent dead, ilxctl fine
+        env.runmgr.start({"label": "transect-pause", "interval_s": 0.4,
+                          "auto_capture": True})
+        got = wait_for(lambda: bool((env.runmgr.status().get("sync") or {})
+                                    .get("paused_for")), 20)
+        st = env.runmgr.status().get("sync") or {}
+        check("three consecutive failed fires pause the capture grid",
+              got and (st.get("paused_for") or {}).get("node") == "cam3",
+              json.dumps(st.get("paused_for")))
+        check("a paused run fired no more than a handful of unpaired shots",
+              0 < st.get("unpaired_shots", 0) <= 4,
+              "unpaired=%s" % st.get("unpaired_shots"))
+        pulled_a = env.runmgr.status()["stats"]["cam2"]["pulled"]
+        time.sleep(1.5)
+        check("the healthy camera is NOT fired alone while paused",
+              env.runmgr.status()["stats"]["cam2"]["pulled"] == pulled_a,
+              "cam2 pulled %d -> %d" % (pulled_a,
+                                        env.runmgr.status()["stats"]["cam2"]["pulled"]))
+        check("capture_paused was journalled as an error",
+              any(e["kind"] == "capture_paused" for e in env.evs()))
+        b.clear_faults()
+        env.tick()
+        resumed = wait_for(lambda: not (env.runmgr.status().get("sync") or {})
+                           .get("paused_for")
+                           and env.runmgr.status()["stats"]["cam3"]["pulled"] >= 1, 15)
+        check("capture resumes by itself when the node answers again",
+              resumed, json.dumps((env.runmgr.status().get("sync") or {}).get("paused_for")))
+        env.runmgr.stop()
+
+        # ---- trigger latency is reused, not re-fired, within 24 h ---------
+        # Every run start used to fire five calibration frames per camera and
+        # hold FOCUS (AE-lock) to re-measure a figure that moves <0.5 ms in a
+        # week: ~240 junk RAW+JPEG frames in three days. A value measured on
+        # the SAME body id within 24 h is adopted instead.
+        seq0 = env.seq()
+        a.clear_counts(); b.clear_counts()
+        env.runmgr.start({"label": "transect-reuse"})
+        time.sleep(2.5)
+        env.runmgr.stop()
+        reused = [e for e in env.evs(since=seq0) if e["kind"] == "calibrate"
+                  and "reused" in e["msg"]]
+        fires = a.count("POST /gpio/fire") + b.count("POST /gpio/fire")
+        check("a fresh same-body latency is reused at the next run start",
+              len(reused) >= 1, "%d reuse events" % len(reused))
+        check("no trigger-calibration frames are fired when reusing "
+              "(only the single EXIF frame per camera remains)",
+              fires <= 2, "%d fires at run start" % fires)
+        check("the latency is persisted under RIG_HOME, not the live ~/rig",
+              os.path.exists(os.path.join(rigcore.RIG_HOME, "trigger_latency.json"))
+              and rigcore.RIG_HOME != os.path.expanduser("~/rig"))
+
         # ---- a node that is down when the run starts ----------------------
         b.down()
         wait_for(lambda: env.mon("cam3").state == "OFFLINE", 8)
@@ -1426,6 +1611,130 @@ def suite_pull(opts):
 # ===========================================================================
 # Suite 6 — resources: threads, fds, rings, memory
 # ===========================================================================
+def suite_strobe(opts):
+    sect("Strobe: scheduled pulse, per-node routing, acceptance verdicts")
+    env = Env([("cam2", "127.0.0.2", 2), ("cam3", "127.0.0.3", 3)],
+              poll=0.3, threaded=True)
+    a, b = env.node("cam2"), env.node("cam3")
+    R = env.runmgr
+    try:
+        env.wait_state("cam2", "CAM_CONNECTED")
+        env.wait_state("cam3", "CAM_CONNECTED")
+
+        # ---- config validation ---------------------------------------------
+        check("strobe is OFF by default",
+              R.get_strobe().get("enabled") is False, str(R.get_strobe()))
+        r = R.set_strobe({"node": "cam9"})
+        check("an unknown strobe node is refused", r.get("ok") is False,
+              str(r.get("error")))
+        r = R.set_strobe({"delta_ms": 300})
+        check("a delta beyond 100 ms is refused", r.get("ok") is False,
+              str(r.get("error")))
+        r = R.set_strobe({"enabled": True, "node": "cam2", "delta_ms": 10})
+        check("enabling at the survey shutter (1/200) warns to run 1/30 "
+              "or slower",
+              r.get("ok") is True and any("1/30" in w
+                                          for w in r.get("warnings", [])),
+              str(r.get("warnings")))
+
+        # ---- the pulse rides ONLY the strobe node's fire --------------------
+        res = R.capture_once()
+        results = res.get("results") or {}
+        check("both cameras fire with the strobe armed",
+              all((results.get(n) or {}).get("ok") for n in ("cam2", "cam3")),
+              json.dumps(results)[:200])
+        check("the strobe pulses on the strobe node only",
+              a.strobe_fires == 1 and b.strobe_fires == 0,
+              "cam2=%d cam3=%d" % (a.strobe_fires, b.strobe_fires))
+        R.set_strobe({"enabled": False})
+        R.capture_once()
+        check("a disabled strobe never pulses",
+              a.strobe_fires == 1, str(a.strobe_fires))
+
+        # ---- acceptance: inside the window at 1/30, a miss at 1/200 ---------
+        # The verdict is docs/strobe-trigger.md §4.2: the strobe instant must
+        # sit inside the intersection of every camera's measured [fall, rise]
+        # window. 1/30 (the spec's recommended minimum) opens 33 ms — a 10 ms
+        # delta lands inside; 1/200 opens 5 ms — the same delta lands after
+        # the curtain has closed.
+        env.settings.update({"shutter": (1 << 16) | 30})
+        # delta 20 ms, not 10: the FAKE fires 5-10 ms late on a loaded host
+        # (the real piagent lands within 0.2 ms), and a 10 ms strobe could
+        # then precede the fall edge and be judged a miss for the wrong reason.
+        R.set_strobe({"enabled": True, "node": "cam2", "delta_ms": 20})
+        time.sleep(1.0)                        # let the shutter apply land
+
+        def strobed_run(label):
+            r0 = R.start({"label": label})
+            wait_for(lambda: R.trig_latency.get("cam2") is not None
+                     and R.trig_latency.get("cam3") is not None, 25)
+            R.capture_once()
+            fla = os.path.join(r0["root"], "cam2", "flight_log.csv")
+            flb = os.path.join(r0["root"], "cam3", "flight_log.csv")
+            ok = wait_for(lambda: os.path.exists(fla) and os.path.exists(flb)
+                          and len(read_flight(fla)[1]) >= 1
+                          and len(read_flight(flb)[1]) >= 1, 15)
+            R.stop()
+            return r0, ok
+
+        r1, delivered = strobed_run("strobed")
+        check("both cameras deliver the strobed frame", bool(delivered))
+        import rigcore as _rc
+        browser = _rc.RunBrowser(env.events)
+        shots = (browser.shots(r1["run_id"]) or {}).get("shots") or []
+        lit = [s for s in shots if s.get("strobe")]
+        check("the strobed shot carries a strobe verdict", bool(lit),
+              json.dumps(shots)[-300:])
+        s1 = lit[-1] if lit else {}
+        check("pair spread is computed from the µs index, not the flight_log",
+              s1.get("spread_src") == "index", str(s1.get("spread_src")))
+        check("a 20 ms strobe inside a 1/30 exposure is ACCEPTED",
+              (s1.get("strobe") or {}).get("ok") is True,
+              json.dumps(s1.get("strobe")))
+
+        # A 40 ms strobe against a 1/200 (5 ms) window: outside it however
+        # late the fake fires (the window closes by ~+15 ms worst case), so the
+        # MISS verdict is deterministic on any host. The contract is about the
+        # verdict, not the margin.
+        R.set_strobe({"delta_ms": 40})
+        env.settings.update({"shutter": (1 << 16) | 200})
+        time.sleep(1.0)                        # let the apply reach the fakes
+        r2, delivered = strobed_run("strobed-fast")
+        check("both cameras deliver the fast-shutter frame", bool(delivered))
+        shots2 = (browser.shots(r2["run_id"]) or {}).get("shots") or []
+        lit2 = [s for s in shots2 if s.get("strobe")]
+        check("a 40 ms strobe against a 1/200 shutter is judged a MISS",
+              bool(lit2) and (lit2[-1].get("strobe") or {}).get("ok") is False,
+              json.dumps(lit2[-1] if lit2 else None))
+        d2 = browser.detail(r2["run_id"])
+        check("the run summary counts the missed strobe",
+              ((d2.get("pairs") or {}).get("strobe_missed") or 0) >= 1,
+              str((d2.get("pairs") or {}).get("strobe_missed")))
+        # ---- the light must not depend on the strobe node's camera ----------
+        # Replay the 2026-08-16 shape: the strobe node's CAMERA faults (card
+        # stall) while its Pi stays healthy. The pulse must ride the
+        # standalone /gpio/strobe so the partner's frames stay lit.
+        R.set_strobe({"enabled": True, "node": "cam2", "delta_ms": 10})
+        with a._lock:
+            a.connected = False          # camera gone; piagent still up
+        env.wait_state("cam2", "REACHABLE")
+        pulses0 = a.strobe_fires
+        res = R.capture_once()
+        check("the partner camera still fires without the strobe node",
+              ((res.get("results") or {}).get("cam3") or {}).get("ok") is True,
+              json.dumps(res.get("results"))[:150])
+        check("the strobe still pulses with its camera faulted (standalone)",
+              wait_for(lambda: a.strobe_fires == pulses0 + 1, 8),
+              "pulses %d -> %d" % (pulses0, a.strobe_fires))
+        with a._lock:
+            a.connected = True
+        R.set_strobe({"enabled": False})
+        check("no unhandled exception escaped any thread",
+              not UNHANDLED, "; ".join(UNHANDLED[:3]))
+    finally:
+        env.close()
+
+
 def suite_resource(opts):
     sect("resource discipline: threads, file descriptors, rings")
     env = Env([("cam2", "127.0.0.2", 2), ("cam3", "127.0.0.3", 3,
@@ -1707,6 +2016,7 @@ def soak(seconds, opts):
 
 # ===========================================================================
 SUITES = [("fake", suite_fake), ("monitor", suite_monitor),
+          ("strobe", suite_strobe),
           ("settings", suite_settings), ("runmgr", suite_runmgr),
           ("pull", suite_pull), ("resource", suite_resource)]
 

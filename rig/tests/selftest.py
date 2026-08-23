@@ -20,7 +20,7 @@ no hardware at all — the flight_log header against PROTOCOL.md byte for byte,
 the rename convention against its regex including the rounding edges, the
 fleet table, and the label-vs-raw discipline of the convergence map.
 
-Usage:  python3 rig/selftest.py [--node cam3] [--offline]
+Usage:  python3 rig/selftest.py [--node cam2] [--offline]
         --offline skips everything that touches a node, so it is safe to run
         while somebody else has the camera.
 Exit code is nonzero if any check fails.
@@ -163,7 +163,7 @@ def test_fleet_table():
             documented[cells[0].replace("pi-", "")] = cells[2]
     builtin = getattr(rigcore, "_DEFAULT_NODES", rigcore.NODES)
     coded = {n["name"]: n["host"] for n in builtin}
-    check("PROTOCOL.md documents the camera nodes", len(documented) >= 3,
+    check("PROTOCOL.md documents the camera nodes", len(documented) >= 2,
           ",".join(sorted(documented)))
     check("the built-in fleet matches the documented fleet", coded == documented,
           "code=%s doc=%s" % (coded, documented))
@@ -333,7 +333,7 @@ def test_live(node):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--node", default="cam3")
+    ap.add_argument("--node", default="cam2")
     ap.add_argument("--offline", action="store_true",
                     help="skip every check that touches a camera node")
     a = ap.parse_args()

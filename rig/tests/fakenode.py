@@ -39,6 +39,7 @@ Standalone:  python3 rig/fakenode.py [--host 127.0.0.2]  (Ctrl-C to stop)
 
 import io
 import json
+import os
 import random
 import socket
 import threading
@@ -49,6 +50,42 @@ from urllib.parse import parse_qs, unquote
 
 ILX_PORT = 8080
 PIA_PORT = 8081
+
+# Linux binds any 127.0.0.0/8 address for free; macOS configures 127.0.0.1
+# alone and raises EADDRNOTAVAIL for the rest. When the alias cannot be bound,
+# every fake maps its nominal (127.0.0.x, port) to a deterministic port on
+# 127.0.0.1 instead. loopback_map() is the single source of that mapping; the
+# soaktest netguard applies the identical rewrite to outgoing URLs, so rig code
+# keeps speaking the fixed-port addresses PROTOCOL.md documents on every OS.
+_ALIAS_BINDABLE = None
+
+
+def _alias_bindable():
+    global _ALIAS_BINDABLE
+    if _ALIAS_BINDABLE is None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.2", 0))
+            _ALIAS_BINDABLE = True
+        except OSError:
+            _ALIAS_BINDABLE = False
+        finally:
+            s.close()
+    return _ALIAS_BINDABLE
+
+
+def loopback_map(host, port):
+    """The (host, port) to actually bind/connect for a nominal 127.0.0.x:port
+    node address: identity where loopback aliases exist, else 127.0.0.1 with a
+    port unique to (pid, x, port). The pid term keeps two test PROCESSES (a
+    lingering previous run, a devrig next to a soaktest) off each other's
+    ports; within one process every suite maps the same nominal address to the
+    same port, which is what lets the client-side URL rewrite stay stateless."""
+    if not host.startswith("127.") or host == "127.0.0.1" or _alias_bindable():
+        return host, port
+    x = int(host.rsplit(".", 1)[1])
+    return "127.0.0.1", 20000 + (os.getpid() % 40) * 640 \
+        + 2 * x + (port - ILX_PORT)
 
 # Sony encodings — PROTOCOL.md "Measured constants".
 SHUTTER_1_200 = (1 << 16) | 200          # 65736
@@ -72,6 +109,9 @@ SURVEY = {                                # a body already set up for the transe
     "aperture": 800, "shutter": SHUTTER_1_200, "iso": 400, "drive": 1,
     "filetype": 1, "imagesize": 1, "transsize": 1, "store_dest": 3,
     "focus_mode": 1, "expcomp": 0,
+    # A fresh body boots in AWB (0); the rig converges it to fixed color
+    # temperature (mode 256) per DEFAULT_DESIRED.
+    "wb_mode": 0, "colortemp": 5500,
 }
 
 # which= name used by /api/exposure  ->  internal settings key
@@ -80,6 +120,7 @@ WHICH_TO_KEY = {
     "drive": "drive", "filetype": "filetype", "imagesize": "imagesize",
     "quality": "quality", "transsize": "transsize", "pcsave": "pcsave",
     "rawtype": "rawtype", "expcomp": "expcomp",
+    "wb_mode": "wb_mode", "colortemp": "colortemp",
 }
 
 
@@ -164,8 +205,11 @@ class FakeNode:
         self.settings = dict(SURVEY if survey else FACTORY)
         self.shots = []                       # [{name,size,bytes,epoch}]
         self._shot_seq = 0
-        self.edges = deque(maxlen=5000)       # (seq, edge, epoch)
+        self.edges = deque(maxlen=5000)       # (seq, edge, epoch, fire_seq)
         self._edge_seq = 0
+        self._fire_seq = 0
+        self.strobe_fires = 0
+        self.strobe_last = None               # epoch of the last strobe pulse
         self.imu = deque(maxlen=6000)
         self.boot_epoch = time.time()
         self.disk_free_mb = 40000
@@ -179,6 +223,10 @@ class FakeNode:
         # Force chosen /api/status keys to a fixed value, so a status whose
         # human label disagrees with its raw number can be staged on demand.
         self.label_override = {}
+        # Keys REMOVED from /api/status entirely — simulates an ilxctl build
+        # that predates a field (e.g. whiteBalance/colorTemp before
+        # 2026-08-20). The reconcile loop must skip those quietly.
+        self.hide_keys = set()
 
         self.counts = Counter()               # "GET /api/status" -> n
         self.call_log = deque(maxlen=4000)    # (epoch, surface, method, path)
@@ -217,12 +265,16 @@ class FakeNode:
 
     # ---- lifecycle --------------------------------------------------------
     def up(self):
-        """Bring both listeners up (idempotent)."""
+        """Bring both listeners up (idempotent). A closed node stays closed:
+        a reboot thread that outlives close() must not resurrect listeners on
+        ports the NEXT suite's Env is about to bind."""
         with self._srv_lock:
+            if getattr(self, "_closed", False):
+                return
             for surface, port in (("ilx", ILX_PORT), ("pia", PIA_PORT)):
                 if surface in self._servers:
                     continue
-                srv = _mkserver(self.host, port)
+                srv = _mkserver(*loopback_map(self.host, port))
                 srv.node = self
                 srv.surface = surface
                 t = threading.Thread(target=srv.serve_forever,
@@ -260,6 +312,7 @@ class FakeNode:
                     self._shot_seq = 0
                 self.edges.clear()
                 self._edge_seq = 0
+                self._fire_seq = 0
                 self.focus_held = False
                 self.log = ["ilxctl up", "USB device found"]
             self.up()
@@ -274,11 +327,29 @@ class FakeNode:
                              name="fake-reboot-%s" % self.name).start()
 
     def close(self):
+        self._closed = True     # before down(): reboot threads check it in up()
         self.down()
 
     # ---- state the harness drives ----------------------------------------
     def add_frame(self, epoch=None, name=None, exif=True, size_bytes=None):
-        """Land a new frame in the PC-save dir, as a capture would."""
+        """Land a new frame in the PC-save dir, as a capture would.
+
+        With `save_delay_s` > 0 the frame lands that much later, the way a
+        real body takes ~0.5-1.5 s of card write + PC-save before the file
+        appears in the spool. The stop-grace barrier exists for exactly that
+        window; instant delivery can never reproduce the race."""
+        delay = getattr(self, "save_delay_s", 0)
+        if delay > 0:
+            t = threading.Timer(delay, self._add_frame_now,
+                                args=(epoch or time.time(), name, exif,
+                                      size_bytes))
+            t.daemon = True
+            t.start()
+            return None
+        return self._add_frame_now(epoch, name, exif, size_bytes)
+
+    def _add_frame_now(self, epoch=None, name=None, exif=True,
+                       size_bytes=None):
         with self._lock:
             self._shot_seq += 1
             ep = time.time() if epoch is None else epoch
@@ -291,11 +362,12 @@ class FakeNode:
                                "epoch": ep})
             return nm
 
-    def push_edge(self, epoch=None, edge="fall"):
+    def push_edge(self, epoch=None, edge="fall", fire_seq=None):
         with self._lock:
             self._edge_seq += 1
             self.edges.append((self._edge_seq, edge,
-                               time.time() if epoch is None else epoch))
+                               time.time() if epoch is None else epoch,
+                               fire_seq))
             return self._edge_seq
 
     def push_imu(self, epoch=None, **over):
@@ -366,6 +438,10 @@ class FakeNode:
                 "storeDest": s["store_dest"],
                 "focusMode": s["focus_mode"],
                 "expcompValue": s["expcomp"],
+                # .get: tests inject partial settings dicts (factory-reset
+                # scenarios predate these keys); a real body always reports.
+                "whiteBalance": s.get("wb_mode", 0),
+                "colorTemp": s.get("colortemp", 5500),
                 "battery": self.battery,
                 "remainShots": 1200,
                 "slotStatus": "OK",
@@ -373,12 +449,15 @@ class FakeNode:
                 "interval": {"running": False, "shots": 0},
                 "isoChoices": [100, 200, 400, 800, 1600, 3200, ISO_AUTO],
                 "apertureChoices": [400, 560, 800, 1100],
-                "shutterChoices": [SHUTTER_1_200, (1 << 16) | 60],
+                "shutterChoices": [SHUTTER_1_200, (1 << 16) | 60,
+                                   (1 << 16) | 30],
                 "log": list(self.log)[-20:],
             }
             if not self.connected:
                 doc["iso"] = doc["shutter"] = doc["aperture"] = ""
             doc.update(self.label_override)
+            for k in self.hide_keys:
+                doc.pop(k, None)
             return doc
 
     def health(self):
@@ -392,7 +471,11 @@ class FakeNode:
                          "ok": self.has_gpio, "focus_held": self.focus_held,
                          "monitor_running": self.has_gpio,
                          "interval": {"running": False, "fired": 0},
-                         "edges_seen": self._edge_seq},
+                         "edges_seen": self._edge_seq,
+                         "strobe": {"bcm": 26, "claimed": self.strobe_fires > 0,
+                                    "fires": self.strobe_fires,
+                                    "last_epoch": self.strobe_last,
+                                    "error": None}},
                 "imu": {"present": self.has_imu,
                         "rate_hz": 50 if self.has_imu else None,
                         "age_s": imu_age},
@@ -610,9 +693,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"present": node.has_imu, "samples": sel})
         elif method == "GET" and path == "/gpio/exposure/events":
             since = int((query.get("since") or [0])[0])
+            # Same shape the real piagent serves: epoch_hw (kernel timestamp
+            # converted to wall time — here identical to epoch) and the
+            # fire_seq each edge belongs to, so identity-based pairing and the
+            # strobe acceptance windows are exercised for real.
             with node._lock:
-                evs = [{"i": i, "edge": ed, "epoch": ep, "raw_ts": None}
-                       for (i, ed, ep) in node.edges if i > since]
+                evs = [{"i": i, "edge": ed, "epoch": ep, "epoch_hw": ep,
+                        "raw_ts": None, "fire_seq": fs}
+                       for (i, ed, ep, fs) in node.edges if i > since]
                 nxt = node._edge_seq
             self._send_json({"next": nxt, "events": evs})
         elif method == "GET" and path == "/gpio/state":
@@ -625,16 +713,72 @@ class _Handler(BaseHTTPRequestHandler):
         elif method == "POST" and path == "/gpio/fire":
             with node._lock:
                 held = node.focus_held
-            if not held:
+            # The real piagent asserts FOCUS itself when the caller supplies a
+            # per-shot focus_lead_ms; only a lead-less fire needs the hold.
+            if not held and not int(body.get("focus_lead_ms") or 0):
                 self._send_json({"ok": False, "error": "FOCUS not held"}, 409)
                 return
             at = float(body.get("at_epoch") or 0) or time.time()
+            # The real piagent busy-waits to its instant on a disciplined
+            # clock; honour the schedule (bounded) so exposure windows, strobe
+            # instants and late_ms all sit where they would on the rig. A bare
+            # time.sleep() lands 1-15 ms late, which is enough to push a fake
+            # exposure window past a scheduled strobe — spin the final approach
+            # exactly as piagent does.
+            if 0 < at - time.time() <= 2.0:
+                while True:
+                    rem = at - time.time()
+                    if rem <= 0:
+                        break
+                    time.sleep(rem - 0.001 if rem > 0.002 else 0)
             now = time.time()
+            with node._lock:
+                node._fire_seq += 1
+                seq = node._fire_seq
+                edge0 = node._edge_seq
             node.add_frame(epoch=now)
-            node.push_edge(epoch=now)
-            self._send_json({"ok": True, "requested_epoch": at,
-                             "actual_epoch": now,
-                             "late_ms": round((now - at) * 1000, 2)})
+            node.push_edge(epoch=now, fire_seq=seq)
+            # End of exposure after the body's current shutter duration, so the
+            # [fall, rise] window the strobe acceptance intersects is real.
+            sh = node.settings.get("shutter") or SHUTTER_1_200
+            num, den = (sh >> 16) & 0xFFFF, sh & 0xFFFF
+            dur = (num / den) if den else 0.005
+            node.push_edge(epoch=now + max(0.001, min(dur, 30.0)),
+                           edge="rise", fire_seq=seq)
+            resp = {"ok": True, "requested_epoch": at, "actual_epoch": now,
+                    "late_ms": round((now - at) * 1000, 2),
+                    "fire_seq": seq, "edge_seq": edge0,
+                    "node_epoch": time.time()}
+            strobe_at = float(body.get("strobe_at_epoch") or 0)
+            if strobe_at:
+                # The fake pulses exactly on schedule plus 0.2 ms of "hardware":
+                # deterministic, so acceptance-window tests can assert on it.
+                t = strobe_at + 0.0002
+                with node._lock:
+                    node.strobe_fires += 1
+                    node.strobe_last = t
+                resp["strobe_epoch"] = t
+                resp["strobe_late_ms"] = 0.2
+            self._send_json(resp)
+        elif method == "POST" and path == "/gpio/strobe":
+            # Strobe with no camera fire: the light must not depend on this
+            # node's camera being claimable (see piagent.strobe_only).
+            at = float(body.get("at_epoch") or 0)
+            if at <= 0:
+                self._send_json({"ok": False, "error": "at_epoch required"}, 400)
+                return
+            if 0 < at - time.time() <= 2.0:
+                while True:
+                    rem = at - time.time()
+                    if rem <= 0:
+                        break
+                    time.sleep(rem - 0.001 if rem > 0.002 else 0)
+            t = at + 0.0002
+            with node._lock:
+                node.strobe_fires += 1
+                node.strobe_last = t
+            self._send_json({"ok": True, "strobe_epoch": t,
+                             "strobe_late_ms": 0.2})
         elif method == "POST" and path.startswith("/gpio/interval"):
             self._send_json({"ok": True})
         elif method == "POST" and path == "/timeprobe":
