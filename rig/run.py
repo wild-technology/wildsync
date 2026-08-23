@@ -32,6 +32,7 @@ import os
 import threading
 import time
 
+import rigcore
 from rigcore import http_json, http_bytes, RUNS_DIR
 
 try:
@@ -649,9 +650,28 @@ class PullWorker(threading.Thread):
         self._flight.writerow([row[k] for k in FLIGHT_HEADER])
         self._flight_fh.flush()
         claim = self.cmd_epoch.get(orig)
+        # The end-of-exposure edge and the shot's strobe instant travel with
+        # the frame into run.json's index: [fall, rise] is this camera's
+        # measured shutter-open window, and the acceptance check for a lit
+        # frame is strobe ∈ ⋂ over cameras of those windows
+        # (docs/strobe-trigger.md §4.2). Both epoch_hw-derived.
+        rise = None
+        if source == "gpio_edge":
+            rise = self.provider.match_rise(self.mon, epoch,
+                                            (claim or {}).get("fire_seq"))
+        strobe = (claim or {}).get("strobe_epoch")
+        if strobe and source == "gpio_edge" and rise \
+                and not (epoch <= strobe <= rise):
+            self.provider.events.emit(
+                "warn", "strobe_miss",
+                "%s: strobe fired %+.1f ms from this frame's exposure window "
+                "[0..%.1f ms] - the frame is unlit or half-lit"
+                % (fname, (strobe - epoch) * 1000, (rise - epoch) * 1000),
+                node=self.mon.name_, frame=fname)
         self.provider.index_frame(self.cam_num, fname, orig, epoch, source,
                                   node=self.mon.name_,
-                                  path=(claim or {}).get("path"))
+                                  path=(claim or {}).get("path"),
+                                  rise=rise, strobe=strobe)
 
     def stats(self):
         with self._lock:
@@ -694,6 +714,13 @@ class RunManager:
         self.workers = {}
         # node -> TRIGGER->EXPOSURE latency in seconds, measured not assumed.
         self.trig_latency = {}
+        # Persisted per-body trigger latency. Each calibration fires five
+        # frames per camera and ran at every rigd start AND every run start:
+        # ~240 RAW+JPEG frames of non-survey data in three days, plus a FOCUS
+        # hold (AE-lock) each time. The figure is a property of the body and
+        # its lens and moved <0.5 ms across a week of measurements, so a value
+        # measured within TRIG_LAT_MAX_AGE_S for the SAME camera id is reused.
+        self._load_trig_latency()
         self.trig_measured_at = {}
         # node -> uncertainty of that node's EXIF clock offset, in seconds.
         self.exif_uncertainty = {}
@@ -713,6 +740,104 @@ class RunManager:
         # that would otherwise fire once per shot at 2 fps.
         self._gpio_ok = {}
         self._warned_at = {}
+        # Strobe (docs/strobe-trigger.md): a scheduled open-drain pulse on the
+        # strobe node at T + delta, where T is the shot's shared target instant.
+        # Persisted so a rigd restart mid-survey keeps the operator's choice.
+        self.strobe = self._load_strobe()
+
+    # ---- strobe config ------------------------------------------------------
+    STROBE_DEFAULT = {"enabled": False, "node": "cam1",
+                      "delta_ms": 10.0, "pulse_ms": 5}
+
+    @staticmethod
+    def _strobe_path():
+        import rigcore
+        return os.path.join(rigcore.RIG_HOME, "strobe.json")
+
+    def _load_strobe(self):
+        cfg = dict(self.STROBE_DEFAULT)
+        try:
+            with open(self._strobe_path()) as fh:
+                saved = json.load(fh)
+            cfg.update({k: saved[k] for k in cfg if k in saved})
+        except (OSError, ValueError):
+            pass
+        return cfg
+
+    def get_strobe(self):
+        with self._lock:
+            return dict(self.strobe)
+
+    def set_strobe(self, changes):
+        """Validate and persist the strobe configuration.
+
+        delta_ms is bounded to the measured-safe window (§4.1: 8–12 ms clears
+        curtain travel plus skew; the wide bound below is for bench work, and
+        the acceptance check in the run browser is the real judge). Warnings —
+        a shutter faster than 1/30 leaves the flash almost no margin — are
+        returned for the UI to show, never silently enforced."""
+        rep, warns = {}, []
+        with self._lock:
+            cfg = dict(self.strobe)
+        if "enabled" in changes:
+            rep["enabled"] = bool(changes["enabled"])
+        if "node" in changes:
+            names = [m.name_ for m in self.monitors]
+            if changes["node"] not in names:
+                return {"ok": False,
+                        "error": "unknown strobe node %r (fleet: %s)"
+                                 % (changes["node"], ", ".join(names))}
+            rep["node"] = changes["node"]
+        if "delta_ms" in changes:
+            try:
+                d = float(changes["delta_ms"])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "delta_ms is not a number"}
+            if not (0.0 < d <= 100.0):
+                return {"ok": False,
+                        "error": "delta_ms %.1f is outside 0..100 ms" % d}
+            if not (8.0 <= d <= 12.0):
+                warns.append("delta_ms %.1f is outside the measured-safe "
+                             "8-12 ms window (docs/strobe-trigger.md §4.1)" % d)
+            rep["delta_ms"] = d
+        if "pulse_ms" in changes:
+            try:
+                pm = int(changes["pulse_ms"])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "pulse_ms is not a number"}
+            if not (1 <= pm <= 50):
+                return {"ok": False,
+                        "error": "pulse_ms %d is outside 1..50" % pm}
+            rep["pulse_ms"] = pm
+        cfg.update(rep)
+        if cfg.get("enabled"):
+            d = self.settings.get() if self.settings else {}
+            sh = d.get("shutter")
+            if sh:
+                num, den = (sh >> 16) & 0xFFFF, sh & 0xFFFF
+                dur_ms = (num / den * 1000.0) if den else 0
+                if 0 < dur_ms < 33.0:
+                    warns.append(
+                        "shutter %s is faster than 1/30 - at delta %.0f ms the "
+                        "flash may land after the first curtain closes; run "
+                        "1/30 or slower (docs/strobe-trigger.md §4.1)"
+                        % ("%d/%d" % (num, den), cfg["delta_ms"]))
+        with self._lock:
+            self.strobe = cfg
+        try:
+            import rigcore
+            os.makedirs(rigcore.RIG_HOME, exist_ok=True)
+            tmp = self._strobe_path() + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(cfg, fh, indent=2)
+            os.replace(tmp, self._strobe_path())
+        except OSError as e:
+            warns.append("strobe config not persisted: %s" % e)
+        if rep:
+            self.events.emit("info", "strobe", "strobe config: %s"
+                             % ", ".join("%s=%s" % kv for kv in cfg.items()),
+                             **{k: v for k, v in cfg.items()})
+        return {"ok": True, "strobe": cfg, "warnings": warns}
 
     # ---- timebase ---------------------------------------------------------
     def _live_time_base(self):
@@ -812,7 +937,8 @@ class RunManager:
                    "nodes": [m.name_ for m in live],
                    "events_fh": events_fh, "nmea_fh": nmea_fh,
                    "index": [], "alerts": [], "fired": {}, "orphans": {},
-                   "skews_ms": [], "late_shots": 0, "failed_fires": 0}
+                   "skews_ms": [], "late_shots": 0, "failed_fires": 0,
+                   "unpaired_shots": 0, "fail_streak": {}, "paused_for": None}
             self.active = run
             self.workers = {}
             for m in live:
@@ -1008,6 +1134,29 @@ class RunManager:
             if self._adopt_stop:
                 self._adopt_stop.set()
             workers = dict(self.workers)
+            fired = dict((self.active.get("fired") or {}))
+        # A fire's frames take ~0.5-1.5 s to reach the node's spool (card
+        # write + PC-save + the 0.4 s listing poll). Stopping the workers the
+        # instant the operator lets go raced that pipeline and dropped the
+        # FINAL shot of every transect, deterministically (measured
+        # 2026-08-20: 141 fired / 140 archived, 337/336). A fire committed
+        # before stop belongs to the transect: no new fires can start now, so
+        # give the workers a bounded grace to catch up before telling them to
+        # stop. Outside the lock — indexing a frame takes it.
+        deadline = time.time() + 6.0
+        lag = [n for n, w in workers.items()
+               if w.stats().get("pulled", 0) < fired.get(n, 0)]
+        while lag and time.time() < deadline:
+            time.sleep(0.2)
+            lag = [n for n, w in workers.items()
+                   if w.stats().get("pulled", 0) < fired.get(n, 0)]
+        if lag:
+            self.events.emit(
+                "warn", "run",
+                "stopping with fired frames still undelivered from %s "
+                "after 6 s grace - check the node spool" % ",".join(lag),
+                nodes=lag)
+        with self._lock:
             for w in workers.values():
                 w.stop()
         # Actually WAIT for the pull threads to finish their current frame. A
@@ -1051,10 +1200,14 @@ class RunManager:
             return {"ok": True, "run_id": rid, "summary": summary}
 
     # ---- capture ----------------------------------------------------------
-    # How far ahead the shared fire instant is scheduled. It must cover the HTTP
-    # round trip to the slowest node, because every node has to receive the
-    # request *before* the instant arrives or it fires late.
-    SYNC_LEAD_S = 0.15
+    # How far ahead the shared fire instant is scheduled. The request must
+    # reach the node BEFORE (target − FOCUS_LEAD_MS − that node's trigger
+    # latency): piagent wakes early to place the FOCUS lead, and a late
+    # arrival does not shorten the lead — the TRIGGER lands late by the full
+    # overshoot, which is direct inter-camera skew. At FOCUS_LEAD_MS=120 and
+    # ~22 ms latency, 0.15 s left ~8 ms for dispatch + JSON + TCP; 0.30 s
+    # restores the ~150 ms margin the original figure had at the 40 ms lead.
+    SYNC_LEAD_S = 0.30
     # An EXPOSURE edge older than this cannot belong to a frame arriving now.
     EDGE_MAX_AGE_S = 30.0
     # A node reporting it fired further than this from its target is not merely
@@ -1197,18 +1350,46 @@ class RunManager:
                 # is fired early by its own latency, so that is `target` for
                 # every camera - the whole point of the compensation.
                 rec = w.note_command(target, path="gpio") if w else None
-                r = http_json("http://%s:8081/gpio/fire" % m.host,
-                              {"at_epoch": target - lead, "pulse_ms": 5,
-                               "focus_lead_ms": self.FOCUS_LEAD_MS},
-                              timeout=10 + self.SYNC_LEAD_S)
+                body = {"at_epoch": target - lead, "pulse_ms": 5,
+                        "focus_lead_ms": self.FOCUS_LEAD_MS}
+                strobe = self.get_strobe()
+                if strobe.get("enabled") and m.name_ == strobe.get("node"):
+                    # The flash is placed against the SHARED target instant, so
+                    # it lands relative to both bodies' exposures, not this
+                    # one's curtain (docs/strobe-trigger.md §4, topology A).
+                    body["strobe_at_epoch"] = target + strobe["delta_ms"] / 1e3
+                    body["strobe_pulse_ms"] = strobe.get("pulse_ms", 5)
+                # A fire answers within lead + FOCUS lead + a few ms. Waiting
+                # 10 s on a dead node held each shot thread open for 10 s,
+                # piled the backlog to 9+ in-flight shots and let the other
+                # camera shoot alone for a whole transect (cam1 power loss,
+                # 2026-08-23). Fail fast instead; the loop pauses on a streak.
+                r = http_json("http://%s:8081/gpio/fire" % m.host, body,
+                              timeout=max(2.0, self.SYNC_LEAD_S
+                                          + self.FOCUS_LEAD_MS / 1000.0 + 1.5))
                 ok = bool(r.get("ok"))
                 actual = r.get("actual_epoch")
+                if body.get("strobe_at_epoch") and ok:
+                    if r.get("strobe_error"):
+                        if self.warn_once("strobe_err:%s" % m.name_, 30):
+                            self.events.emit(
+                                "warn", "strobe_fail",
+                                "strobe scheduled on %s but did not pulse: %s"
+                                % (m.name_, r["strobe_error"]), node=m.name_)
+                    elif (r.get("strobe_late_ms") or 0) > 5.0:
+                        self.events.emit(
+                            "warn", "strobe_late",
+                            "strobe on %s pulsed %.1f ms late - the flash may "
+                            "have missed the exposure window"
+                            % (m.name_, r["strobe_late_ms"]), node=m.name_,
+                            late_ms=r["strobe_late_ms"])
                 if ok and w and rec is not None:
                     # piagent hands back the identity of this fire and the edge
                     # cursor it started from, so the frame can be paired with
                     # ITS OWN exposure edge instead of the nearest one.
                     w.update_command(rec, fire_seq=r.get("fire_seq"),
-                                     edge_seq=r.get("edge_seq"))
+                                     edge_seq=r.get("edge_seq"),
+                                     strobe_epoch=r.get("strobe_epoch"))
                 elif w and rec is not None:
                     # It exposed nothing, so no frame will ever claim this.
                     w.drop_command(rec)
@@ -1239,6 +1420,40 @@ class RunManager:
         for m in live:
             th = threading.Thread(target=_fire, args=(m,), daemon=True)
             th.start(); threads.append(th)
+        # The survey's light must not depend on the strobe node's CAMERA: if
+        # that body is faulted (the 2026-08-16 card fault) or harness-less,
+        # its healthy piagent still hosts the flash. Pulse it standalone so
+        # every other camera's frames stay lit.
+        strobe = self.get_strobe()
+        if strobe.get("enabled"):
+            sm = next((m for m in self.monitors
+                       if m.name_ == strobe.get("node")), None)
+            fired_with_strobe = (sm is not None and sm in live
+                                 and self._fire_path(sm) == "gpio")
+            if sm is not None and not fired_with_strobe:
+                def _strobe_alone():
+                    r = http_json("http://%s:8081/gpio/strobe" % sm.host,
+                                  {"at_epoch":
+                                   target + strobe["delta_ms"] / 1e3,
+                                   "pulse_ms": strobe.get("pulse_ms", 5)},
+                                  timeout=10 + self.SYNC_LEAD_S)
+                    if not (isinstance(r, dict) and r.get("ok")):
+                        if self.warn_once("strobe_alone:%s" % sm.name_, 30):
+                            self.events.emit(
+                                "warn", "strobe_fail",
+                                "standalone strobe on %s failed: %s"
+                                % (sm.name_,
+                                   (r or {}).get("error", "unreachable")),
+                                node=sm.name_)
+                    else:
+                        # Kept OUT of `results`: _judge_shot scores camera
+                        # fires, and a phantom "_strobe" node would pollute
+                        # the run's fired/failed counts.
+                        self.last_standalone_strobe = {
+                            "node": sm.name_, "at": time.time(),
+                            "strobe_epoch": r.get("strobe_epoch")}
+                th = threading.Thread(target=_strobe_alone, daemon=True)
+                th.start(); threads.append(th)
         for th in threads:
             th.join(timeout=35)
         return self._judge_shot(target, results)
@@ -1271,6 +1486,14 @@ class RunManager:
                         del run["skews_ms"][:-1000]
                 if failed:
                     run["failed_fires"] += len(failed)
+                    if fired:
+                        # Some members fired, some did not: this shot can
+                        # never be a pair. Count it so the summary says so.
+                        run["unpaired_shots"] += 1
+                for n in failed:
+                    run["fail_streak"][n] = run["fail_streak"].get(n, 0) + 1
+                for n in fired:
+                    run["fail_streak"][n] = 0
                 if worst_late is not None and worst_late > self.LATE_BUDGET_MS:
                     run["late_shots"] += 1
         if failed and self.warn_once("capture_fail:%s" % ",".join(sorted(failed)),
@@ -1314,13 +1537,64 @@ class RunManager:
 
         def _loop():
             k = 0
+            g = 0
             start = time.time() + 1.0
             inflight = []
             while not stopev.is_set():
                 if count and k >= count:
                     break
+                # A node that has failed 3 fires in a row is not "slow", it is
+                # gone (power loss, link down). Firing the other camera alone
+                # produces unpaired frames that are not a transect. Pause the
+                # grid, say so once, and resume by itself the moment the node
+                # answers its health poll again.
+                dead = self._dead_fire_node()
+                if dead:
+                    # Resume test: a piagent health answer NEWER than the
+                    # pause means the node is back; forgive the streak and
+                    # let the next fire prove it.
+                    m = next((x for x in self.monitors if x.name_ == dead), None)
+                    with self._lock:
+                        run = self.active
+                        pf = run and run["paused_for"]
+                        if pf and m is not None:
+                            snap = m.snapshot()
+                            seen = snap.get("last_seen") or 0
+                            if snap.get("health") and seen > pf["since"]:
+                                run["fail_streak"][dead] = 0
+                                dead = None
+                    if dead is None:
+                        continue
+                    with self._lock:
+                        run = self.active
+                        first = run and run["paused_for"]
+                        if run and not first:
+                            run["paused_for"] = {"node": dead,
+                                                 "since": time.time(),
+                                                 "after_shot": k}
+                    if not first:
+                        self.events.emit(
+                            "error", "capture_paused",
+                            "%s stopped answering fires - capture paused "
+                            "until it is back (other camera NOT fired alone)"
+                            % dead, node=dead)
+                    stopev.wait(min(period, 1.0))
+                    start = time.time() + 1.0     # re-anchor the grid
+                    g = 0
+                    continue
+                with self._lock:
+                    run = self.active
+                    if run and run["paused_for"]:
+                        self.events.emit(
+                            "info", "capture_resumed",
+                            "%s answering again - capture resumed"
+                            % run["paused_for"]["node"],
+                            node=run["paused_for"]["node"])
+                        run["paused_for"] = None
                 # Absolute grid, so lateness in one shot cannot accumulate.
-                target = start + k * period
+                # `g` indexes the grid (re-anchored after a pause); `k` counts
+                # shots fired, for the frame budget and the summary.
+                target = start + g * period
                 # Wake a lead-time early: capture_once has to reach every node
                 # BEFORE the instant, and calling it at the instant itself made
                 # each shot SYNC_LEAD_S late. Dispatching it inline also
@@ -1344,6 +1618,7 @@ class RunManager:
                                      % len(inflight))
                     inflight[0].join(timeout=period)
                 k += 1
+                g += 1
             for t in inflight:
                 t.join(timeout=5)
             self.events.emit("info", "capture", "auto-capture loop ended",
@@ -1353,6 +1628,22 @@ class RunManager:
         self._cap_thread.start()
         self.events.emit("info", "capture", "auto-capture loop started",
                          interval_s=period, frames=count)
+
+    def _dead_fire_node(self):
+        """The first run member with >=3 consecutive failed fires, else None.
+
+        Three timeouts in a row ARE the evidence: waiting for the monitor to
+        also notice (its poll can lag 10 s behind a node that just died) let
+        a whole 8-shot budget fire into one camera before the pause engaged
+        (validation-2, 2026-08-23). Resuming is where the health poll
+        belongs - see the loop: a health answer newer than the pause clears
+        the streak."""
+        with self._lock:
+            run = self.active
+            if not run:
+                return None
+            return next((n for n, k in run["fail_streak"].items() if k >= 3),
+                        None)
 
     def _stop_capture_loop(self):
         if self._cap_stop:
@@ -1468,6 +1759,22 @@ class RunManager:
         if isinstance(r, dict):
             mon._edge_cursor = r.get("next", getattr(mon, "_edge_cursor", 0))
             for e in r.get("events", []):
+                if e.get("edge") == "rise":
+                    # End-of-exposure edges, kept separately: together with the
+                    # fall they bound the shutter-open window the strobe
+                    # acceptance check needs (strobe ∈ ⋂ [fall_i, rise_i]).
+                    t = e.get("epoch_hw")
+                    if t is None:
+                        t = e.get("epoch")
+                    if t is not None:
+                        rbuf = getattr(mon, "_rise_buf", None)
+                        if rbuf is None:
+                            rbuf = mon._rise_buf = []
+                        rbuf.append({"t": t, "i": e.get("i"),
+                                     "fire_seq": e.get("fire_seq")})
+                        if len(rbuf) > 64:
+                            del rbuf[:-64]
+                    continue
                 if e.get("edge") != "fall":
                     continue
                 # epoch_hw is the kernel's own interrupt timestamp converted to
@@ -1519,6 +1826,58 @@ class RunManager:
         if abs(buf[i]["t"] - expected) > window:
             return None
         return buf.pop(i)["t"]
+
+    def match_rise(self, mon, fall_t, fire_seq=None):
+        """The end-of-exposure edge belonging to a frame whose fall edge is
+        known, or None. Prefers fire_seq identity; else the first rise after
+        the fall within one plausible exposure (5 s covers multi-second
+        shutters without adopting a later frame's rise at survey rates)."""
+        buf = getattr(mon, "_rise_buf", None)
+        if not buf:
+            return None
+        # A rise can only close THIS exposure if it sits within a plausible
+        # shutter-plus-overhead of the fall. Audit of the 2026-08-20 2 Hz run
+        # found 10 cam2 rows whose "rise" was the NEXT frame's (523 ms windows
+        # at a 24 ms shutter): the ringing harness lost the genuine rise and
+        # the node tagged the following one with the stale fire_seq. A wrong
+        # window would make the strobe verdict lie, so an implausible rise is
+        # discarded and the window left unmeasured instead.
+        limit = max(0.2, 3.0 * self._shutter_s(mon) + 0.05)
+
+        def take(k):
+            t = buf.pop(k)["t"]
+            if 0 < t - fall_t <= limit:
+                return t
+            if self.warn_once("rise_lost:%s" % mon.name_, 60):
+                self.events.emit(
+                    "warn", "edge", "%s: end-of-exposure edge lost - the next "
+                    "frame's rise was tagged to this fire (%.0f ms after the "
+                    "fall, limit %.0f); window left unmeasured"
+                    % (mon.name_, (t - fall_t) * 1000, limit * 1000),
+                    node=mon.name_)
+            return None
+        if fire_seq is not None:
+            for k, e in enumerate(buf):
+                if e.get("fire_seq") == fire_seq:
+                    return take(k)
+        cand = [k for k, e in enumerate(buf) if 0 < e["t"] - fall_t <= limit]
+        if not cand:
+            return None
+        k = min(cand, key=lambda k: buf[k]["t"] - fall_t)
+        return buf.pop(k)["t"]
+
+    @staticmethod
+    def _shutter_s(mon):
+        """The body's current shutter in seconds (Sony (num<<16)|den), default
+        1/60 when unreadable."""
+        try:
+            v = int((mon.snapshot()["status"] or {}).get("shutterValue") or 0)
+            num, den = (v >> 16) & 0xFFFF, v & 0xFFFF
+            if num and den:
+                return num / den
+        except Exception:  # noqa: BLE001
+            pass
+        return 1.0 / 60
 
     # ---- calibration ------------------------------------------------------
     # A calibration exposure is real on the camera but is not survey data. It is
@@ -1663,7 +2022,63 @@ class RunManager:
             return
         self.calibrate_trigger(nodes=[m])
 
-    def calibrate_trigger(self, samples=5, hold_focus=True, nodes=None):
+    TRIG_LAT_MAX_AGE_S = 24 * 3600
+
+    @property
+    def TRIG_LAT_PATH(self):
+        # Under rigcore.RIG_HOME so the test harness's redirect isolates it:
+        # fakes must never persist a latency the live fleet could read.
+        return os.path.join(rigcore.RIG_HOME, "trigger_latency.json")
+
+    def _load_trig_latency(self):
+        self._trig_saved = {}
+        try:
+            with open(self.TRIG_LAT_PATH) as fh:
+                self._trig_saved = json.load(fh)
+        except (OSError, ValueError):
+            self._trig_saved = {}
+
+    def _save_trig_latency(self, out):
+        now = time.time()
+        for name, lat in out.items():
+            m = next((x for x in self.monitors if x.name_ == name), None)
+            cam_id = ((m.snapshot().get("status") or {}).get("id")
+                      if m else None)
+            self._trig_saved[name] = {"ms": round(lat * 1000, 3), "at": now,
+                                      "camera_id": cam_id}
+        try:
+            os.makedirs(os.path.dirname(self.TRIG_LAT_PATH), exist_ok=True)
+            tmp = self.TRIG_LAT_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self._trig_saved, fh, indent=1)
+            os.replace(tmp, self.TRIG_LAT_PATH)
+        except OSError as e:
+            self.events.emit("warn", "calibrate",
+                             "could not persist trigger latency: %s" % e)
+
+    def _reuse_trig_latency(self, m):
+        """Adopt a saved latency for this node when it is fresh and was
+        measured on the SAME body (camera id). Returns True if adopted."""
+        ent = self._trig_saved.get(m.name_)
+        if not ent:
+            return False
+        cam_id = (m.snapshot().get("status") or {}).get("id")
+        if ent.get("camera_id") != cam_id or cam_id is None:
+            return False
+        age = time.time() - float(ent.get("at") or 0)
+        if age > self.TRIG_LAT_MAX_AGE_S:
+            return False
+        self.trig_latency[m.name_] = float(ent["ms"]) / 1000.0
+        self.trig_measured_at[m.name_] = float(ent["at"])
+        self.events.emit("info", "calibrate",
+                         "%s trigger latency reused: %.2f ms measured %.1f h "
+                         "ago on this body (%s) - no calibration frames fired"
+                         % (m.name_, ent["ms"], age / 3600.0, cam_id),
+                         node=m.name_)
+        return True
+
+    def calibrate_trigger(self, samples=5, hold_focus=True, nodes=None,
+                          force=False):
         """Measure each camera's TRIGGER -> EXPOSURE latency, per node.
 
         Two bodies do not answer a trigger in the same time: measured 22.18 ms
@@ -1681,6 +2096,8 @@ class RunManager:
         pool = nodes if nodes is not None else self.monitors
         live = [m for m in pool if m.is_connected()
                 and (m.health.get("gpio", {}) or {}).get("available")]
+        if not force:
+            live = [m for m in live if not self._reuse_trig_latency(m)]
         if not live:
             return {}
         out = {}
@@ -1768,6 +2185,7 @@ class RunManager:
             self.trig_latency.update(out)
             for k in out:
                 self.trig_measured_at[k] = now
+            self._save_trig_latency(out)
             self.events.emit("info", "calibrate",
                              "trigger latency: " +
                              ", ".join("%s=%.2fms" % (k, v * 1000)
@@ -1907,7 +2325,7 @@ class RunManager:
         self.events.emit("debug", "frame", "%s <- %s" % (fname, orig), node=node)
 
     def index_frame(self, cam_num, fname, orig, epoch, source, node=None,
-                    path=None):
+                    path=None, rise=None, strobe=None):
         with self._lock:
             if self.active:
                 # Microseconds, not milliseconds: the capture instant is a
@@ -1921,6 +2339,15 @@ class RunManager:
                     # 0-200 ms of skew against its pair and has to be
                     # identifiable when the survey is processed.
                     rec["path"] = path
+                if rise is not None:
+                    # End of exposure: [epoch, rise] is this camera's measured
+                    # shutter-open window, for the strobe acceptance check.
+                    rec["rise"] = round(rise, 6)
+                if strobe is not None:
+                    # The shot's strobe pulse instant, carried on the strobe
+                    # node's frame; the pair-level verdict joins it against
+                    # every member's window when the run is browsed.
+                    rec["strobe"] = round(strobe, 6)
                 self.active["index"].append(rec)
                 if len(self.active["index"]) % 10 == 0:
                     self._write_run_json()
@@ -1934,6 +2361,8 @@ class RunManager:
         doc = {"run_id": run["run_id"], "label": run["label"],
                "started": run["started"], "nodes": run["nodes"],
                "config": run["config"],
+               # Read without get_strobe(): callers already hold self._lock.
+               "strobe": dict(self.strobe),
                # The correction actually applied to every datetime and filename
                # in this run, so the whole transect can be re-based in post.
                "time": {"source": run["time_src"],
@@ -1946,6 +2375,8 @@ class RunManager:
                                         if skews else None),
                         "late_shots": run["late_shots"],
                         "failed_fires": run["failed_fires"],
+                        "unpaired_shots": run.get("unpaired_shots", 0),
+                        "paused_for": run.get("paused_for"),
                         "fired": dict(run["fired"]),
                         "orphan_fires": dict(run["orphans"]),
                         "trigger_latency_ms": {k: round(v * 1000, 2) for k, v
@@ -1978,6 +2409,8 @@ class RunManager:
                              "skew_ms_max": skews[-1] if skews else None,
                              "late_shots": run["late_shots"],
                              "failed_fires": run["failed_fires"],
+                             "unpaired_shots": run.get("unpaired_shots", 0),
+                             "paused_for": run.get("paused_for"),
                              "orphan_fires": dict(run["orphans"])},
                     "stats": {n: w.stats() for n, w in self.workers.items()}}
 

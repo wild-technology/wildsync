@@ -20,6 +20,7 @@ without it, runs still work and the flight log simply carries empty nav columns.
 import json
 import os
 import signal
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,155 @@ SLOT_WRITING_CRITICAL_S = 120.0
 # Anomaly detectors — cheap checks over current fleet state, each with the
 # evidence and a suggested action an operator (or agent) can act on.
 # ---------------------------------------------------------------------------
+STATIC_FIX_PATH = os.path.expanduser("~/rig/static_fix.json")
+
+
+class LiveTap:
+    """Per-camera live-view throttle: rigd is the SINGLE point where live
+    view touches a node. One upstream fetch in flight per camera, every
+    client shares it, and a cached frame is served while it is younger than
+    the policy interval — so no browser tab, second operator, or stray curl
+    loop can exceed the cap.
+
+    Why a cap at all (bench, 2026-08-23): live view polled unbounded (~53 fps)
+    on both cameras during a 2 Hz RAW transect starved cam1's piagent fire
+    path (23 of 28 fires timed out) and starved cam2's SDK transfer path to
+    zero delivered frames, then wedged its body. The same transect with live
+    view at ~6 fps per camera was clean: 30/30, 0 late, 0.19 ms skew, 6 ms
+    worst preview latency. Policy: 5 fps idle, 2 fps while a run is active
+    (conservative until measured at more), 0 fps with no viewer (pull-based:
+    nothing is fetched unless someone asks)."""
+
+    IDLE_S = 0.20        # 5 fps, no run active
+    RUN_S = 0.50         # 2 fps while a transect is recording
+    TIMEOUT_S = 1.5      # an SDK stall must not freeze the picture for 8 s
+
+    def __init__(self):
+        self._ent = {}
+        self._lock = threading.Lock()
+
+    def _slot(self, name):
+        with self._lock:
+            e = self._ent.get(name)
+            if e is None:
+                e = self._ent[name] = {"lock": threading.Lock(), "data": None,
+                                       "at": 0.0, "err": None}
+            return e
+
+    def get(self, m, run_active):
+        """Returns (jpeg_bytes_or_None, error, age_ms, policy)."""
+        interval = self.RUN_S if run_active else self.IDLE_S
+        policy = "run" if run_active else "idle"
+        e = self._slot(m.name_)
+        with e["lock"]:          # concurrent clients queue here and share
+            now = time.monotonic()
+            if e["data"] is not None and now - e["at"] < interval:
+                return e["data"], None, (now - e["at"]) * 1000.0, policy
+            data, err = http_bytes("http://%s:8080/liveview.jpg" % m.host,
+                                   timeout=self.TIMEOUT_S)
+            if data:
+                e["data"], e["at"], e["err"] = data, time.monotonic(), None
+                return data, None, 0.0, policy
+            e["err"] = err
+            # Serve the last good frame briefly rather than nothing, but
+            # never pretend it is fresh: the age header says so.
+            if e["data"] is not None and now - e["at"] < 3.0:
+                return e["data"], err, (now - e["at"]) * 1000.0, policy
+            return None, err or "no liveview", None, policy
+
+
+LIVETAP = LiveTap()
+
+
+class StaticFixNav:
+    """Delegating wrapper around NavReader: when there is NO valid live fix,
+    fix_at()/snapshot() fall back to the operator-provided static position in
+    ~/rig/static_fix.json ({lat, lon, label, ...}).
+
+    Field case: no NMEA aboard, but the site position is known — e.g. the
+    last live fix from a previous day. Honesty rules: a live fix ALWAYS wins;
+    the static row carries only position/UTM (never depth, heading, or speed,
+    which we do not know); `nav_epoch` is the original fix's capture epoch so
+    `age_s` says exactly how old the position is; and health()/snapshot()
+    name the static source so the UI preflight can say so out loud. The file
+    is re-read on mtime change, so it can be edited without a restart."""
+
+    def __init__(self, reader, navmod, events):
+        self._r = reader
+        self._nm = navmod
+        self._ev = events
+        self._sf = None
+        self._sf_mtime = None
+        self._load()
+
+    def _load(self):
+        try:
+            mt = os.path.getmtime(STATIC_FIX_PATH)
+        except OSError:
+            self._sf = None
+            self._sf_mtime = None
+            return
+        if mt == self._sf_mtime:
+            return
+        try:
+            with open(STATIC_FIX_PATH) as fh:
+                sf = json.load(fh)
+            lat, lon = float(sf["lat"]), float(sf["lon"])
+            e, n, zone = self._nm.latlon_to_utm(lat, lon)
+            sf.update({"lat": lat, "lon": lon,
+                       "xutm": e, "yutm": n, "utm_zone": zone})
+            self._sf = sf
+            self._sf_mtime = mt
+        except Exception as exc:  # noqa: BLE001
+            self._sf = None
+            self._ev.emit("warn", "nav",
+                          "static_fix.json unreadable: %s" % exc)
+
+    def static_label(self):
+        self._load()
+        return (self._sf or {}).get("label") or \
+            ("static fix" if self._sf else None)
+
+    def fix_at(self, epoch=None, max_age_s=None):
+        row = self._r.fix_at(epoch, max_age_s)
+        if row.get("valid"):
+            return row
+        self._load()
+        if not self._sf:
+            return row
+        sf = self._sf
+        row.update({"lat": sf["lat"], "lon": sf["lon"], "long": sf["lon"],
+                    "xutm": sf["xutm"], "yutm": sf["yutm"],
+                    "utm_zone": sf["utm_zone"]})
+        row["nav_epoch"] = sf.get("captured_epoch")
+        if row["nav_epoch"] and row.get("local_epoch"):
+            row["age_s"] = abs(row["local_epoch"] - row["nav_epoch"])
+        row["static_fix"] = self.static_label()
+        return row
+
+    def snapshot(self):
+        snap = self._r.snapshot() or {}
+        if not snap.get("valid"):
+            self._load()
+            if self._sf:
+                sf = self._sf
+                snap.update({"lat": sf["lat"], "lon": sf["lon"],
+                             "xutm": sf["xutm"], "yutm": sf["yutm"],
+                             "utm_zone": sf["utm_zone"],
+                             "static_fix": self.static_label()})
+        return snap
+
+    def health(self):
+        h = self._r.health()
+        self._load()
+        h["static_fix"] = self.static_label()
+        return h
+
+    def __getattr__(self, name):
+        # set_raw_hook, bus_table, stop, port, ... — the reader's surface.
+        return getattr(self._r, name)
+
+
 class Anomalies:
     def __init__(self, monitors, runmgr, nav, events, settings=None):
         self.monitors = monitors
@@ -102,8 +252,94 @@ class Anomalies:
                                    {"log": (status.get("log") or [])[-1:]},
                                    "check USB cable is a data cable, camera on, "
                                    "PC Remote mode", sev="bad"))
+            elif st == NodeMonitor.ILX_DOWN:
+                out.append(self._a(
+                    "ilx_down", m.name_,
+                    "ilxctl not answering (piagent is) - camera daemon wedged",
+                    {"error": status.get("error"),
+                     "last_seen_s": snap.get("age_s")},
+                    "the SDK session is stuck (HANDOFF §2.2): power-cycle the "
+                    "camera body first; if ilxctl still does not answer, on "
+                    "the node: sudo pkill -9 -x ilxctl, USB unbind/bind, "
+                    "sudo systemctl start ilxctl (or pull the Pi's PoE for "
+                    "10 s). Fires still work; frames will NOT be delivered",
+                    sev="bad"))
+            if st == NodeMonitor.CONNECTED and \
+                    str(status.get("slotStatus", "")).lower() in ("no card", "nocard"):
+                out.append(self._a(
+                    "card_missing", m.name_,
+                    "%s has NO memory card" % m.name_,
+                    {"slotStatus": status.get("slotStatus"),
+                     "storeDest": status.get("storeDestLabel")},
+                    "the shutter still fires on GPIO but nothing records and "
+                    "nothing is delivered to the Pi - every shot is an orphan. "
+                    "Insert a card before running",
+                    sev="bad"))
+            ts = getattr(self, "timesync", None)
+            off = ts.exif_offset.get(m.name_) if ts else None
+            if off is not None and abs(off) > 60:
+                days = abs(off) / 86400.0
+                out.append(self._a(
+                    "camera_clock_wrong", m.name_,
+                    "%s body clock is %s %s the rig (EXIF)"
+                    % (m.name_, ("%.1f days" % days) if days >= 1
+                       else ("%.0f s" % abs(off)),
+                       "behind" if off < 0 else "ahead"),
+                    {"offset_s": round(off, 2)},
+                    "set date/time in the body's own menu (USB cannot: the "
+                    "ILX-LR1 refuses DateTime_Settings). Only the card files' "
+                    "own timestamps are wrong - the rig's edge times and "
+                    "the ingest sidecars are unaffected",
+                    sev="warn"))
+            pw = h.get("power") or {}
+            if pw.get("undervolt_now") or pw.get("undervolt_since_boot"):
+                out.append(self._a(
+                    "node_undervoltage", m.name_,
+                    "%s reports %s" % (m.name_, "UNDER-VOLTAGE NOW"
+                                       if pw.get("undervolt_now")
+                                       else "an under-voltage since boot"),
+                    {"throttled": pw.get("throttled")},
+                    "the PoE port/cable is sagging under load: this is the "
+                    "step before the node reboots mid-run. Fix the power "
+                    "budget before a survey",
+                    sev="bad" if pw.get("undervolt_now") else "warn"))
+            rb = getattr(m, "rebooted_at", None)
+            if rb and now - rb < 600:
+                out.append(self._a(
+                    "node_rebooted", m.name_,
+                    "%s lost power and restarted %d s ago" % (m.name_, now - rb),
+                    {"rebooted_at": rb, "uptime_s": h.get("uptime_s")},
+                    "a Pi does not reboot by itself: PoE budget collapsed or "
+                    "the port/cable sagged. Check the switch's PoE input, per-"
+                    "port draw and shed events; isolate this node's power to "
+                    "confirm. Frames fired while it was down are lost",
+                    sev="bad"))
+            # The body answers but its property table is gone: no writable
+            # map, no ISO, slotWriting unreported. That is the card-stall
+            # aftermath (HANDOFF §2.1: one frame the card will not accept
+            # locks the whole table) or a half-dead SDK session — NOT ten
+            # fields that each need attention. Say the one true thing and
+            # hush the per-field divergence while it lasts.
+            locked = (st == NodeMonitor.CONNECTED and status
+                      and not status.get("writable")
+                      and status.get("iso") in (None, "", "?")
+                      and status.get("slotWritingLabel") in (None, "unknown"))
+            if locked:
+                out.append(self._a(
+                    "body_locked", m.name_,
+                    "%s property table unavailable - body busy/locked"
+                    % m.name_,
+                    {"slotStatus": status.get("slotStatus"),
+                     "log": (status.get("log") or [])[-1:]},
+                    "the classic card stall (a write the card will not take "
+                    "locks the whole body; slotStatus still says OK): power "
+                    "the camera fully OFF, pull the card, full-format it on a "
+                    "computer, format again in-camera - or replace it with a "
+                    "V60/UHS-II card. Frames will not deliver until then",
+                    sev="bad"))
             conv = snap.get("convergence") or {}
-            if conv.get("synced") is False and conv.get("diverged"):
+            if st == NodeMonitor.CONNECTED and not locked \
+                    and conv.get("synced") is False and conv.get("diverged"):
                 # Name the ilxctl error where there is one: for filetype /
                 # imagesize / transsize there is no readback, so the body's own
                 # words are the only evidence the field did not take.
@@ -193,12 +429,22 @@ class Anomalies:
                 # N2K bus, not from USB, so a dark bus means silence on a port
                 # that still opens perfectly well.
                 if snap and not snap.get("gateway_online"):
+                    # With a static fix armed the operator has already said
+                    # "no NMEA aboard, use this position" — that is a state
+                    # to display, not an alarm to chase.
+                    sf = snap.get("static_fix")
                     out.append(self._a("nav_gateway_down", None,
-                                       "iKonvert sending no data",
+                                       ("no live NMEA — static fix in use: %s"
+                                        % sf) if sf
+                                       else "iKonvert sending no data",
                                        {"health": self.nav.health()},
+                                       "flight-log positions use the armed "
+                                       "static fix; plug in the iKonvert for "
+                                       "live nav" if sf else
                                        "the iKonvert draws power from the N2K "
                                        "bus, not USB - check bus power and the "
-                                       "gateway's POWER LED", sev="bad"))
+                                       "gateway's POWER LED",
+                                       sev="warn" if sf else "bad"))
                 elif snap and snap.get("lat") is None:
                     out.append(self._a("nav_no_fix", None, "no GPS fix",
                                        {"snap": {k: snap.get(k) for k in
@@ -206,6 +452,17 @@ class Anomalies:
                                        "check the N2K backbone / GPS source"))
             except Exception:  # noqa: BLE001
                 pass
+        paused = (run.get("sync") or {}).get("paused_for") if run.get("active") else None
+        if paused:
+            out.append(self._a(
+                "capture_paused", paused.get("node"),
+                "capture paused: %s is not answering fires (since %d s)"
+                % (paused.get("node"), now - (paused.get("since") or now)),
+                {"since": paused.get("since"), "after_shot": paused.get("after_shot")},
+                "the run is holding so the other camera does not shoot "
+                "unpaired frames; it resumes by itself when the node answers "
+                "its health poll. If it rebooted, see node_rebooted",
+                sev="bad"))
         # jitter from the active run
         if run.get("active"):
             for node, s in (run.get("stats") or {}).items():
@@ -241,6 +498,36 @@ class Anomalies:
                 "a mismatched stereo pair, and a run start will drop the "
                 "preview; it also expires on its own"))
         # The Jetson volume the transects are actually written to.
+        # Node clock agreement. Every scheduled fire and every epoch_hw edge
+        # lives on the NODE's clock, so two nodes disagreeing with each other
+        # lands 1:1 in inter-camera exposure skew — the whole sync budget is
+        # 10 ms. With no local chrony master (the Jetson is gone in the
+        # macOS-host topology) the Pis free-run apart silently; measured
+        # 16.8 ms apart on 2026-08-20. Offsets are RTT-bounded /health
+        # samples, so only differences well above the noise floor alarm.
+        clocked = [(m.name_, m.clock) for m in self.monitors
+                   if getattr(m, "clock", None)
+                   and now - m.clock["at"] < 30
+                   and m.clock["rtt_ms"] < 20]
+        for i in range(len(clocked)):
+            for j in range(i + 1, len(clocked)):
+                (na, ca), (nb, cb) = clocked[i], clocked[j]
+                skew = abs(ca["offset_s"] - cb["offset_s"]) * 1000.0
+                noise = (ca["rtt_ms"] + cb["rtt_ms"]) / 2.0
+                if skew > max(5.0, noise):
+                    out.append(self._a(
+                        "node_clock_skew", None,
+                        "%s and %s clocks disagree by %.1f ms" % (na, nb, skew),
+                        {"skew_ms": round(skew, 2),
+                         "offsets_ms": {na: round(ca["offset_s"] * 1e3, 2),
+                                        nb: round(cb["offset_s"] * 1e3, 2)},
+                         "rtt_noise_ms": round(noise, 2)},
+                        "scheduled fires land this far apart and the strobe "
+                        "walks out of the exposure window. Re-point both "
+                        "nodes' chrony at ONE reachable master (the rigd "
+                        "host, or peer cam2 to cam1) and confirm with "
+                        "chronyc tracking",
+                        sev="bad" if skew > 8.0 else "warn"))
         free = self._runs_free_mb()
         if isinstance(free, (int, float)) and free < RUNS_DISK_LOW_MB:
             out.append(self._a(
@@ -286,6 +573,7 @@ class Rig:
                                  self.events, self.nav)
         self.anomalies = Anomalies(self.monitors, self.runmgr, self.nav,
                                    self.events, self.settings)
+        self.anomalies.timesync = self.timesync
         self.runs = RunBrowser(self.events)
         self._stop = threading.Event()
         self._stopped = threading.Event()
@@ -297,6 +585,11 @@ class Rig:
         threading.Thread(target=self._reconcile_loop, daemon=True).start()
         threading.Thread(target=self._nav_time_loop, daemon=True).start()
         threading.Thread(target=self._startup_calibrate, daemon=True).start()
+        # Anomalies used to be evaluated ONLY when a browser polled
+        # /api/anomalies: with no tab open, a stuck card write, a rebooted
+        # node or a paused capture raised no event at all. Scan on a timer so
+        # the journal records them whether or not anyone is watching.
+        threading.Thread(target=self._anomaly_loop, daemon=True).start()
         self.events.emit("info", "lifecycle", "rigd up", port=PORT,
                          nodes=[m.name_ for m in self.monitors],
                          nav=bool(self.nav))
@@ -376,7 +669,13 @@ class Rig:
             # nav for the whole lifetime of the process.
             self.events.emit("warn", "nav", "iKonvert not open yet: %s" % e)
         reader.start()
-        return reader
+        wrapped = StaticFixNav(reader, navmod, self.events)
+        if wrapped.static_label():
+            self.events.emit("warn", "nav",
+                             "STATIC FIX armed: flight-log positions fall "
+                             "back to '%s' whenever there is no live fix"
+                             % wrapped.static_label())
+        return wrapped
 
     def _startup_calibrate(self):
         """Measure per-camera trigger latency once the fleet is up.
@@ -389,6 +688,14 @@ class Rig:
             live = [m for m in self.monitors if m.is_connected()]
             if len(live) >= 1:
                 time.sleep(3)          # let the property tables settle
+                # A run started during the boot window does its own
+                # calibration; firing this one into it would hold FOCUS
+                # (AE-lock) and race the run's frame naming.
+                if self.runmgr.status().get("active"):
+                    self.events.emit("info", "calibrate",
+                                     "startup calibration skipped: a run is "
+                                     "already active and calibrates itself")
+                    return
                 try:
                     self.runmgr.calibrate_trigger()
                 except Exception as e:  # noqa: BLE001
@@ -399,6 +706,14 @@ class Rig:
         self.events.emit("info", "calibrate",
                          "no camera connected within 90s; trigger latency "
                          "will be measured at the next run start")
+
+    def _anomaly_loop(self):
+        while True:
+            time.sleep(2.5)
+            try:
+                self.anomalies.scan()
+            except Exception as e:  # noqa: BLE001
+                self.events.emit("warn", "anomaly", "scan error: %s" % e)
 
     def _reconcile_loop(self):
         while not self._stop.wait(3.0):
@@ -515,6 +830,12 @@ class Rig:
             "zoom_pos": status.get("zoomPosCur", status.get("zoomPos")),
             "zoom_setting_label": status.get("zoomSettingLabel"),
             "convergence": snap.get("convergence"),
+            # This node's clock vs ours, RTT-bounded, from the /health poll.
+            # Two nodes disagreeing with each other is 1:1 exposure skew.
+            "clock_offset_ms": (round(m.clock["offset_s"] * 1e3, 2)
+                                if getattr(m, "clock", None) else None),
+            "clock_rtt_ms": (round(m.clock["rtt_ms"], 2)
+                             if getattr(m, "clock", None) else None),
             "gpio": h.get("gpio"), "imu": h.get("imu"),
             "disk_free_mb": h.get("disk_free_mb"),
             "cam_frames": h.get("cam_frames"),
@@ -705,6 +1026,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.runs.list_runs(limit=lim))
             elif p == "/api/run/detail":
                 self._runs(lambda: RIG.runs.detail((q.get("id") or [""])[0]))
+            elif p == "/api/run/shots":
+                self._runs(lambda: RIG.runs.shots(
+                    (q.get("id") or [""])[0],
+                    (q.get("offset") or ["0"])[0],
+                    (q.get("limit") or ["200"])[0]))
             elif p == "/api/run/frame":
                 self._run_frame((q.get("id") or [""])[0],
                                 (q.get("cam") or [""])[0],
@@ -724,6 +1050,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.imu_window(t0, now))
             elif p == "/api/nav":
                 self._json(RIG.nav_snapshot())
+            elif p == "/api/nav/all":
+                # The bus-sniffing table: every PGN seen on the N2K bus with
+                # age/rate/source and raw payload, decoded or not.
+                if RIG.nav and hasattr(RIG.nav, "bus_table"):
+                    self._json(RIG.nav.bus_table())
+                else:
+                    self._json({"present": False, "pgns": []})
+            elif p == "/nmea":
+                try:
+                    with open(os.path.join(HERE, "nmea_dash.html"), "rb") as fh:
+                        self._bytes(fh.read(), "text/html; charset=utf-8")
+                except OSError:
+                    self._bytes(b"nmea_dash.html missing", "text/plain", 500)
+            elif p == "/api/strobe":
+                self._json({"ok": True, "strobe": RIG.runmgr.get_strobe()})
             elif p == "/api/status":
                 m = self._mon((q.get("node") or [""])[0])
                 if not m:
@@ -766,6 +1107,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)},
                        404 if "no such" in str(e) else 400)
             return
+        # A transect frame never changes once written: let the browser keep
+        # it. Stepping back to a pair used to re-download and re-decode every
+        # byte (14 MB at transsize=Original) because _bytes sends no-store.
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            self._json({"ok": False, "error": str(e)}, 404)
+            return
+        etag = '"%s-%d-%d"' % (name, st.st_size, int(st.st_mtime))
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            return
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
@@ -773,8 +1129,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)}, 404)
             return
         ext = os.path.splitext(name)[1].lower()
-        self._bytes(data, "image/jpeg" if ext in (".jpg", ".jpeg")
-                    else "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg" if ext in (".jpg", ".jpeg")
+                         else "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _run_flight_log(self, rid, cam):
         try:
@@ -797,6 +1162,9 @@ class Handler(BaseHTTPRequestHandler):
         m = self._mon(node)
         if not m or not name:
             self._json({"ok": False, "error": "bad node/name"}, 400); return
+        if (m.snapshot().get("status") or {}).get("ilx_down"):
+            self._json({"ok": False, "error": "ilxctl not answering"}, 503)
+            return
         # ilxctl already validates the name; we forward as-is (it 404s bad ones)
         data, err = http_bytes("http://%s:8080/shot/%s" % (m.host, name),
                                timeout=30)
@@ -808,10 +1176,29 @@ class Handler(BaseHTTPRequestHandler):
         m = self._mon(node)
         if not m:
             self._json({"ok": False, "error": "bad node"}, 400); return
-        data, err = http_bytes("http://%s:8080/liveview.jpg" % m.host, timeout=8)
-        if err or not data:
+        if not m.is_connected():
+            # Never forward to a node whose camera is not live: against a
+            # wedged ilxctl every request strands an HTTP worker behind the
+            # stuck SDK mutex and the 8 s wait freezes the UI's picture.
+            self._json({"ok": False, "error": "camera not connected"}, 503)
+            return
+        active = bool(RIG.runmgr.status().get("active"))
+        data, err, age_ms, policy = LIVETAP.get(m, active)
+        if not data:
             self._json({"ok": False, "error": err or "no liveview"}, 503); return
-        self._bytes(data, "image/jpeg")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Age-ms", "%.0f" % (age_ms or 0))
+        self.send_header("X-Live-Policy", policy)
+        if err:
+            self.send_header("X-Live-Stale", err[:80])
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self):
         u = urlparse(self.path)
@@ -859,14 +1246,52 @@ class Handler(BaseHTTPRequestHandler):
             elif p == "/api/capture":
                 self._json(RIG.runmgr.capture_once(af=bool(b.get("af"))))
             elif p == "/api/calibrate":
+                # Never into a live transect: calibration holds FOCUS (an
+                # AE-lock on the body) and its exposures race the run's own
+                # frame naming — the run does its own calibration at start.
+                if RIG.runmgr.status().get("active"):
+                    self._json({"ok": False, "error":
+                                "a run is active - calibration would corrupt "
+                                "its exposures; stop the run first"}, 409)
+                    return
                 self._json({"ok": True,
                             "latency_ms": {k: round(v * 1000, 2) for k, v in
                                            RIG.runmgr.calibrate_trigger(
-                                               samples=int(b.get("samples", 5))
+                                               samples=int(b.get("samples", 5)),
+                                               force=True   # operator asked
                                            ).items()}})
             elif p == "/api/reconcile":
                 RIG.settings.reconcile_all(force=True)
                 self._json({"ok": True})
+            elif p == "/api/strobe":
+                # Strobe config: enable/node/delta_ms/pulse_ms. Validation and
+                # the shutter-speed warning live in RunManager.set_strobe.
+                self._json(RIG.runmgr.set_strobe(b or {}))
+            elif p == "/api/run/open":
+                # Open the run's folder in the host's file manager. The id is
+                # validated by RunBrowser.run_dir (path-guarded), and the
+                # RESOLVED path is passed as one argv - never through a shell.
+                try:
+                    path = RIG.runs.run_dir(str(b.get("id") or ""))
+                except RunsError as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+                    return
+                import subprocess
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                if opener == "xdg-open" and not (os.environ.get("DISPLAY") or
+                                                 os.environ.get(
+                                                     "WAYLAND_DISPLAY")):
+                    self._json({"ok": False, "path": path,
+                                "error": "no display on the rigd host - "
+                                         "browse or copy the path instead"})
+                    return
+                try:
+                    subprocess.Popen([opener, path],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    self._json({"ok": True, "path": path})
+                except OSError as e:
+                    self._json({"ok": False, "path": path, "error": str(e)})
             elif p == "/api/focus/mode":
                 # Focus MODE is fleet state, so it goes through `desired` and
                 # is converged like any other field. Fanning it out instead
@@ -878,6 +1303,25 @@ class Handler(BaseHTTPRequestHandler):
                 rep = RIG.settings.update({"focus_mode": b.get("mode")})
                 self._json({"ok": bool(rep["applied"]), "applied":
                             rep["applied"], "rejected": rep["rejected"]})
+            elif p == "/api/exposure":
+                # Per-camera exposure, LIVE: the operator tunes one body while
+                # its partner keeps the fleet vector, then either applies that
+                # exposure to the fleet (POST /api/settings) or deliberately
+                # leaves the bodies different. A node key is REQUIRED here so
+                # no client can fleet-write exposure by accident; the split
+                # shows up as convergence.exposure_split, never as a fault.
+                m = self._mon(b.get("node"))
+                if not m:
+                    self._json({"ok": False, "error": "a 'node' key naming one "
+                                "camera is required on /api/exposure"}, 400)
+                    return
+                if not m.is_connected():
+                    self._json({"ok": False, "error": "%s has no connected "
+                                "camera" % m.name_}, 409)
+                    return
+                r = m.set_exposure(b.get("which"), b.get("value"))
+                self._json(r if isinstance(r, dict)
+                           else {"ok": False, "error": "no response"})
             elif p in ("/api/focus/drive", "/api/focus/position",
                        "/api/zoom/drive", "/api/zoom/position",
                        "/api/zoom/setting"):
