@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "sha256.h"
 #include "httplib.h"
 #include "web_ui.h"
 
@@ -40,7 +41,7 @@ bool isJpegName(const std::string& n) {
     if (dot == std::string::npos) return false;
     std::string ext = n.substr(dot);
     for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return ext == ".jpg" || ext == ".jpeg";
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".arw" || ext == ".heif" || ext == ".hif";
 }
 
 // Reject anything that could climb out of the capture directory: only a plain
@@ -69,14 +70,22 @@ bool safeShotName(const std::string& n) {
 // sequentially, so name order is capture order. Only names that /shot/ would
 // actually serve are listed, which also keeps the JSON free of characters that
 // would need escaping.
-std::string shotsJson() {
+// Two served directories: the PC-save spool (what the body pushes live) and
+// the card-drain directory (what /api/card/pull fetches post-run). Never the
+// same dir: the run's pull worker lists the spool every 0.4 s and must not
+// see 35 MB RAWs appearing mid-survey.
+std::string dirFor(const std::string& which) {
+    return which == "raw" ? g_saveDir + "-raw" : g_saveDir;
+}
+
+std::string shotsJson(const std::string& dir) {
     std::vector<std::pair<std::string, long long>> files;
-    if (DIR* d = ::opendir(g_saveDir.c_str())) {
+    if (DIR* d = ::opendir(dir.c_str())) {
         while (const dirent* e = ::readdir(d)) {
             const std::string n = e->d_name;
             if (!safeShotName(n)) continue;
             struct stat st {};
-            if (::stat((g_saveDir + "/" + n).c_str(), &st) != 0) continue;
+            if (::stat((dir + "/" + n).c_str(), &st) != 0) continue;
             files.emplace_back(n, static_cast<long long>(st.st_size));
         }
         ::closedir(d);
@@ -453,9 +462,151 @@ int main(int argc, char** argv) {
     });
 
     // ----- captures ---------------------------------------------------------
-    g_srv.Get("/api/shots", [](const httplib::Request&, httplib::Response& res) {
+    g_srv.Get("/api/shots", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Cache-Control", "no-store");
-        res.set_content(shotsJson(), "application/json");
+        res.set_content(shotsJson(dirFor(req.get_param_value("dir"))), "application/json");
+    });
+
+    // Remove one served file. The host calls this after it has verified its
+    // copy (size + sha256), so a Pi spool never fills up over a season. Gated
+    // like format: {"confirm":"delete"}.
+    g_srv.Post("/api/shots/delete", [](const httplib::Request& req, httplib::Response& res) {
+        if (jsonStr(req.body, "confirm") != "delete") {
+            res.status = 400;
+            res.set_content("{\"ok\":false,\"error\":\"refusing without {\\\"confirm\\\":\\\"delete\\\"}\"}",
+                            "application/json");
+            return;
+        }
+        const std::string name = jsonStr(req.body, "name");
+        if (!safeShotName(name)) {
+            fail(res, "bad frame name", 400);
+            return;
+        }
+        const std::string path = dirFor(jsonStr(req.body, "dir")) + "/" + name;
+        struct stat st {};
+        if (::lstat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            fail(res, "no such frame", 404);
+            return;
+        }
+        if (std::remove(path.c_str()) != 0) {
+            fail(res, std::string("unlink failed: ") + std::strerror(errno), 500);
+            return;
+        }
+        ok(res, "\"deleted\":\"" + name + "\",\"bytes\":" + std::to_string(st.st_size));
+    });
+
+    // ---- card drain: ready / list / pull / delete / mode ----------------
+    // Cheap poll of whether the body has finished indexing the card after a
+    // mode switch - the drain gates its first list on this instead of a blind
+    // retry that holds the SDK for two minutes.
+    g_srv.Get("/api/card/ready", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(std::string("{\"ok\":true,\"ready\":") +
+                        (g_cam.cardIndexReady() ? "true" : "false") +
+                        ",\"mode\":\"" +
+                        (g_cam.controlMode() == SDK::CrSdkControlMode_RemoteTransfer
+                             ? "transfer" : "remote") + "\"}",
+                        "application/json");
+    });
+    g_srv.Get("/api/card/list", [](const httplib::Request& req, httplib::Response& res) {
+        std::vector<Camera::CardEntry> ents;
+        std::string err;
+        const int maxNums = static_cast<int>(jsonInt("{\"n\":" + req.get_param_value("n") + "}", "n", 4000, 1, 20000));
+        if (!g_cam.cardList(ents, err, maxNums)) {
+            fail(res, err, 503);
+            return;
+        }
+        std::string out = "{\"ok\":true,\"count\":" + std::to_string(ents.size()) + ",\"files\":[";
+        for (std::size_t i = 0; i < ents.size(); ++i) {
+            const auto& e = ents[i];
+            if (i) out += ',';
+            out += "{\"contentId\":" + std::to_string(e.contentId) +
+                   ",\"fileId\":" + std::to_string(e.fileId) +
+                   ",\"fileNumber\":" + std::to_string(e.fileNumber) +
+                   ",\"dirNumber\":" + std::to_string(e.dirNumber) +
+                   ",\"name\":\"" + jsonEscapeStr(e.name) + "\"" +
+                   ",\"size\":" + std::to_string(e.size) +
+                   ",\"format\":" + std::to_string(e.format) +
+                   ",\"captured_utc\":" + std::to_string(e.capturedUtc) + "}";
+        }
+        out += "]}";
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(out, "application/json");
+    });
+
+    g_srv.Post("/api/card/pull", [](const httplib::Request& req, httplib::Response& res) {
+        const long long cid = jsonInt(req.body, "contentId", -1, 0, 1LL << 32);
+        const long long fid = jsonInt(req.body, "fileId", -1, 0, 1LL << 16);
+        std::string name = jsonStr(req.body, "name");
+        if (cid < 0 || fid < 0 || !safeShotName(name)) {
+            fail(res, "need contentId, fileId and a safe name", 400);
+            return;
+        }
+        const std::string dir = dirFor("raw");
+        long long bytes = 0;
+        std::string err;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!g_cam.cardPull(static_cast<CrInt32u>(cid), static_cast<CrInt32u>(fid), dir, name,
+                            bytes, err, 180)) {
+            fail(res, err, 503);
+            return;
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        long long hashed = 0;
+        const std::string sha = sha256File(dir + "/" + name, &hashed);
+        g_cam.log("Card pull " + name + " " + std::to_string(bytes) + " B in " +
+                  std::to_string(secs) + " s");
+        ok(res, "\"name\":\"" + jsonEscapeStr(name) + "\",\"bytes\":" + std::to_string(bytes) +
+                 ",\"sha256\":\"" + sha + "\",\"secs\":" + std::to_string(secs));
+    });
+
+    g_srv.Post("/api/card/delete", [](const httplib::Request& req, httplib::Response& res) {
+        if (jsonStr(req.body, "confirm") != "delete") {
+            res.status = 400;
+            res.set_content("{\"ok\":false,\"error\":\"refusing without {\\\"confirm\\\":\\\"delete\\\"}\"}",
+                            "application/json");
+            return;
+        }
+        const long long cid = jsonInt(req.body, "contentId", -1, 0, 1LL << 32);
+        if (cid < 0) {
+            fail(res, "need contentId", 400);
+            return;
+        }
+        std::string err;
+        if (!g_cam.cardDelete(static_cast<CrInt32u>(cid), err)) {
+            fail(res, err, 503);
+            return;
+        }
+        ok(res, "\"deleted\":" + std::to_string(cid));
+    });
+
+    // Some bodies only answer Remote Transfer calls in the dedicated SDK
+    // control mode; switching reconnects the session in that mode (no
+    // shooting while in it) and back again.
+    g_srv.Post("/api/card/mode", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string mode = jsonStr(req.body, "mode");
+        SDK::CrSdkControlMode m = SDK::CrSdkControlMode_Remote;
+        if (mode == "transfer") m = SDK::CrSdkControlMode_RemoteTransfer;
+        else if (mode != "remote") {
+            fail(res, "mode must be remote|transfer", 400);
+            return;
+        }
+        g_cam.disconnect();
+        std::string err;
+        const auto cams = g_cam.enumerate(3);
+        int pick = -1;
+        for (std::size_t i = 0; i < cams.size(); ++i)
+            if (camMatch.empty() || cams[i].id.find(camMatch) != std::string::npos ||
+                cams[i].model.find(camMatch) != std::string::npos) { pick = static_cast<int>(i); break; }
+        if (pick < 0) {
+            fail(res, "no camera found to reconnect in " + mode + " mode", 503);
+            return;
+        }
+        if (!g_cam.connect(pick, err, m)) {
+            fail(res, err, 503);
+            return;
+        }
+        ok(res, "\"mode\":\"" + mode + "\"");
     });
 
     g_srv.Get(R"(/shot/(.+))", [](const httplib::Request& req, httplib::Response& res) {
@@ -464,11 +615,13 @@ int main(int argc, char** argv) {
             fail(res, "bad frame name", 404);
             return;
         }
-        // A JPEG the camera writes is a few MB; refuse anything that would
-        // stress a Pi's RAM to slurp. The cap is enforced on the read too, in
-        // case the file grows between stat and fread.
-        constexpr long long kMaxShotBytes = 64LL * 1024 * 1024;
-        const std::string path = g_saveDir + "/" + name;
+        const std::string which = req.get_param_value("dir");
+        // A JPEG the camera writes is a few MB; a drained RAW is 30-130 MB.
+        // Refuse anything beyond that so a Pi's RAM is never asked to slurp
+        // something absurd. The cap is enforced on the read too, in case the
+        // file grows between stat and fread.
+        const long long kMaxShotBytes = (which == "raw" ? 160LL : 64LL) * 1024 * 1024;
+        const std::string path = dirFor(which) + "/" + name;
         struct stat st {};
         // lstat, not stat: a symlink named *.jpg in the save dir must not be
         // followed to serve whatever it points at. Only a real regular file.

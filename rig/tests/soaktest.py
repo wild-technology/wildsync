@@ -1735,6 +1735,61 @@ def suite_strobe(opts):
         env.close()
 
 
+def suite_drain(opts):
+    sect("card drain: pull -> verify sha -> delete, run/drain mutual exclusion")
+    import drain as draindrv
+    env = Env([("cam2", "127.0.0.2", 2), ("cam3", "127.0.0.3", 3)],
+              poll=0.3, threaded=True)
+    a = env.node("cam2")
+    try:
+        env.wait_state("cam2", "CAM_CONNECTED")
+        # land some card content by firing
+        for _ in range(5):
+            a.add_frame(epoch=time.time())
+        host = env.node_host("cam2") if hasattr(env, "node_host") else "127.0.0.2"
+        dest = os.path.join(env.dir, "raw")
+        # point the drainer at the fake's mapped address
+        from fakenode import loopback_map
+        h, port = loopback_map("127.0.0.2", 8080)
+        dr = draindrv.Drainer("cam2", "%s:%d" % (h, port) if port != 8080 else h,
+                              dest=dest, log=lambda *a: None)
+        dr.base = "http://%s:%d" % (h, port)
+        n_card = len(a.card)
+        rep = dr.run()
+        check("every RAW pulled verified its sha256",
+              rep["pulled"] == n_card and not rep["errors"],
+              json.dumps({k: rep[k] for k in ("pulled", "deleted", "errors")}))
+        check("verified files landed on the host",
+              all(os.path.exists(os.path.join(dest, nm)) for nm in rep["files"]),
+              str(rep["files"][:3]))
+        check("each pulled shot was deleted from the card",
+              len(a.card) == 0, "%d left" % len(a.card))
+        check("the camera was returned to remote mode after the drain",
+              a.card_mode == "remote", a.card_mode)
+
+        # a corrupt transfer must keep the file on the card
+        a.add_frame(epoch=time.time())
+        cid = max(a.card)
+        # monkeypatch the fetch to return wrong bytes for this one
+        orig_fetch = dr.fetch
+        dr.fetch = lambda name: b"corrupt"
+        rep2 = dr.run()
+        dr.fetch = orig_fetch
+        check("a hash mismatch keeps the file on the card",
+              cid in a.card and any("HASH MISMATCH" in e for e in rep2["errors"]),
+              json.dumps(rep2["errors"][:2]))
+
+        # run/drain mutual exclusion
+        env.runmgr.draining = "cam2"
+        r = env.runmgr.start({"label": "x"})
+        check("a run refuses to start while a drain holds the node",
+              r.get("ok") is False and "drain" in (r.get("error") or ""),
+              json.dumps(r))
+        env.runmgr.draining = None
+    finally:
+        env.close()
+
+
 def suite_resource(opts):
     sect("resource discipline: threads, file descriptors, rings")
     env = Env([("cam2", "127.0.0.2", 2), ("cam3", "127.0.0.3", 3,
@@ -2018,7 +2073,8 @@ def soak(seconds, opts):
 SUITES = [("fake", suite_fake), ("monitor", suite_monitor),
           ("strobe", suite_strobe),
           ("settings", suite_settings), ("runmgr", suite_runmgr),
-          ("pull", suite_pull), ("resource", suite_resource)]
+          ("pull", suite_pull), ("drain", suite_drain),
+          ("resource", suite_resource)]
 
 
 def main():

@@ -53,6 +53,9 @@ struct IntervalStatus {
     std::string lastError;
 };
 
+// Defined in camera.cpp; shared with main.cpp's route builders.
+std::string jsonEscapeStr(const std::string& s);
+
 class Camera : public SDK::IDeviceCallback {
 public:
     Camera() = default;
@@ -64,8 +67,35 @@ public:
 
     // Discovery / lifecycle -------------------------------------------------
     std::vector<CameraInfo> enumerate(int timeoutSec = 3);
-    bool connect(int index, std::string& err);
+    bool connect(int index, std::string& err,
+                 SDK::CrSdkControlMode mode = SDK::CrSdkControlMode_Remote);
     void disconnect();
+    SDK::CrSdkControlMode controlMode() const { return m_mode; }
+
+    // Card drain (SDK "Remote Transfer"): list what the card holds, pull a
+    // file to a directory, delete a content. Post-run only - never while a
+    // survey is recording.
+    struct CardEntry {
+        CrInt32u contentId = 0;
+        CrInt32u fileId = 0;
+        CrInt32u fileNumber = 0;
+        CrInt32u dirNumber = 0;
+        std::string name;        // basename on the card, e.g. DSC09187.ARW
+        long long size = 0;
+        CrInt32u format = 0;     // CrContentsFile_FileFormat
+        long long capturedUtc = 0;   // the BODY's clock (days wrong on this rig)
+    };
+    bool cardList(std::vector<CardEntry>& out, std::string& err, int maxNums = 4000);
+    bool cardPull(CrInt32u contentId, CrInt32u fileId, const std::string& dir,
+                  const std::string& fileName, long long& bytes, std::string& err,
+                  int timeoutSec = 180);
+    bool cardDelete(CrInt32u contentId, std::string& err);
+    void OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrChar* filename) override;
+    void OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrInt8u* data,
+                                      CrInt64u size) override;
+    void OnNotifyRemoteTransferContentsListChanged(CrInt32u notify, CrInt32u slotNumber,
+                                                   CrInt32u addSize) override;
+    bool cardIndexReady() const { return m_cardIndexReady.load(); }
     bool isConnected() const { return m_connected.load(); }
     std::string modelName() const;
 
@@ -188,6 +218,14 @@ private:
     // OnConnected from that same attempt is ignored rather than resurrecting a
     // dead session (connected==true while m_handle==0).
     std::atomic<bool> m_attemptAbandoned{false};
+    SDK::CrSdkControlMode m_mode = SDK::CrSdkControlMode_Remote;
+    // remote-transfer completion handshake
+    std::mutex m_rtMutex;
+    std::condition_variable m_rtCv;
+    int m_rtResult = 0;          // 0 pending, 1 ok, -1 failed, -2 busy
+    CrInt32u m_rtPercent = 0;
+    std::string m_rtFile;
+    std::atomic<bool> m_cardIndexReady{false};
     // True from just before SDK::Connect until the attempt concludes; lets
     // statusJson answer without the SDK mutex while a connect blocks.
     std::atomic<bool> m_connecting{false};

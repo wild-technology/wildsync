@@ -710,6 +710,7 @@ class RunManager:
         self.imu_node = imu_node
         self._imu_node_cache = None
         self._lock = threading.Lock()
+        self.draining = None       # node name while a card drain holds it
         self.active = None            # dict describing the current run
         self.workers = {}
         # node -> TRIGGER->EXPOSURE latency in seconds, measured not assumed.
@@ -910,6 +911,10 @@ class RunManager:
             if self.active:
                 return {"ok": False, "error": "run already active",
                         "run_id": self.active["run_id"]}
+            if getattr(self, "draining", None):
+                return {"ok": False, "error": "card drain in progress on %s - "
+                        "cannot start a run (the camera is in transfer mode)"
+                        % self.draining}
             # Latch the timebase for the whole run, before anything is named.
             time_off, time_src = self._live_time_base()
             now = time.time() + time_off

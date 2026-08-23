@@ -219,6 +219,11 @@ class FakeNode:
         # Pi's save dir. That is cam3's real state whenever the body's PC-save
         # menu or PC control priority is lost (see PROTOCOL.md + field notes).
         self.pc_save = True
+        # A synthetic card for the drain path: contentId -> {jpeg, raw bytes}.
+        # Populated lazily; each fired frame also lands a RAW here.
+        self.card = {}
+        self._card_seq = 40000
+        self.card_mode = "remote"
         self.log = ["ilxctl up", "USB device found"]
         # Force chosen /api/status keys to a fixed value, so a status whose
         # human label disagrees with its raw number can be staged on demand.
@@ -360,6 +365,14 @@ class FakeNode:
                 data = (data * (size_bytes // len(data) + 1))[:size_bytes]
             self.shots.append({"name": nm, "size": len(data), "bytes": data,
                                "epoch": ep})
+            # The same shot also lands a JPEG+RAW pair on the card (one
+            # contentId), so the drain path has something to pull.
+            self._card_seq += 1
+            cid = self._card_seq
+            base = "_CA%05d" % cid
+            raw = (_fallback_jpeg(ep) * 40)[:200000]      # a stand-in "RAW"
+            self.card[cid] = {1: (base + ".JPG", data, 0x3801),
+                              2: (base + ".ARW", raw, 0xB101)}
             return nm
 
     def push_edge(self, epoch=None, edge="fall", fire_seq=None):
@@ -618,6 +631,13 @@ class _Handler(BaseHTTPRequestHandler):
                                  for s in node.shots])
         elif method == "GET" and path.startswith("/shot/"):
             name = unquote(path[len("/shot/"):])
+            if (query.get("dir") or [""])[0] == "raw":
+                with node._lock:
+                    hit = next((data for c in node.card.values()
+                                for (nm, data, fmt) in c.values() if nm == name), None)
+                if hit is None:
+                    self._send_json({"ok": False, "error": "no such frame"}, 404); return
+                self._send_raw(hit, "image/jpeg"); return
             with node._lock:
                 shot = next((s for s in node.shots if s["name"] == name), None)
             if shot is None or f["vanish"]:
@@ -632,6 +652,47 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_raw(data, "image/jpeg")
         elif method == "GET" and path == "/liveview.jpg":
             self._send_raw(make_jpeg(time.time()), "image/jpeg")
+        elif method == "POST" and path == "/api/card/mode":
+            with node._lock:
+                node.card_mode = (body or {}).get("mode", "remote")
+            self._send_json({"ok": True, "mode": node.card_mode})
+        elif method == "GET" and path == "/api/card/ready":
+            with node._lock:
+                self._send_json({"ok": True, "ready": node.card_mode == "transfer",
+                                 "mode": node.card_mode})
+        elif method == "GET" and path == "/api/card/list":
+            with node._lock:
+                if node.card_mode != "transfer":
+                    self._send_json({"ok": False, "error": "InvalidCalled 0x8402"}, 503); return
+                files = []
+                for cid, c in sorted(node.card.items()):
+                    for fid, (nm, data, fmt) in c.items():
+                        files.append({"contentId": cid, "fileId": fid, "name": nm,
+                                      "size": len(data), "format": fmt,
+                                      "fileNumber": cid, "dirNumber": 100,
+                                      "captured_utc": 1787000000})
+            self._send_json({"ok": True, "count": len(files), "files": files})
+        elif method == "POST" and path == "/api/card/pull":
+            cid = int((body or {}).get("contentId", -1)); fid = int((body or {}).get("fileId", -1))
+            with node._lock:
+                ent = node.card.get(cid, {}).get(fid)
+            if not ent:
+                self._send_json({"ok": False, "error": "content not found"}, 503); return
+            nm, data, fmt = ent
+            import hashlib
+            self._send_json({"ok": True, "name": nm, "bytes": len(data),
+                             "sha256": hashlib.sha256(data).hexdigest(), "secs": 0.01})
+        elif method == "POST" and path == "/api/card/delete":
+            if (body or {}).get("confirm") != "delete":
+                self._send_json({"ok": False, "error": "confirm"}, 400); return
+            cid = int((body or {}).get("contentId", -1))
+            with node._lock:
+                existed = node.card.pop(cid, None)
+            self._send_json({"ok": bool(existed), "deleted": cid})
+        elif method == "POST" and path == "/api/shots/delete":
+            if (body or {}).get("confirm") != "delete":
+                self._send_json({"ok": False, "error": "confirm"}, 400); return
+            self._send_json({"ok": True})
         elif method == "POST" and path == "/api/connect":
             if f["connect_lies"]:
                 # ilxctl reports success, but PC-remote priority is not actually
