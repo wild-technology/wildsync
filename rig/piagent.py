@@ -56,6 +56,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BCM_FOCUS = 17      # header pin 11 -> harness pin 4
 BCM_TRIGGER = 27    # header pin 13 -> harness pin 5
 BCM_EXPOSURE = 22   # header pin 15 -> harness pin 6
+# Strobe sync (docs/strobe-trigger.md): Bolt VB-22 sync tip on header pin 37,
+# shell on pin 39. Open-drain contact closure, NO pull-up flag (the flash
+# supplies its own 2.9 V pull-up), never parked (it is our OUTPUT, not a camera
+# input, and `gpio=26=ip,np` on the kernel cmdline makes unconfigured == off).
+# 0 disables strobe support on this node.
+BCM_STROBE = int(os.environ.get("WILDSYNC_STROBE_BCM", "26"))
+# A strobe instant is scheduled relative to the shot's shared target T
+# (δ ≈ 8–12 ms after T clears curtain travel plus skew). Anything more than
+# this far from the trigger instant is a scheduling bug, not a plan.
+STROBE_MAX_AFTER_S = 2.0
 
 # Guard window for EXPOSURE edge debouncing. Well under the >=1 ms Sony
 # specifies for the assert (measured ~13 ms), and far above the ~60 us bursts a
@@ -165,7 +175,10 @@ class _LineDriver:
 
     IDLE, ASSERT = 1, 0                  # open-drain: 1 == high-Z, 0 == pulled low
 
-    def __init__(self, chip_name, lines):
+    def __init__(self, chip_name, lines, pull_up=True):
+        """pull_up=False is for the strobe sync line: the flash supplies its
+        own pull-up (measured 2.9 V open circuit), and adding ours would leak
+        current into its trigger circuit for no benefit."""
         self.ok = False
         self._lines = {}
         self._chip = None
@@ -178,7 +191,8 @@ class _LineDriver:
             flags = getattr(gpiod, "LINE_REQ_FLAG_OPEN_DRAIN", 0)
             # Bias is a newer kernel/libgpiod feature; if the build lacks it the
             # open-drain idle still leaves the line high-Z, which is safe.
-            flags |= getattr(gpiod, "LINE_REQ_FLAG_BIAS_PULL_UP", 0)
+            if pull_up:
+                flags |= getattr(gpiod, "LINE_REQ_FLAG_BIAS_PULL_UP", 0)
             for bcm in lines:
                 ln = self._chip.get_line(bcm)
                 ln.request(consumer="wildsync", type=gpiod.LINE_REQ_DIR_OUT,
@@ -343,6 +357,13 @@ class Gpio:
         # that made trigger latency platform-dependent, and its open-drain idle
         # doubles as the safe park for both camera inputs.
         self.driver = _LineDriver(self.chip, self.PARKED_INPUTS)
+        # Strobe: claimed lazily on the first scheduled strobe, so a node with
+        # nothing on pin 37 never touches the line at all. Open-drain with NO
+        # pull-up (the flash supplies 2.9 V of its own) and never parked.
+        self._strobe = None              # _LineDriver once claimed, or False
+        self._strobe_fires = 0
+        self._strobe_last = None         # epoch of the last pulse
+        self._strobe_err = None
         if self.available:
             self._start_monitor()
             if not self.driver.ok:
@@ -494,7 +515,8 @@ class Gpio:
                       % (skew, cls.FIRE_MAX_FUTURE_S, cls.FIRE_MAX_PAST_S)),
             "clock_skew_s": round(skew, 3), "node_epoch": time.time()}
 
-    def fire(self, at_epoch, pulse_ms, focus_lead_ms=0):
+    def fire(self, at_epoch, pulse_ms, focus_lead_ms=0, strobe_at_epoch=0,
+             strobe_pulse_ms=5):
         if not self.available:
             return {"ok": False, "error": "no gpio on this node"}
         focus_lead_ms = max(0, min(int(focus_lead_ms or 0), 500))
@@ -507,6 +529,26 @@ class Gpio:
         at_epoch, fault = self._epoch_fault(at_epoch)
         if fault:
             return fault
+        # Strobe schedule sanity: δ is measured in milliseconds after the shot's
+        # target instant (docs/strobe-trigger.md §4.1). A strobe before the
+        # trigger, or seconds after it, is a scheduling bug the Jetson needs to
+        # hear about, not a plan to honour.
+        try:
+            strobe_at = float(strobe_at_epoch or 0)
+        except (TypeError, ValueError):
+            strobe_at = 0.0
+        if strobe_at:
+            base = at_epoch or time.time()
+            delta = strobe_at - base
+            if not (0.0 < delta <= STROBE_MAX_AFTER_S):
+                return {"ok": False, "code": 400,
+                        "error": "strobe_at_epoch sits %+.3f s from at_epoch - "
+                                 "must be 0..%.1f s after it" %
+                                 (delta, STROBE_MAX_AFTER_S)}
+            # Claim the line now, while we are still waiting for the shot's
+            # instant, so the first-ever strobe does not pay the chip-open
+            # latency inside its timing window.
+            self._strobe_driver()
         # One fire at a time. Two overlapping fires share FOCUS and TRIGGER, so
         # they interleave into a single malformed pulse train that drops frames,
         # and the second would steal the first's FOCUS. Queueing the second is no
@@ -519,11 +561,93 @@ class Gpio:
             return {"ok": False, "code": 409, "busy": True,
                     "error": "another fire is in flight on this node"}
         try:
-            return self._fire_locked(at_epoch, pulse_ms, focus_lead_ms)
+            return self._fire_locked(at_epoch, pulse_ms, focus_lead_ms,
+                                     strobe_at, strobe_pulse_ms)
         finally:
             self._fire_lock.release()
 
-    def _fire_locked(self, at_epoch, pulse_ms, focus_lead_ms):
+    # ---- strobe -------------------------------------------------------------
+    def _strobe_driver(self):
+        """The strobe line, claimed lazily; False when unavailable.
+
+        Lazy so a node with nothing on pin 37 never touches the pad at all —
+        `gpio=26=ip,np` on the kernel cmdline keeps it high-Z until the first
+        scheduled strobe actually claims it."""
+        with self._lock:
+            if self._strobe is not None:
+                return self._strobe
+            if not BCM_STROBE:
+                self._strobe, self._strobe_err = False, "strobe disabled " \
+                    "(WILDSYNC_STROBE_BCM=0)"
+                return False
+            if not self.available:
+                self._strobe, self._strobe_err = False, "no gpio on this node"
+                return False
+            drv = _LineDriver(self.chip, (BCM_STROBE,), pull_up=False)
+            if not drv.ok:
+                self._strobe, self._strobe_err = False, \
+                    "could not claim BCM%d (gpiod path required)" % BCM_STROBE
+                log("warn", "strobe", self._strobe_err)
+                return False
+            self._strobe, self._strobe_err = drv, None
+            log("info", "strobe", "strobe line claimed open-drain, no pull",
+                bcm=BCM_STROBE)
+            return drv
+
+    def strobe_only(self, at_epoch, pulse_ms=5):
+        """Pulse the strobe with NO camera fire — the survey's light must not
+        depend on this node's camera being claimable. The 2026-08-16 card
+        fault took cam1's camera out while its Pi (the strobe host) stayed
+        perfectly healthy; riding the strobe exclusively on /gpio/fire would
+        have darkened every cam2 frame for the rest of that survey."""
+        if not self.available:
+            return {"ok": False, "error": "no gpio on this node"}
+        try:
+            at = float(at_epoch or 0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if at <= 0:
+            return {"ok": False, "code": 400,
+                    "error": "at_epoch is required for a scheduled strobe"}
+        skew = at - time.time()
+        if not (-0.05 <= skew <= self.FIRE_MAX_FUTURE_S):
+            return {"ok": False, "code": 400,
+                    "error": "at_epoch is %+.3f s from this node's clock"
+                             % skew}
+        if self._strobe_driver() is False:
+            return {"ok": False,
+                    "error": self._strobe_err or "strobe unavailable"}
+        r = self._strobe_pulse(at, pulse_ms)
+        if "strobe_error" in r:
+            return {"ok": False, "error": r["strobe_error"]}
+        r["ok"] = True
+        return r
+
+    def _strobe_pulse(self, strobe_at, pulse_ms):
+        """Busy-wait to the strobe instant and close the sync contact.
+
+        Runs inside the fire lock, after the TRIGGER pulse: δ ≈ 8–12 ms after
+        the shared target T, which is ~30 ms after this node's own trigger
+        (fired at T − ~22 ms latency), so the wait is short and exclusive."""
+        drv = self._strobe_driver()
+        if drv is False:
+            return {"strobe_error": self._strobe_err or "strobe unavailable"}
+        pulse_ms = max(1, min(int(pulse_ms or 5), 100))
+        _LineDriver._spin_until(strobe_at)
+        t = drv.pulse(BCM_STROBE, pulse_ms / 1000.0)
+        if t is None:
+            return {"strobe_error": "strobe line write failed"}
+        with self._lock:
+            self._strobe_fires += 1
+            self._strobe_last = t
+        late = (t - strobe_at) * 1000.0
+        if late > 5.0:
+            log("warn", "strobe_late", "strobe pulsed late",
+                late_ms=round(late, 2))
+        return {"strobe_epoch": t, "strobe_late_ms": round(late, 2)}
+
+    def _fire_locked(self, at_epoch, pulse_ms, focus_lead_ms,
+                     strobe_at=0.0, strobe_pulse_ms=5):
         # Busy-wait the final approach so scheduling jitter does not smear the
         # fire time; sleep the coarse part to stay off the CPU.
         # Wake early enough to place the FOCUS lead before the target instant,
@@ -568,8 +692,12 @@ class Gpio:
                 self._unclaim(seq)
                 return {"ok": False, "error": "trigger line unavailable",
                         "fire_seq": seq, "edge_seq": edge_seq}
-            return self._fire_result(seq, edge_seq, requested, actual, pulse_ms,
-                                     "gpiod")
+            extra = self._strobe_pulse(strobe_at, strobe_pulse_ms) \
+                if strobe_at else {}
+            res = self._fire_result(seq, edge_seq, requested, actual, pulse_ms,
+                                    "gpiod")
+            res.update(extra)
+            return res
         # Fallback path: no python3-libgpiod, so every edge is a subprocess.
         held = self.focus_held()
         if focus_lead_ms and not held:
@@ -615,8 +743,12 @@ class Gpio:
                 # Release only what this shot asserted, and never leave FOCUS
                 # low on the way out: a permanent half-press locks the body.
                 self.focus(False)
-        return self._fire_result(seq, edge_seq, requested, actual, pulse_ms,
-                                 "gpioset")
+        extra = self._strobe_pulse(strobe_at, strobe_pulse_ms) \
+            if strobe_at else {}
+        res = self._fire_result(seq, edge_seq, requested, actual, pulse_ms,
+                                "gpioset")
+        res.update(extra)
+        return res
 
     def _unclaim(self, seq):
         """A fire that never pulsed must not adopt the next edge on the line."""
@@ -792,9 +924,19 @@ class Gpio:
                     hw = None
                     if raw is not None:
                         hw = raw + (time.time() - time.monotonic())
+                    # The reference carries its CLOCK DOMAIN. raw is kernel
+                    # CLOCK_MONOTONIC (~1e5 s since boot); epoch is wall time
+                    # (~1.7e9 s). One unparseable line used to store a wall
+                    # reference, after which every genuine monotonic edge
+                    # compared as (1e5 - 1.7e9) < guard — a bounce — forever:
+                    # edges_seen froze and every frame silently fell back to
+                    # EXIF. Comparing across domains is meaningless; only a
+                    # same-domain reference may debounce an edge.
+                    domain = "raw" if raw is not None else "epoch"
                     ref = raw if raw is not None else epoch
                     last = self._last_edge.get(edge)
-                    if last is not None and (ref - last) < EDGE_DEBOUNCE_S:
+                    if last is not None and last[0] == domain \
+                            and (ref - last[1]) < EDGE_DEBOUNCE_S:
                         # Do NOT advance the reference on a dropped edge. Doing
                         # so makes the dead time self-extending: a line that
                         # rings faster than the guard window keeps pushing the
@@ -805,13 +947,17 @@ class Gpio:
                         # from the last ACCEPTED edge only.
                         self._bounced += 1
                         continue
-                    self._last_edge[edge] = ref
+                    self._last_edge[edge] = (domain, ref)
                     self._record_edge(epoch, edge, raw, hw)
                     if edge == "fall":
                         log("debug", "exposure_edge", "capture edge",
                             epoch=round(epoch, 4))
             except Exception as e:  # noqa: BLE001 - monitor must never die silently
                 log("warn", "gpio_monitor", "monitor read error", err=str(e))
+            # A fresh gpiomon is a fresh timestamp stream: a reference carried
+            # across the respawn could swallow the first genuine edge of the
+            # new child (or poison the domain check above).
+            self._last_edge = {}
             if self._mon_run:
                 time.sleep(1)      # brief backoff before respawn
 
@@ -874,6 +1020,14 @@ class Gpio:
                 "inputs_parked": parked,
                 "trigger_path": "gpiod" if self.driver.ok else "gpioset",
                 "edges_bounced": self._bounced,
+                # Strobe line (docs/strobe-trigger.md): claimed lazily on the
+                # first scheduled strobe, so claimed=False on a node with no
+                # flash is the normal, safe state, not a fault.
+                "strobe": {"bcm": BCM_STROBE,
+                           "claimed": bool(self._strobe),
+                           "fires": self._strobe_fires,
+                           "last_epoch": self._strobe_last,
+                           "error": self._strobe_err},
                 # With the gpiod driver the lines are held open-drain-idle for
                 # the life of the process, which is the safe state by construction.
                 "harness_safe": (self.driver.ok
@@ -894,6 +1048,13 @@ class Gpio:
             self.driver.close()
         else:
             self._release_focus()
+        # The strobe line releases to its cmdline-configured no-pull high-Z
+        # (`gpio=26=ip,np`), which the flash's own pull-up holds idle — never
+        # asserted, so a dying piagent cannot latch the tube on.
+        if self._strobe:
+            self._strobe.set(BCM_STROBE, _LineDriver.IDLE)
+            self._strobe.close()
+            self._strobe = None
         # Leave a pull-up on the pads either way: once our handles are gone the
         # line reverts to pad bias, and a bare release lands on a pull-DOWN here
         # - which is a permanent half-press on the camera.
@@ -1057,13 +1218,46 @@ def health():
     return {
         "node": NODE,
         "uptime_s": round(time.time() - T_START, 1),
+        # The Pi's uptime, not this process's: a service restart (every
+        # deploy) must not read as a power loss on the host.
+        "host_uptime_s": _host_uptime(),
         "gpio": GPIO.state(),
         "imu": IMU.health(),
         "disk_free_mb": _disk_free_mb(CAM_SAVE_DIR),
         "cam_frames": _count_frames(),
         "load1": _load1(),
+        "power": _power(),
         "time": {"epoch": time.time(), "source": "local"},
     }
+
+
+def _host_uptime():
+    try:
+        with open("/proc/uptime") as fh:
+            return round(float(fh.read().split()[0]), 1)
+    except (OSError, ValueError):
+        return None
+
+
+_THROTTLED_PATH = "/sys/devices/platform/soc/soc:firmware/get_throttled"
+
+
+def _power():
+    """The firmware's under-voltage / throttling word, straight from sysfs
+    (no subprocess): bit 0 = under-voltage NOW, 16 = has occurred since boot,
+    1/17 = frequency capped, 2/18 = throttled, 3/19 = soft temp limit. On
+    this rig a node that browns out usually reboots outright (flags reset),
+    but a sag that stops short of a reset shows here first."""
+    try:
+        with open(_THROTTLED_PATH) as fh:
+            raw = int(fh.read().strip(), 0)
+    except (OSError, ValueError):
+        return None
+    return {"throttled": "0x%x" % raw,
+            "undervolt_now": bool(raw & 0x1),
+            "undervolt_since_boot": bool(raw & 0x10000),
+            "throttled_now": bool(raw & 0x4),
+            "throttled_since_boot": bool(raw & 0x40000)}
 
 
 def _count_frames():
@@ -1141,7 +1335,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"ok": ok, "focus_held": GPIO.focus_held()})
             elif path == "/gpio/fire":
                 res = GPIO.fire(b.get("at_epoch", 0), b.get("pulse_ms", 5),
-                                b.get("focus_lead_ms", 0))
+                                b.get("focus_lead_ms", 0),
+                                b.get("strobe_at_epoch", 0),
+                                b.get("strobe_pulse_ms", 5))
+                self._send(res, res.get("code", 200 if res.get("ok") else 400))
+            elif path == "/gpio/strobe":
+                res = GPIO.strobe_only(b.get("at_epoch", 0),
+                                       b.get("pulse_ms", 5))
                 self._send(res, res.get("code", 200 if res.get("ok") else 400))
             elif path == "/gpio/interval/start":
                 res = GPIO.interval_start(b.get("at_epoch", 0),

@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -501,30 +503,100 @@ int main(int argc, char** argv) {
         res.set_content(data, "image/jpeg");
     });
 
+    // Live view backstop: at most ~10 SDK grabs per second no matter how many
+    // clients ask (rigd's own page, the built-in page, a stray curl loop).
+    // Unbounded polling (~53 fps, bench 2026-08-23) starved the SDK transfer
+    // path to zero delivered frames and wedged a body; this is the node-side
+    // floor under rigd's throttle.
     g_srv.Get("/liveview.jpg", [](const httplib::Request&, httplib::Response& res) {
-        std::vector<unsigned char> jpg;
-        std::string err;
-        if (!g_cam.liveViewJpeg(jpg, err)) {
-            fail(res, err, 503);
+        static std::mutex lvMutex;
+        static std::vector<unsigned char> lvCache;
+        static std::chrono::steady_clock::time_point lvAt{};
+        std::lock_guard<std::mutex> lk(lvMutex);
+        const auto now = std::chrono::steady_clock::now();
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - lvAt);
+        if (lvCache.empty() || age.count() >= 100) {
+            std::vector<unsigned char> jpg;
+            std::string err;
+            if (g_cam.liveViewJpeg(jpg, err)) {
+                lvCache.swap(jpg);
+                lvAt = now;
+            } else if (lvCache.empty()) {
+                fail(res, err, 503);
+                return;
+            }
+        }
+        const auto served = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - lvAt);
+        res.set_header("Cache-Control", "no-store");
+        res.set_header("X-LiveView-Age-Ms", std::to_string(served.count()));
+        res.set_content(reinterpret_cast<const char*>(lvCache.data()), lvCache.size(), "image/jpeg");
+    });
+
+    // Spool hygiene. The PC-save dir grows forever (1400+ files per node
+    // after a week) and every new frame then collides with an old name and
+    // lands as NAME(n).JPG. Moves files older than `older_than_s` (default a
+    // day), keeping the newest `keep` (default 50), into <dir>-archive — never
+    // deletes. Requires {"confirm":"prune"}.
+    g_srv.Post("/api/spool/prune", [](const httplib::Request& req, httplib::Response& res) {
+        if (jsonStr(req.body, "confirm") != "prune") {
+            res.status = 400;
+            res.set_content("{\"ok\":false,\"error\":\"refusing without {\\\"confirm\\\":\\\"prune\\\"}\"}",
+                            "application/json");
             return;
         }
-        res.set_header("Cache-Control", "no-store");
-        res.set_content(reinterpret_cast<const char*>(jpg.data()), jpg.size(), "image/jpeg");
+        const long long olderThan = jsonInt(req.body, "older_than_s", 86400, 0, 1LL << 40);
+        const long long keep = jsonInt(req.body, "keep", 50, 0, 100000);
+        struct Ent { std::string name; time_t mtime; };
+        std::vector<Ent> ents;
+        if (DIR* d = ::opendir(g_saveDir.c_str())) {
+            while (dirent* e = ::readdir(d)) {
+                const std::string n = e->d_name;
+                if (n.empty() || n[0] == '.') continue;
+                struct stat st{};
+                if (::stat((g_saveDir + "/" + n).c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                ents.push_back({n, st.st_mtime});
+            }
+            ::closedir(d);
+        }
+        std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.mtime > b.mtime; });
+        const std::string archive = g_saveDir + "-archive";
+        ::mkdir(archive.c_str(), 0755);
+        const time_t cutoff = std::time(nullptr) - static_cast<time_t>(olderThan);
+        long long moved = 0, kept = 0;
+        for (std::size_t i = 0; i < ents.size(); ++i) {
+            if (static_cast<long long>(i) < keep || ents[i].mtime > cutoff) { ++kept; continue; }
+            if (std::rename((g_saveDir + "/" + ents[i].name).c_str(),
+                            (archive + "/" + ents[i].name).c_str()) == 0) ++moved;
+        }
+        g_cam.log("Spool prune: moved " + std::to_string(moved) + " to " + archive);
+        ok(res, "\"moved\":" + std::to_string(moved) + ",\"kept\":" + std::to_string(kept) +
+                 ",\"archive\":\"" + archive + "\"");
     });
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
+    // Bind :8080 FIRST, connect in the background. A stuck PTP session used
+    // to block SDK::Connect before the port was ever bound, so the daemon sat
+    // "active" at 0% CPU answering nothing and looked exactly like a dead
+    // camera (HANDOFF §2.2). Now /api/status answers from the first second;
+    // connected:false + the log line tells the truth while the SDK waits.
+    std::thread startupConnect;
     if (autoConnect) {
-        std::string err;
-        if (!doConnect(err)) g_cam.log("Startup connect: " + err);
+        startupConnect = std::thread([&] {
+            std::string err;
+            if (!doConnect(err)) g_cam.log("Startup connect: " + err);
+        });
     }
 
     std::printf("\n  ILX-LR1 control panel -> http://%s:%d\n  Ctrl-C to quit\n\n",
                 host.c_str(), port);
     std::fflush(stdout);
 
-    if (!g_srv.listen(host.c_str(), port)) {
+    const bool bound = g_srv.listen(host.c_str(), port);
+    if (startupConnect.joinable()) startupConnect.join();
+    if (!bound) {
         std::fprintf(stderr, "Could not bind %s:%d (is another copy running?)\n",
                      host.c_str(), port);
         g_cam.disconnect();

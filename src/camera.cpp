@@ -373,10 +373,26 @@ std::vector<CameraInfo> Camera::enumerate(int timeoutSec) {
 bool Camera::connect(int index, std::string& err) {
     std::unique_lock<std::recursive_mutex> lk(m_sdkMutex);
     if (m_handle) {
-        // A second racing /api/connect must not overwrite (and leak) the
-        // handle of a connection that is already up or underway.
-        err = "already connected";
-        return false;
+        bool pending;
+        {
+            std::lock_guard<std::mutex> clk(m_connectMutex);
+            pending = (m_connectResult == 0);
+        }
+        if (m_connected || pending) {
+            // A second racing /api/connect must not overwrite (and leak) the
+            // handle of a connection that is already up or underway.
+            err = "already connected";
+            return false;
+        }
+        // A handle left behind by a dropped session: OnDisconnected clears
+        // m_connected but keeps m_handle, so every later connect was refused
+        // with "already connected" forever and only a daemon restart brought
+        // the body back (rigd re-POSTed into that wall every backoff,
+        // 2026-08-23). Release the stale handle and reconnect.
+        log("Stale SDK handle from a dropped session - releasing before reconnect");
+        SDK::Disconnect(m_handle);
+        SDK::ReleaseDevice(m_handle);
+        m_handle = 0;
     }
     if (!m_enumInfo || index < 0 ||
         static_cast<CrInt32u>(index) >= m_enumInfo->GetCount()) {
@@ -393,6 +409,11 @@ bool Camera::connect(int index, std::string& err) {
         m_connectResult = 0;
     }
 
+    m_connecting = true;
+    struct ConnectingGuard {
+        std::atomic<bool>& f;
+        ~ConnectingGuard() { f = false; }
+    } connectingGuard{m_connecting};
     const SDK::CrError e = SDK::Connect(obj, this, &m_handle, SDK::CrSdkControlMode_Remote,
                                         SDK::CrReconnecting_ON);
     if (e != SDK::CrError_None) {
@@ -1231,6 +1252,11 @@ bool Camera::setExposure(const std::string& which, long long value, std::string&
     // complement, matching Sony's encoding. Only writable in an auto exposure
     // mode - in M the body reports it read-only and the error says so.
     else if (which == "expcomp") code = SDK::CrDeviceProperty_ExposureBiasCompensation;
+    // White balance: wb_mode picks the regime (CrWhiteBalance_*; 0x0100 =
+    // fixed color temperature), colortemp the Kelvin value used in that
+    // regime. Both readable, so the convergence engine can verify them.
+    else if (which == "wb_mode") code = SDK::CrDeviceProperty_WhiteBalance;
+    else if (which == "colortemp") code = SDK::CrDeviceProperty_Colortemp;
     else {
         err = "unknown exposure control '" + which + "'";
         return false;
@@ -1390,6 +1416,26 @@ bool Camera::makeDirs(const std::string& dir) {
 // ---------------------------------------------------------------------------
 
 std::string Camera::statusJson() {
+    // A connect in flight holds m_sdkMutex for as long as SDK::Connect takes
+    // — which against a stalled PTP session is "until the body is power-
+    // cycled". Taking the mutex here then froze /api/status too, and the
+    // daemon looked dead (rigd: ILX_DOWN). Answer without it while a connect
+    // is pending: connected:false, connecting:true, and the log.
+    if (m_connecting && !m_connected) {
+        {
+            std::ostringstream pos;
+            pos << "{\"connected\":false,\"connecting\":true,\"model\":\"\","
+                   "\"id\":\"\",\"log\":[";
+            const auto logLines = takeLog();
+            const std::size_t from = logLines.size() > 40 ? logLines.size() - 40 : 0;
+            for (std::size_t i = from; i < logLines.size(); ++i) {
+                if (i > from) pos << ",";
+                pos << "\"" << jsonEscape(logLines[i]) << "\"";
+            }
+            pos << "]}";
+            return pos.str();
+        }
+    }
     std::string model, id;
     {
         std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
@@ -1450,6 +1496,12 @@ std::string Camera::statusJson() {
             SDK::CrDeviceProperty_CameraOperatingMode,
             SDK::CrDeviceProperty_DisplayedMenuStatus,
             SDK::CrDeviceProperty_SdkControlMode,
+            // White balance: the ILX-LR1 accepts the writes (verified live
+            // 2026-08-23) and answers a targeted read; it must be asked for
+            // by code here or the readback stays -1 and convergence can never
+            // confirm what the bodies render.
+            SDK::CrDeviceProperty_WhiteBalance,
+            SDK::CrDeviceProperty_Colortemp,
         };
         const CrInt32u nCodes = sizeof(codes) / sizeof(codes[0]);
 
@@ -1478,6 +1530,10 @@ std::string Camera::statusJson() {
         long long iso = 0, shutter = 0, fnum = 0, program = 0, drive = 0;
         long long battery = -1, remainShots = -1, slotStatus = -1, storeDest = 0;
         long long priorityKey = 0;
+        // -1 = not reported. whiteBalance is the MODE (CrWhiteBalance_*,
+        // 0x0100 = fixed color temperature); colorTemp is the Kelvin value
+        // that applies while the mode is ColorTemp.
+        long long whiteBalance = -1, colorTemp = -1;
         // -1 = the body did not report it, which is different from "fine".
         long long overheat = -1, liveViewStatus = -1, slotWriting = -1;
         long long powerStatus = 0, opMode = 0, menuStatus = 0, sdkCtlMode = -1;
@@ -1515,6 +1571,8 @@ std::string Camera::statusJson() {
                 case SDK::CrDeviceProperty_StillImageStoreDestination:
                     flagOf("storeDest", p);
                     break;
+                case SDK::CrDeviceProperty_WhiteBalance: flagOf("whiteBalance", p); break;
+                case SDK::CrDeviceProperty_Colortemp: flagOf("colorTemp", p); break;
                 default: break;
             }
             switch (p.GetCode()) {
@@ -1571,6 +1629,8 @@ std::string Camera::statusJson() {
                     drive = cur;
                     collect(p, driveChoices, [](long long v) { return formatDriveMode(v); });
                     break;
+                case SDK::CrDeviceProperty_WhiteBalance: whiteBalance = cur; break;
+                case SDK::CrDeviceProperty_Colortemp: colorTemp = cur; break;
                 case SDK::CrDeviceProperty_BatteryRemain: battery = cur; break;
                 case SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber: remainShots = cur; break;
                 case SDK::CrDeviceProperty_MediaSLOT1_Status: slotStatus = cur; break;
@@ -1742,6 +1802,14 @@ std::string Camera::statusJson() {
         emitNum("storeDest", storeDest);
         emitStr("storeDestLabel", formatStoreDestination(storeDest));
         emitChoices("storeChoices", storeChoices);
+        emitNum("whiteBalance", whiteBalance);
+        emitStr("whiteBalanceLabel",
+                whiteBalance == 0x0000 ? "AWB"
+                : whiteBalance == 0x0011 ? "Daylight"
+                : whiteBalance == 0x0100 ? "Color temp"
+                : whiteBalance < 0      ? "--"
+                                        : "other");
+        emitNum("colorTemp", colorTemp);
     }
 
     const IntervalStatus iv = intervalStatus();
