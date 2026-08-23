@@ -7,10 +7,14 @@ fix one of them in the same commit — never leave them apart.
 
 | Node | Hardware | IP | User | GPIO chip | Camera | Extras |
 |---|---|---|---|---|---|---|
-| jetson | Orin (aarch64) | 192.168.1.166 | wildtech | — | — | iKonvert on /dev/ttyUSB0 (FTDI FT232R B400BIHV), chrony master, rigd :9090 |
+| rigd host | **macOS (Apple Silicon)** — the Jetson (192.168.1.166) is retired 2026-08-23 | DHCP (.199 at last check) | wild | — | — | iKonvert on /dev/cu.usbserial-B400BIHV, rigd :9090 as a launchd agent. NOT a chrony master: the nodes peer each other (orphan mode) |
 | pi-cam1 | **Pi 5 Model B Rev 1.0** | 192.168.1.201 | ubuntu | **gpiochip4** (pinctrl-rp1, 54 lines) | D516000F467B | Yahboom YB-MRA02 IMU on USB-A; primary node |
 | pi-cam2 | **Pi 4 Model B Rev 1.5** | 192.168.1.202 | ubuntu | **gpiochip0** (pinctrl-bcm2711, 58 lines) | D516000F46F7 | — |
-| pi-cam3 | not populated | 192.168.1.203 | — | — | — | slot reserved; reports OFFLINE |
+
+> **cam3 removed 2026-08-19.** The empty third slot fired a permanent
+> `node_offline` anomaly and a forever-"2/3" header for hardware that does not
+> exist. A third camera joins via `~/rig/nodes.json` (full node list or a
+> one-key address override), never a code edit.
 
 > **Renamed 2026-08-16.** The Pi 5 (formerly "cam3") is now **cam1**, the rig's
 > primary: it hosts the IMU, previews global exposure changes, and is the
@@ -58,6 +62,14 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
   ISO AUTO = 16777215; drive Single = 1, Continuous Lo = 65540;
   FileType None=0 JPEG=1 RAW=2 RAW+JPEG=3 RAW+HEIF=4 HEIF=5; ImageSize L/M/S=1/2/3;
   TransSize Original=0 Small=1; StoreDest PC=1 card=2 both=3.
+- White balance (2026-08-21): `wb_mode` = CrWhiteBalance_* (AWB=0,
+  Daylight=0x11, **ColorTemp=0x100**); `colortemp` = Kelvin, valid only while
+  `wb_mode`=0x100. Both readable (`whiteBalance`/`colorTemp` in `/api/status`)
+  and settable over USB; fleet-converged via the desired vector (default
+  256/5600 — fixed WB is rig policy: AWB renders the two bodies of a pair
+  differently). **Build-gated:** an ilxctl without the readback keys predates
+  the field and the reconcile loop skips it silently — no pushes, no
+  divergence — until the node is updated.
 - **Body-menu-only properties.** `pcsave` (RAW_J_PC_Save_Image, "RAW+H Save Image")
   and `storeDest` report `enableFlag=DisplayOnly(2)` on these bodies and CANNOT be
   set over USB - they must be changed in the camera's own menu over HDMI, per body.
@@ -93,12 +105,25 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
   imu:{present,rate_hz,age_s}, disk_free_mb, load1, time:{epoch, source}}`
 - `POST /gpio/focus` `{hold:bool}` — hold = spawn open-drain LOW holder;
   release = kill it. Idempotent.
-- `POST /gpio/fire` `{at_epoch:float|0, pulse_ms:int=5}` → busy-wait to
+- `POST /gpio/fire` `{at_epoch:float|0, pulse_ms:int=5, focus_lead_ms:int=0,
+  strobe_at_epoch:float=0, strobe_pulse_ms:int=5}` → busy-wait to
   `at_epoch` (0 = now), pulse TRIGGER LOW, return
-  `{ok, requested_epoch, actual_epoch, late_ms}`. Requires FOCUS held; 409 if not.
+  `{ok, requested_epoch, actual_epoch, late_ms, fire_seq, edge_seq,
+  node_epoch}`. Requires FOCUS held (409 if not) unless `focus_lead_ms` asks
+  the node to place its own per-shot FOCUS lead. A nonzero `strobe_at_epoch`
+  (must sit 0..2 s after `at_epoch`) additionally pulses the strobe line
+  (BCM26, open-drain, no pull — docs/strobe-trigger.md) at that instant and
+  adds `strobe_epoch`/`strobe_late_ms` (or `strobe_error`) to the reply.
+- `POST /gpio/strobe` `{at_epoch, pulse_ms:int=5}` → strobe pulse with NO
+  camera fire, same schedule discipline. Exists so the survey's light never
+  depends on this node's camera being claimable (the 2026-08-16 card fault
+  took the camera out while the Pi stayed healthy).
 - `POST /gpio/interval/start` `{at_epoch, period_s, count:int|0}` — absolute
   schedule `at+k·period`, immune to drift; 0 = until stop.
 - `POST /gpio/interval/stop`
+- `GET /gpio/state` includes `strobe: {bcm, claimed, fires, last_epoch,
+  error}` — `claimed:false` is the normal state on a node with no flash; the
+  line is claimed lazily on the first scheduled strobe.
 - `GET  /gpio/exposure/events?since=<idx>` → `{next, events:[{i,edge:"fall"|"rise",epoch}]}`
   from a persistent gpiomon on BCM22. fall = exposure start.
 - `GET  /imu/latest` → newest sample or `{present:false}`
@@ -110,13 +135,26 @@ mx, my, mz, temp}` — degrees, g, deg/s; missing fields null.
 
 ## Desired-state convergence (rigd holds one truth)
 
-rigd keeps a single **desired settings vector** applied identically to every
-online camera — the cameras are never controlled individually:
+rigd keeps a single **desired settings vector**; non-exposure fields are
+applied identically to every online camera:
 
 ```
 desired = { aperture, shutter, iso, expcomp, drive,
             focus_mode, filetype, imagesize, transsize, store_dest }
 ```
+
+**Exposure is per-camera between explicit applies (2026-08-20).** The
+operator tunes one body live — `POST /api/exposure {node, which, value}`, a
+node key is REQUIRED on that path — and either pushes that camera's exposure
+to the fleet (`POST /api/settings`, the force path) or deliberately leaves
+the two bodies different, e.g. balancing them against unequal strobes. The
+continuous 3 s reconcile therefore only READS `aperture/shutter/iso/expcomp`
+and reports a split as `convergence.exposure_split` (information, `synced`
+stays true); they are still WRITTEN on an explicit apply, on a node
+reconnect, and when the in-pass reboot tell (a NON-exposure readable field
+reverted) fires — so a factory-reset body still rejoins the vector. The
+staged preview-on-cam1 flow is superseded by this model; its endpoints still
+answer for compatibility.
 
 **What is deliberately NOT in it, and must not be added:** `focus_position`,
 `zoom_setting`, `zoom_position`. Lens encoder parity between the two bodies is
@@ -345,6 +383,91 @@ Node monitor state machine per camera node, 2 s poll:
 `OFFLINE → REACHABLE → CAM_CONNECTED` with automatic `/api/connect` retry
 (backoff 5→60 s), settings re-push + verify after every reconnect, alert on
 every transition. Dropouts mid-run never stop the run for other nodes.
+
+Each `/health` poll also samples the node's clock against rigd's
+(RTT-bounded): `/api/fleet` nodes carry `clock_offset_ms`/`clock_rtt_ms`, and
+a `node_clock_skew` anomaly fires when two nodes disagree beyond the noise
+floor (warn >5 ms, bad >8 ms). Every scheduled fire and every `epoch_hw` edge
+lives on the NODE's clock, so inter-node clock skew lands 1:1 in true
+exposure skew **while the rig's own skew figures under-report it** — the
+nodes' chrony must share one master (measured 16.8 ms apart free-running on
+2026-08-20 after the Jetson master left the topology).
+
+### 2026-08-20 additions — strobe, pairs, per-camera exposure
+
+- `GET/POST /api/strobe` → `{ok, strobe:{enabled, node, delta_ms, pulse_ms},
+  warnings:[…]}`. Config persists to `~/rig/strobe.json`. When enabled,
+  `capture_once` schedules the pulse at `T + delta_ms` on the strobe node —
+  inside its `/gpio/fire` when that node fires over GPIO, else via the
+  standalone `/gpio/strobe` so a faulted camera cannot darken the survey.
+  Warnings (not refusals): delta outside the measured-safe 8–12 ms, shutter
+  faster than 1/30 (docs/strobe-trigger.md §4.1).
+- `POST /api/exposure` `{node, which, value}` → per-camera LIVE exposure
+  write, forwarded to that node's ilxctl; 400 without `node`, 409 when the
+  camera is not connected. See "Desired-state convergence".
+- `GET /api/run/shots?id&offset&limit` → `{run_id, total, offset, shots:[…]}`
+  — the run's full grouped shot list (offset<0 counts from the end). Each
+  shot: `{epoch, files:{cam:name}, missing:[…], spread_ms, spread_src:
+  "index"|"flight_log", srcs:{cam:capture_source}, strobe?:{epoch, ok,
+  margin_ms}}`. `spread_src:"index"` means µs-grade run.json-index epochs;
+  flight_log datetimes are centisecond-quantised and must not be read as a
+  jitter measurement. The strobe verdict is docs/strobe-trigger.md §4.2 —
+  `ok` only when the pulse sits inside the INTERSECTION of every member's
+  measured `[fall, rise]` window and every member is `gpio_edge`; `ok:null`
+  when it fired but the windows are not all measured.
+- `POST /api/run/open` `{id}` → opens the run directory in the rigd host's
+  file manager (`open`/`xdg-open`; path-guarded; returns `{ok:false, path}`
+  with no display). `/api/run/detail` gains `path` and `pairs.strobe_missed`.
+- run.json index rows gain `rise` (end-of-exposure `epoch_hw`) and `strobe`
+  (the shot's pulse instant, carried on the strobe node's frame); the run doc
+  gains the `strobe` config in force.
+- `POST /api/calibrate` refuses (409) while a run is active — calibration
+  holds FOCUS (an AE-lock) and races the run's frame naming; the run
+  calibrates itself at start. Measured latency persists to
+  `~/rig/trigger_latency.json` keyed by node with the body's camera id and is
+  reused for 24 h on the same body (no calibration frames fired); the API
+  call always re-measures (`force`).
+
+### 2026-08-23 additions — macOS host, node health, wedge-proofing
+
+- Node states gain `ILX_DOWN`: piagent answers, ilxctl does not. rigd never
+  POSTs `/api/connect` at it, marks the cached status `{connected:false,
+  stale:true, ilx_down:true}`, and raises anomaly `ilx_down` (bad) with the
+  §2.2 recipe. `REACHABLE` keeps its meaning: ilxctl answered
+  `connected:false`.
+- Anomalies: `node_rebooted` (host uptime went backwards — power loss),
+  `node_undervoltage` (piagent `power` flags), `body_locked` (connected but
+  no `writable` map / ISO / slotWriting — the card-stall table lock; per-field
+  `settings_divergent` is suppressed while it lasts), `capture_paused` (the
+  grid is holding for a node that failed 3 fires), `camera_clock_wrong`
+  (|EXIF offset| > 60 s), `node_clock_skew`.
+- piagent `/health` adds `host_uptime_s` (the Pi's `/proc/uptime`; `uptime_s`
+  is the service's) and `power: {throttled, undervolt_now,
+  undervolt_since_boot, throttled_now, throttled_since_boot}` from the
+  firmware's `get_throttled` word via sysfs.
+- Capture loop: per-node fire timeout is `max(2 s, lead + FOCUS lead + 1.5 s)`;
+  three consecutive failed fires on a node pause the grid (no unpaired
+  frames), `capture_paused`/`capture_resumed` events, `sync.unpaired_shots`
+  and `sync.paused_for` in `/api/run` and run.json. Stop waits up to 6 s for
+  frames of fires already committed before releasing the pull workers.
+- rigd `/api/liveview` is a throttle (`LiveTap`): one upstream grab per
+  camera shared by all clients, served from cache within 200 ms idle /
+  500 ms while a run is active; headers `X-Frame-Age-ms`, `X-Live-Policy`.
+  ilxctl `/liveview.jpg` has its own backstop (one SDK grab per 100 ms,
+  `X-LiveView-Age-Ms`). `/api/run/frame` is cacheable (`ETag`, max-age 3600).
+- ilxctl binds :8080 BEFORE the startup connect and `/api/status` answers
+  `{connected:false, connecting:true, log:[…]}` without the SDK mutex while a
+  connect is pending; a handle left by a dropped session is released on the
+  next `/api/connect` instead of refusing "already connected".
+- `POST /api/spool/prune` `{confirm:"prune", older_than_s=86400, keep=50}`
+  moves old PC-save files into `<dir>-archive` (never deletes).
+- Ingest: `rig/ingest.py <card_dir>` matches card files to flight-log rows
+  (by file number when the card counter equals the PC-save counter, else by
+  the measured clock offset with rigd's journaled `exif_offset` as the
+  tie-break), places `<base>.ARW` / `<base>.card.JPG` / `<base>.xmp`
+  (true instant, GPS, UTM, attitude, pair spread) beside the review JPEG,
+  writes `ingest_manifest.csv`. `rig/stereo_check.py` verifies pairing by
+  relative-pose consistency against a mis-paired control.
 
 Transect run layout (Jetson, `~/rig-runs/`):
 

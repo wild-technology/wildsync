@@ -20,6 +20,44 @@ including the one thing that currently needs a hand on the hardware.
 
 ---
 
+## -1. 2026-08-23 state — macOS host, Jetson retired (read before §0)
+
+The Jetson is gone; **this Mac runs rigd** (launchd agent
+`org.wildtechnology.wildsync.rigd`, ProcessType Interactive, `~/rig/rigd-launchd.log`).
+Both Pis were re-provisioned from their cards (`deploy/pi-resync/`): this Mac's SSH
+key, chrony peering cam1<->cam2 in orphan mode (0.6 ms mutual lock, no upstream needed),
+Pi 5 capped at 1.8 GHz with radios off. `deploy/deploy.sh node camN` works from macOS.
+
+**Verified live this week:** sync 0.8 ms median pair spread; two real transects
+(140 + 336 pairs, 0 missing, all GPIO-edge stamped); RAW+JPEG on card with Small JPEG
+delivered; **white balance fixed at 5600 K and read back on both bodies**; strobe
+support deployed (BCM26, unclaimed until used); card ingest tool (`rig/ingest.py`)
+matched 476/476 frames and stamps RAWs with edge time + position + attitude (XMP);
+stereo pairing verified by relative-pose consistency (`rig/stereo_check.py`).
+
+**The brown-out is power, not software.** Synchronized fires on BOTH nodes drop one
+node's PoE port (cam1 untrimmed; cam2 once cam1 was trimmed) — the Ubiquiti switch's
+budget at the synchronized spike. Either node alone is clean. rigd now reports it
+(`node_rebooted`, `node_undervoltage`, `capture_paused`). Fix is electrical: isolate
+one node's power / bigger PoE input / body off the Pi's port. Check the UniFi PoE page.
+
+**Open hardware items:** cam1's card stalls on L-size RAW+JPEG writes (§2.1 again) —
+replace with V60/UHS-II; both body clocks ~2 days slow (menu-only; ingest corrects the
+archive); iKonvert must be in RAW mode (all four DIP switches ON, 230400) — it shipped
+in Mode 0 (NMEA-0183 at 4800); strobe continuity to the sync tip still unproven (one
+live fire with the flash pointed away).
+
+**Host-side behaviour added:** ILX_DOWN state (wedged daemon is not "camera not
+claimed"); body_locked anomaly (card-stall property-table lock, hushes per-field
+divergence); fire timeout 2 s + pause-on-dead-node + `unpaired_shots`; anomaly scan on a
+2.5 s timer; stop-grace for the last shot; LiveTap throttle; cacheable run frames;
+trigger-latency persistence (`~/rig/trigger_latency.json`, reused <24 h per body id);
+static fix fallback (`~/rig/static_fix.json`); bus sniffer (`/nmea`).
+**Pi-side:** ilxctl binds :8080 before connecting and answers status while a connect
+is pending; stale SDK handles are released on reconnect; live-view backstop; spool
+prune (`POST /api/spool/prune`); WB properties; piagent strobe, `host_uptime_s`,
+`power` (under-voltage flags).
+
 ## 0. Read this first — the three things that will waste your day
 
 1. **Everything is committed and pushed** — `ae6668d` on `jetson-port`. The working tree
@@ -183,7 +221,12 @@ cam1, whose lead is clean.
 `setInterval(pollFleet, 2000)` is not tab-gated and `renderFleet()` unconditionally emits
 `<img src="/api/liveview?node=…&_=cachebuster">` per connected camera. Hidden tabs still
 load images. **One browser tab left open pulls live view from both bodies every 2 s for
-the entire survey.** Worse, `liveViewJpeg()` takes `m_sdkMutex` — the same recursive mutex
+the entire survey.** (Corrected 2026-08-23: live view does NOT share `m_sdkMutex` with
+frame transfer — the PC-save download runs on the SDK's own thread and takes no lock;
+the measured starvation at ~53 fps happens inside the SDK/USB transfer path itself,
+which ilxctl cannot observe. The mutex DOES serialise live view with `/api/status` and
+lens drive. Both tiers are now rate-capped: rigd `LiveTap` 5 fps idle / 2 fps in-run,
+ilxctl `/liveview.jpg` backstop ≤10 grabs/s.) Historical text: `liveViewJpeg()` takes `m_sdkMutex` — the same recursive mutex
 shared by **all 24 SDK entry points**, including image transfer — so it contends directly
 with frame delivery. (The UI lane may have partly addressed this; verify.)
 
