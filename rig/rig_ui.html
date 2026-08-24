@@ -18,12 +18,17 @@
   header{display:flex;align-items:center;gap:14px;padding:10px 18px;flex-wrap:wrap;
          border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
   header h1{font-family:var(--mono);font-size:15px;margin:0;letter-spacing:.02em}
-  header .clock{font-family:var(--mono);color:var(--muted);font-size:12px}
+  header .clock{font-family:var(--mono);color:var(--muted);font-size:12px;white-space:nowrap}
   .pill{font-family:var(--mono);font-size:12px;padding:3px 9px;border-radius:10px;
         border:1px solid var(--line);color:var(--muted)}
   .pill.on{color:var(--ok);border-color:var(--ok)}
   .pill.warn{color:var(--warn);border-color:var(--warn)}
   .pill.bad{color:var(--bad);border-color:var(--bad)}
+  /* A long transect label used to wrap the whole header to two lines even at
+     1440px (the run pill carries the full run id). Cap it and ellipsise; the
+     full id lives in the pill's title and in Transects. */
+  #hRun{display:inline-block;max-width:34ch;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap;vertical-align:bottom}
   nav{display:flex;gap:2px;padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line);
       position:sticky;top:49px;z-index:4;overflow-x:auto}
   nav button{background:none;border:none;color:var(--muted);font-family:var(--mono);
@@ -54,6 +59,13 @@
   button.act.stop{background:var(--bad);border-color:var(--bad);color:#170707;font-weight:700;position:relative;overflow:hidden}
   button.act.stop .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(0,0,0,.35)}
   button.act.toggle.on{background:var(--accent);border-color:var(--accent);color:#0a1420;font-weight:700}
+  /* Hold-to-confirm, the same sweep the Stop button uses, for any action that
+     cannot be taken back. Start-a-drain wears it: each verified shot is
+     DELETED from the card. */
+  button.act.hold{position:relative;overflow:hidden}
+  button.act.hold .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(90,169,230,.38)}
+  button.act:disabled{opacity:.45;cursor:not-allowed}
+  button.act:disabled:hover{border-color:var(--line)}
   input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
                border-radius:6px;padding:9px 10px;font-family:var(--mono);font-size:13px;min-height:40px}
   input:focus-visible,select:focus-visible{outline:2px solid var(--accent)}
@@ -196,6 +208,28 @@
       <div id="runInfo" class="small muted" style="margin-top:8px"></div>
     </div>
 
+    <!-- CARD DRAIN. Placed HERE, in Review, directly under the Stop that
+         starts it — not on Controls. The drain is not a camera setting: it is
+         the step BETWEEN transects. rigd refuses to start a run while a drain
+         holds a camera, a full card takes 10-15 minutes, and a wedged body
+         needs a power cycle before the next line can go in. Everything the
+         operator needs to decide "can I shoot the next transect yet?" is on
+         this screen, next to Start/Stop and the pull tally. -->
+    <div class="card" id="drainCard" style="margin-bottom:12px">
+      <h2>Card drain — RAW off the cards, between transects</h2>
+      <div id="drainState" class="small">reading…</div>
+      <div class="row" style="margin-top:8px">
+        <label>Drain<select id="drNode" style="min-width:200px"></select></label>
+        <label style="flex-direction:row;align-items:center;gap:6px">
+          <input id="drKeep" type="checkbox"> keep cards (pull a copy, delete nothing)</label>
+        <button class="act hold" id="btnDrain"><span class="fill"></span>⏏ Drain cards (hold 1 s)</button>
+        <button class="act" id="btnDrainCancel" style="display:none">Cancel drain</button>
+      </div>
+      <div id="drainNote" class="small muted" style="margin-top:6px"></div>
+      <div id="drainLast" style="margin-top:8px"></div>
+      <div id="drainWedge"></div>
+    </div>
+
     <div class="row" style="margin-bottom:4px">
       <button class="act" id="pvOlder">◀ older</button>
       <button class="act toggle on" id="pvFollow">following newest</button>
@@ -280,6 +314,22 @@
           <label>Transfer<select id="sTsize" style="min-width:190px">
             <option value="0">Original — 60.2 MP, 14.1 MB</option>
             <option value="1">Small — 1.7 MP, ~320 KB</option></select></label>
+          <!-- RAW compression, CrRAWFileCompressionType (CrDeviceProperty.h
+               1927): 0 Uncompression, 1 Compression, 2 LossLess, 3 LossLessS,
+               4 LossLessM, 5 LossLessL, 6 Compressed_HQ. LossLessL is the
+               fleet default (full resolution, lossless, ~30-35 MB/frame,
+               drained between runs). LossLessM/S are lossless but at REDUCED
+               pixel counts — on a photogrammetry rig that silently changes
+               the ground sample distance, so they are labelled as such rather
+               than left as bare enum names. -->
+          <label>RAW type<select id="sRawtype" style="min-width:190px">
+            <option value="5">LossLessL — full res (default)</option>
+            <option value="4">LossLessM — REDUCED res</option>
+            <option value="3">LossLessS — REDUCED res</option>
+            <option value="2">LossLess</option>
+            <option value="1">Compressed — lossy</option>
+            <option value="6">Compressed HQ — lossy</option>
+            <option value="0">Uncompressed — largest file</option></select></label>
           <label>White balance<select id="sWbMode" style="min-width:130px">
             <option value="0">Auto (AWB)</option>
             <option value="17">Daylight</option>
@@ -288,19 +338,28 @@
             step="100" value="5600" style="width:5.5em"></label>
         </div>
         <!-- Small = 1.7 MP review thumbnail; Original = 60 MP / 14.1 MB, 44x the
-             bytes over the same USB link the capture path uses. No readback on
-             this body: the select shows what rigd pushes, never a confirmation. -->
+             bytes over the same USB link the capture path uses. The selects
+             show what rigd PUSHES; the per-camera rows below show what each
+             body actually reports (ilxctl 2026-08-23+ emits format readback,
+             older builds get a "no readback" badge). -->
         <div class="small muted" style="margin-top:8px">
           <b>Small is a review thumbnail</b>, not survey imagery.
-          No readback on this body — confirm by delivered frame size.
+          Confirm the push against the per-camera readback below (or by
+          delivered frame size on older ilxctl builds).
           White balance pins the JPEG rendering only (RAW is WB-agnostic) and
           takes effect on nodes running ilxctl 2026-08-20+; older nodes are
           skipped quietly until updated.
+          <b>RAW type LossLessM/S are lossless but at fewer pixels</b> — they
+          change the ground sample distance of every frame; LossLessL is the
+          survey setting.
         </div>
         <div class="row" style="margin-top:8px">
           <button class="act" id="btnFmt">Apply format to fleet</button>
           <span id="fmtNote" class="small muted"></span>
         </div>
+        <!-- Per-camera format readback (C2): what each BODY says it is set
+             to, read live from /api/status?node= — never the fleet cache. -->
+        <div id="fmtReadback" style="margin-top:8px"></div>
         <h2 style="margin-top:14px">Set on the body only</h2>
         <div id="bodyOnly" class="ro"></div>
         <!-- storeDest/pcsave report enableFlag=DisplayOnly on these bodies:
@@ -376,7 +435,7 @@ function showTab(t){
   document.querySelectorAll('.tab').forEach(s=>s.classList.toggle('active',s.id==='tab-'+t));
   if(t==='controls'){ pollControls(); hydrateSettings(); hydrateStrobe(); }
   if(t==='imu') pollImuWindow();
-  if(t==='review'){ renderPair(); pollPairs(true); }
+  if(t==='review'){ renderPair(); pollPairs(true); pollDrain(true); }
   if(t==='transects') pollTransects(true);
 }
 // Live view is expensive in a way that is invisible from the browser: ilxctl's
@@ -385,7 +444,8 @@ function showTab(t){
 // therefore fetched ONLY when a tab that shows it is both selected and visible.
 function liveOk(tab){ return TAB===tab && !document.hidden; }
 document.addEventListener('visibilitychange',()=>{ if(!document.hidden){
-  if(TAB==='controls') pollControls(); if(TAB==='review') pollPairs(true); } });
+  if(TAB==='controls') pollControls();
+  if(TAB==='review'){ pollPairs(true); pollDrain(true); } } });
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.t));
 
 // ---- header + clock -------------------------------------------------------
@@ -413,7 +473,26 @@ async function pollFleet(){
   document.body.classList.remove('linklost');
   FLEET=f;
   const run=f.run||{};
-  pill($('#hRun'), run.active?('run '+run.run_id+' · '+run.frames+' frm'):'no run', run.active?'on':'');
+  // The pill carries a SHORT id (full id in its title): a long transect label
+  // used to wrap the header to two lines and push the clock off-screen.
+  const ridFull=String(run.run_id||'');
+  const ridShort=ridFull.length>18?(ridFull.slice(0,17)+'…'):ridFull;
+  pill($('#hRun'), run.active?('run '+ridShort+' · '+run.frames+' frm'):'no run', run.active?'on':'');
+  $('#hRun').title=run.active?('run '+ridFull):'';
+  // RunManager refuses a start over a live run; say so on the button instead
+  // of letting the click bounce off pre-flight as "the rig is not fit to
+  // survey" (misleading for "already recording").
+  const sb=$('#btnStart');
+  sb.disabled=!!run.active;
+  sb.title=run.active?('run '+ridFull+' is recording — hold Stop to end it first'):'';
+  // A card drain holds the body in the SDK's transfer mode, and RunManager
+  // refuses a start for the whole 10-15 min of it. Say so on the button
+  // instead of letting the click bounce off with "a drain already holds cam1".
+  if(!sb.disabled && DRAIN.active){
+    sb.disabled=true;
+    sb.title='a card drain is running on '+(DRAIN.node||'a camera')+
+      ' — wait for it, or cancel it in Card drain below';
+  }
   const conn=f.nodes.filter(n=>n.connected).length;
   pill($('#hNodes'), conn+'/'+f.nodes.length+' cameras', conn===f.nodes.length?'on':'bad');
   pill($('#hTime'), 'time '+(f.time_source||'—'), f.time_source==='gps'?'on':'warn');
@@ -430,6 +509,9 @@ async function pollFleet(){
     if(spark[n.name].length>60) spark[n.name].shift();
   });
   renderReviewChrome();
+  // The Apply button's promise ("Apply cam2's exposure") depends on cam2
+  // still being connected: refresh it on every fleet poll, not only on edits.
+  syncApplyBtn();
   if(TAB==='controls') pollControls();
   if(TAB==='imu') pollImuWindow();
 }
@@ -441,6 +523,12 @@ function sparkSvg(vals){
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
     <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
 }
+// Clock-chip thresholds. CLK_WARN_MS is this strip's own bar (rigd's
+// host_clock_offset anomaly sits higher, at 100 ms, on purpose — the chip is
+// meant to be seen before the anomaly fires). CLK_RTT_LIMIT_MS mirrors rigd's
+// CLOCK_RTT_LIMIT_MS so the strip and /api/anomalies call the same link
+// "too slow to measure a clock over" rather than contradicting each other.
+const CLK_WARN_MS=50, CLK_RTT_LIMIT_MS=20;
 // Camera health that matters at a glance. The card write is the loudest: one
 // frame stuck in the body's write buffer takes the whole camera down while
 // slotStatus still reads OK — the 2026-08-16 fault signature.
@@ -462,6 +550,37 @@ function healthStrip(n){
   const gpio=n.gpio||{};
   bits.push(gpio.available?`<span>gpio <b>${gpio.edges_seen||0}</b> edges</span>`
                           :'<span class="hwarn">no harness — USB fire</span>');
+  // Node-vs-host clock offset. Every scheduled fire epoch and every nav lookup
+  // crosses this boundary: at 187 ms (measured 2026-08-23) the fire schedule's
+  // whole lead was eaten and every fire ran late. >50 ms is worth an amber
+  // chip on the strip.
+  //
+  // Read the FILTERED figure (clock_offset_s: rigd's RTT-gated median of the
+  // last up-to-8 samples, contract C1), never clock_offset_ms. That field is
+  // the LAST RAW /health sample and is what this chip used to read: one poll
+  // whose RTT spikes puts half of that RTT straight into the midpoint
+  // estimate, and rigd's own anomaly code records the cost — single-scan
+  // "82.9 ms" alarms while chronyc had the two Pis 20 µs apart. So the chip
+  // flickered amber on a chrony-locked fleet, and a chip that flickers is a
+  // chip the operator stops reading. rigd publishes both numbers on purpose,
+  // so the raw sample stays visible in the chip's title. The filtered figure
+  // also expires at 60 s, which the raw one never did: a node whose piagent
+  // died while ilxctl stayed up can no longer freeze the chip on an old
+  // sample. Typed guards, not != null, because a number is interpolated here.
+  const ci=n.clock_offset_info||{};
+  const co=(typeof n.clock_offset_s==='number')?n.clock_offset_s*1e3:null;
+  const crtt=(typeof ci.rtt_ms_best==='number')?ci.rtt_ms_best:null;
+  const cn=(typeof ci.n==='number')?ci.n:0;
+  const craw=(typeof n.clock_offset_ms==='number')
+    ? ` · last raw sample ${Math.round(n.clock_offset_ms)} ms` : '';
+  if(co!=null && crtt!=null && crtt>=CLK_RTT_LIMIT_MS)
+    // Same call rigd's node_clock_unmeasurable makes: over a link this slow
+    // the midpoint estimate is mostly network, so printing it as a clock error
+    // would be printing the switch. Name it unmeasurable instead.
+    bits.push(`<span class="hwarn" title="the 10 ms stereo sync budget cannot be verified on this node while its link is this slow — check the switch port / cable / PoE load${craw}">clk unmeasurable — link ${Math.round(crtt)} ms</span>`);
+  else if(co!=null && cn>=2 && Math.abs(co)>CLK_WARN_MS)
+    // cn>=2: a one-sample window is the raw sample wearing the filter's name.
+    bits.push(`<span class="hwarn" title="this node's clock vs the rigd host, RTT-filtered median of ${cn} samples — fire schedules and nav lookups shift by this much${craw}">clk ${co>0?'+':''}${Math.round(co)} ms vs host</span>`);
   if(n.stats&&n.stats.pulled!=null)
     bits.push(`<span>pull <b>${n.stats.pulled}</b> ok${n.stats.failed?(' / <span class="hbad">'+n.stats.failed+' fail</span>'):''} · jit ${n.stats.interval_jitter_ms??'—'}ms</span>`);
   return bits.join(' ');
@@ -502,19 +621,60 @@ $('#pvOlder').onclick=()=>stepPair(-1);
 $('#pvNewer').onclick=()=>stepPair(+1);
 document.addEventListener('keydown',e=>{
   if(TAB!=='review')return;
+  // Arrows typed into the Label/interval/frames inputs move the CARET, not
+  // the pair cursor: stepping here also silently dropped follow mode mid-run.
+  const t=e.target;
+  if(t && (t.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName||''))) return;
   if(e.key==='ArrowLeft') stepPair(-1);
   if(e.key==='ArrowRight') stepPair(+1);
 });
-let RUNS_HEAD=null;   // newest run id when no run is active
+let RUNS_HEAD=null;   // newest run id WITH frames when no run is active
+let RUNS_HEAD_AT=0;   // when that pick was last made (empty picks are retried)
+// The run Review shows when nothing is recording. '' means "none of them has a
+// frame" — the caller falls through to the camera spool, then to the explicit
+// empty panel. See the ordering note in pollPairsInner.
+function pickRunWithFrames(runs){
+  const l=runs||[];
+  const wf=l.find(x=>(x.frames||0)>0)
+        || l.find(x=>x.frames==null && (x.cams||[]).length);
+  return wf?wf.run_id:'';
+}
+let PAIRS_STALE=false; // last /api/run/shots poll failed; PAIRS is kept as-is
 async function pollPairs(force){
   if(!force && !liveOk('review')) return;
+  // Whatever happens below, Review must never be left sitting on the initial
+  // "looking for frames…" placeholder. That is exactly what the operator saw
+  // when the newest run had no frames, and a placeholder that never resolves
+  // reads as "still working" forever rather than as a fault. Any unexpected
+  // throw in here ends as an honest stale render instead of silence.
+  try{ await pollPairsInner(force); }
+  catch(e){ PAIRS_STALE=true; renderPair(); }
+}
+async function pollPairsInner(force){
   const run=(FLEET.run||{});
   let rid=null, src=null;
   if(run.active){ rid=run.run_id; src='live run '+run.run_id; }
   else {
-    if(RUNS_HEAD===null || force){
-      const r=await api('/api/runs?limit=1');
-      RUNS_HEAD=(r&&r.runs&&r.runs[0])?r.runs[0].run_id:'';
+    // Re-pick on an explicit force (tab switch, run start/stop, Capture one),
+    // and periodically while the pick is EMPTY — a run finished by another
+    // client, or a repaired run.json, must not need a reload to show up.
+    if(RUNS_HEAD===null || force ||
+       (RUNS_HEAD==='' && Date.now()-RUNS_HEAD_AT>10000)){
+      RUNS_HEAD_AT=Date.now();
+      // "Newest" here means: the FIRST entry of /api/runs that has frames.
+      // list_runs sorts the YYMMDD_hhmm_label directory names descending, and
+      // the id is minute-stamped, so first == most recently started (name
+      // order, deliberately not mtime, so a directory touched later does not
+      // jump the queue). The old limit=1 pick took that first entry
+      // unconditionally, so a run started and stopped before a single frame
+      // landed pinned Review to an empty list — "looking for frames…" with no
+      // way out. Order of preference now: newest run with frames>0, then the
+      // newest run whose count is UNKNOWN (no run.json — it may still hold
+      // frames, and /api/run/shots is the one that can say), then the camera
+      // spool, then the explicit empty panel.
+      const r=await api('/api/runs?limit=10');
+      if(r && Array.isArray(r.runs)) RUNS_HEAD=pickRunWithFrames(r.runs);
+      // on a failed listing RUNS_HEAD stays null → retried next poll
     }
     if(RUNS_HEAD){ rid=RUNS_HEAD; src='run '+RUNS_HEAD; }
   }
@@ -524,16 +684,36 @@ async function pollPairs(force){
     else q='offset='+Math.max(0,PAIRS.cursor-6)+'&limit=13';
     const r=await api('/api/run/shots?id='+encodeURIComponent(rid)+'&'+q);
     if(r && Array.isArray(r.shots)){
+      PAIRS_STALE=false;
       PAIRS={src:'run', rid, total:r.total, start:r.offset, list:r.shots,
              cursor: PAIRS.follow||PAIRS.cursor<0 ? r.total-1
                      : Math.min(PAIRS.cursor, r.total-1),
              follow:PAIRS.follow, label:src};
       syncFollowBtn(); renderPair(); return;
     }
+    // A run IS known but this poll did not answer with a list. Two very
+    // different reasons, and they need opposite handling:
+    //   * rigd REFUSED the id ({ok:false,error:"no such run"} + 404) — the
+    //     directory was moved or the pick came from a listing that has since
+    //     changed. Drop the pick so the next pass re-chooses, and take the
+    //     spool this once rather than pinning a dead id forever.
+    //   * the request failed or timed out (8 s on a busy rigd, a transient
+    //     500). Falling into the spool branch here threw the operator from
+    //     pair N to the 5-shot bench spool and clamped their cursor — keep the
+    //     last good PAIRS on screen, say it is stale, retry next poll.
+    const dead = r && !r._err && r.ok===false;
+    if(!(dead && !run.active)){
+      PAIRS_STALE=true;
+      renderPair();
+      return;
+    }
+    RUNS_HEAD=null;
   }
-  // Spool fallback: whatever sits in the cameras' own save directories —
-  // test fires, bench shots. Paired by rank, NOT by measured epoch, so no
-  // jitter is shown: this is a browse aid, not a transect.
+  // Spool fallback — reached ONLY when no run exists to show: whatever sits
+  // in the cameras' own save directories — test fires, bench shots. Paired
+  // by rank, NOT by measured epoch, so no jitter is shown: this is a browse
+  // aid, not a transect.
+  PAIRS_STALE=false;
   const names={}, roster=(FLEET.nodes||[]);
   for(const n of roster.filter(n=>n.connected)){
     const shots=await api('/api/shots?node='+n.name);
@@ -558,6 +738,14 @@ function tstamp(ep){ return ep==null?'—'
   : new Date(ep*1000).toISOString().replace('T',' ').slice(0,21)+'Z'; }
 function jitChip(s){
   if(!s || s.spool) return '';
+  // A one-camera shot HAS no inter-camera spread: the server computes 0 over
+  // the single member and this chip used to print a green "0.00ms" beside a
+  // MISSING panel. Never show a number unless both cameras are in the shot.
+  if((s.missing||[]).length || Object.keys(s.files||{}).length<2){
+    const who=(s.missing||[]).join(',');
+    return `<span class="jit na" title="one camera only — no inter-camera spread exists">${
+      who?('— missing '+escapeHtml(who)):'no pair'}</span>`;
+  }
   const v=s.spread_ms;
   if(v==null) return '<span class="jit na">n/a</span>';
   const meas = s.spread_src==='index'
@@ -573,6 +761,28 @@ function strobeChip(s){
   if(st.ok===true)  return `<span class="strobechip lit" title="strobe inside every camera's exposure window · margin ${st.margin_ms}ms">LIT</span>`;
   if(st.ok===false) return `<span class="strobechip miss" title="strobe OUTSIDE an exposure window by ${st.margin_ms}ms — frame is unlit">STROBE MISS</span>`;
   return '<span class="strobechip unk" title="strobe fired but the windows are not measured on every camera">STROBE ?</span>';
+}
+// The pair <img> is SHARED between live view and recorded frames. On a mode
+// flip the pixels on screen belong to the OTHER mode: live OFF used to leave
+// the last live frame captioned as the recorded survey file (dataset.name
+// matched, so renderPair skipped the reload), and live ON left a LIVE badge
+// over recorded frames. This helper owns the transition: it clears the
+// name/busy latches and the load handlers and adds/removes the burn, forcing
+// an honest reload whenever the mode changes.
+function frameImg(fr, live){
+  let img=fr.querySelector('img');
+  if(!img){ fr.innerHTML='<img alt="">'; img=fr.querySelector('img'); }
+  const burn=fr.querySelector('.burn');
+  if(live && !burn){
+    img.dataset.name=''; img.dataset.busy=''; img.onload=null; img.onerror=null;
+    img.removeAttribute('src');
+    fr.insertAdjacentHTML('beforeend','<div class="burn">LIVE</div>');
+  } else if(!live && burn){
+    burn.remove();
+    img.dataset.name=''; img.dataset.busy=''; img.onload=null; img.onerror=null;
+    img.removeAttribute('src');
+  }
+  return img;
 }
 function renderPair(){
   const wrap=$('#pairWrap'); if(TAB!=='review') return;
@@ -594,14 +804,17 @@ function renderPair(){
   const i=PAIRS.cursor, s=(i>=PAIRS.start)?PAIRS.list[i-PAIRS.start]:null;
   if(PAIRS.src==='empty'||!s){
     $('#pairTitle').textContent=LIVE?'live view':'no frames yet';
-    $('#pairSub').textContent=LIVE?'no pairs yet — showing the cameras live'
-      :'Capture one or Start transect — frames appear here as pairs';
+    // PAIRS_STALE here means the pair list could not be READ, which is not the
+    // same claim as "this rig has no frames" — say which one it is.
+    $('#pairSub').textContent=PAIRS_STALE
+      ? 'refreshing… (the pair list could not be read; retrying)'
+      : (LIVE?'no pairs yet — showing the cameras live'
+             :'Capture one or Start transect — frames appear here as pairs');
     // LIVE with no pairs still shows the cameras: an operator aiming the rig
     // before the first shot needs the picture, not an empty box.
     roster.forEach(n=>{ const fr=$('#rvfr-'+n.name); const fe=$('#rvf-'+n.name);
       if(!fr) return;
-      if(LIVE && n.connected){ fr.className='frame';
-        if(!fr.querySelector('img')) fr.innerHTML='<img alt=""><div class="burn">LIVE</div>';
+      if(LIVE && n.connected){ fr.className='frame'; frameImg(fr,true);
         if(fe) fe.textContent='live view'; }
       else { fr.className='frame'; fr.innerHTML=''; if(fe) fe.textContent=''; } });
     const mid=$('#pairMid'); if(mid) mid.innerHTML='';
@@ -609,7 +822,8 @@ function renderPair(){
   }
   $('#pairTitle').textContent = s.epoch!=null ? tstamp(s.epoch)
     : Object.values(s.files||{})[0] || '—';
-  $('#pairSub').textContent = 'pair '+(i+1)+' / '+PAIRS.total+' · '+(PAIRS.label||'');
+  $('#pairSub').textContent = 'pair '+(i+1)+' / '+PAIRS.total+' · '+(PAIRS.label||'')+
+    (PAIRS_STALE?' · refreshing… (last pair-list poll failed; showing the previous list)':'');
   const mid=$('#pairMid');
   if(mid) mid.innerHTML=jitChip(s)+strobeChip(s);
   roster.forEach(n=>{
@@ -618,7 +832,7 @@ function renderPair(){
     const f=(s.files||{})[n.name];
     if(LIVE && n.connected){
       fr.className='frame';
-      if(!fr.querySelector('img')) fr.innerHTML='<img alt=""><div class="burn">LIVE</div>';
+      frameImg(fr,true);
       if(fe) fe.textContent='live view';
       return;
     }
@@ -637,8 +851,9 @@ function renderPair(){
     }
     fr.className='frame';
     const url = pairFrameUrl(s, n.name, f);
-    let img=fr.querySelector('img');
-    if(!img){ fr.innerHTML='<img alt="">'; img=fr.querySelector('img'); }
+    // frameImg strips a leftover LIVE burn and clears dataset.name if this
+    // <img> was just showing live view, so the recorded file always reloads.
+    const img=frameImg(fr,false);
     if(img.dataset.name!==f){
       // Decode off-screen, then swap: the previous frame stays on screen
       // until the new one is ready instead of collapsing to blank while a
@@ -688,17 +903,41 @@ setInterval(()=>{ if(LIVE && liveOk('review'))
 
 // ---- nav ------------------------------------------------------------------
 const track=[];
-async function pollNav(){
-  const s=await api('/api/nav');
+// Where the position CAME from. A lat/lon that is the operator's armed STATIC
+// fix (rigd's snapshot carries valid:false plus a static_fix label) is NOT a
+// GPS fix, and it used to wear the same green "nav fix" pill as one — so a rig
+// that had lost its fix an hour ago still read as navigating. rigd states this
+// as fix_kind ("live"|"static"|"none"); derive it on an older rigd from the
+// two fields that have always been there.
+function navFixKind(s){
+  if(!s) return 'none';
+  if(s.fix_kind) return s.fix_kind;
+  if(s.valid) return 'live';
+  return (s.lat!=null && s.static_fix) ? 'static' : 'none';
+}
+async function pollNav(){ renderNav(await api('/api/nav')); }
+function renderNav(s){
   const kv=$('#navKv');
   if(!s||s.present===false){ kv.innerHTML='<div class="muted small">no nav source</div>';
     pill($('#hNav'),'nav off','warn'); drawRose('navRose',null); return; }
-  pill($('#hNav'),'nav '+(s.lat!=null?'fix':'no fix'), s.lat!=null?'on':'warn');
-  kv.innerHTML = kvrow('Lat',fmt(s.lat,6))+kvrow('Lon',fmt(s.lon,6))+
+  const kind=navFixKind(s);
+  if(kind==='live') pill($('#hNav'),'nav fix','on');
+  else if(kind==='static') pill($('#hNav'),'nav STATIC','warn');
+  else pill($('#hNav'),'nav no fix','warn');
+  kv.innerHTML =
+    kvrow('Source', kind==='static'
+      ? '<span style="color:var(--warn)">STATIC fix'+
+        (s.static_fix?(' — '+escapeHtml(String(s.static_fix))):'')+'</span>'
+      : (kind==='live'?'live GPS':'<span class="muted">no fix</span>'))+
+    kvrow('Lat',fmt(s.lat,6))+kvrow('Lon',fmt(s.lon,6))+
     kvrow('UTM',(s.xutm?fmt(s.xutm,1)+' E, '+fmt(s.yutm,1)+' N '+(s.utm_zone||''):'—'))+
     kvrow('Depth',fmt(s.depth_m,2)+' m')+kvrow('Heading',fmt(s.heading_mag_deg??s.heading_true_deg,1)+'°')+
-    kvrow('SOG',fmt(s.sog,2))+kvrow('Sats',s.sats??'—');
-  if(s.lat!=null){ track.push([s.lon,s.lat]); if(track.length>3000)track.shift(); drawTrack(); }
+    // the API field is sog_mps; reading s.sog rendered "—" forever
+    kvrow('SOG',s.sog_mps!=null?fmt(s.sog_mps,2)+' m/s':'—')+kvrow('Sats',s.sats??'—');
+  // A static fix is one constant position, not a track — never plot it as
+  // motion.
+  if(s.lat!=null && kind!=='static'){
+    track.push([s.lon,s.lat]); if(track.length>3000)track.shift(); drawTrack(); }
   drawRose('navRose', s.heading_mag_deg??s.heading_true_deg);
 }
 function drawTrack(){
@@ -894,43 +1133,164 @@ function fillChoice(sel,list,cur,lab){
       e.value=o.v; e.textContent=o.l; sel.appendChild(e);}); }
   if(cur!=null && isFinite(cur)) sel.value=String(+cur);
 }
+// #applyNote is shared between the apply VERDICT and the idle "fleet desired"
+// line, and the verdict kept losing: every writer of the verdict ends with
+// `await hydrateSettings()`, and pollControls hydrates again every 5 s, so
+// "refused: ..." or "aperture, shutter were NOT applied" was overwritten
+// within one round-trip and the operator never read it. A verdict now holds
+// the line for APPLY_MSG_TTL_MS; after that the desired vector comes back on
+// its own at the next hydrate.
+const APPLY_MSG_TTL_MS=20000;
+let APPLY_MSG_AT=0;
+function applyNote(html){ APPLY_MSG_AT=Date.now(); $('#applyNote').innerHTML=html; }
 async function hydrateSettings(){
   const d=await api('/api/settings');
   if(!d || d.aperture==null) return;   // keep what is on screen; never invent
   DESIRED=d; SET_AT=Date.now();
   syncFmtControls(); renderCtlCols();
-  $('#applyNote').innerHTML='<span class="muted">fleet desired: '+labSet(DESIRED)+'</span>';
+  if(Date.now()-APPLY_MSG_AT>=APPLY_MSG_TTL_MS)
+    $('#applyNote').innerHTML='<span class="muted">fleet desired: '+labSet(DESIRED)+'</span>';
 }
-// Format fields: no readback on this body, so the select shows what rigd is
-// PUSHING, never a confirmation.
+// Format fields. The SELECT shows what rigd is pushing (the desired vector);
+// what each BODY reports back is a separate, per-camera panel below
+// (renderFmtReadback) — never conflate the two.
 const FMT=[['filetype','#sFtype'],['imagesize','#sIsize'],['transsize','#sTsize'],
-           ['wb_mode','#sWbMode'],['colortemp','#sColorTemp']];
+           ['rawtype','#sRawtype'],['wb_mode','#sWbMode'],['colortemp','#sColorTemp']];
 const FMT_DIRTY=new Set();
 function syncFmtControls(){
   const d=DESIRED||{};
-  FMT.forEach(([f,sel])=>{ const el=$(sel); if(!el||FMT_DIRTY.has(f))return;
+  FMT.forEach(([f,sel])=>{ const el=$(sel);
+    // Never write under the operator's caret: the 5 s hydrate used to
+    // overwrite a half-typed Kelvin value (dirty only fires on change, i.e.
+    // on blur, so mid-edit the field looked clean).
+    if(!el||FMT_DIRTY.has(f)||document.activeElement===el)return;
     if(d[f]!=null) el.value=String(d[f]); });
 }
-FMT.forEach(([f,sel])=>{ const el=$(sel); if(el) el.onchange=()=>{
-  FMT_DIRTY.add(f); el.classList.add('edited');
-  $('#fmtNote').innerHTML='<span style="color:var(--warn)">edited: '+
-    [...FMT_DIRTY].join(', ')+'</span>'; }; });
+FMT.forEach(([f,sel])=>{ const el=$(sel); if(!el) return;
+  const dirty=()=>{
+    FMT_DIRTY.add(f); el.classList.add('edited');
+    $('#fmtNote').innerHTML='<span style="color:var(--warn)">edited: '+
+      [...FMT_DIRTY].join(', ')+'</span>'; };
+  el.onchange=dirty;
+  // a text/number input is dirty from the first keystroke, not first blur —
+  // belt to the activeElement braces above
+  if(el.tagName==='INPUT') el.oninput=dirty; });
+// Did the push actually land? A transport failure answers {_err:true} and a
+// rigd 500 answers {ok:false,error} — NEITHER carries a 'rejected' key, so a
+// check that only looked at r.rejected took the SUCCESS branch for both: green
+// "pushed", dirty cleared, while the cameras kept shooting the old format. The
+// panel says there is no readback, so that message was the operator's only
+// confirmation.
+function fmtPushOk(r){
+  return !!(r && !r._err && r.ok!==false &&
+            r.applied && Object.keys(r.applied).length);
+}
 $('#btnFmt').onclick=async()=>{
   const note=$('#fmtNote');
   if(!FMT_DIRTY.size){ note.innerHTML='<span class="muted">nothing edited</span>';
     return; }
   const body={}; FMT.forEach(([f,sel])=>{ if(FMT_DIRTY.has(f)) body[f]=+$(sel).value; });
   const r=await api('/api/settings',body);
+  // ONE source of truth for "did anything land", so the fields cleared below
+  // and the verdict printed further down can never disagree.
+  const ok=fmtPushOk(r);
+  const got=ok?Object.keys(r.applied):[];
   const bad=Object.keys((r&&r.rejected)||{});
+  // /api/settings answers per FIELD, so an apply can be part-refused. Clear
+  // only what actually landed and leave the rest amber and still dirty, or the
+  // operator loses the edit that was refused along with the one that worked.
+  got.forEach(f=>{ FMT_DIRTY.delete(f);
+    const e=FMT.find(x=>x[0]===f); if(e) $(e[1]).classList.remove('edited'); });
   if(bad.length){ note.innerHTML='<span style="color:var(--bad)">refused: '+
-    escapeHtml(bad.map(k=>k+' — '+r.rejected[k]).join(' · '))+'</span>'; }
-  else { FMT_DIRTY.clear();
-    FMT.forEach(([,sel])=>$(sel).classList.remove('edited'));
+    escapeHtml(bad.map(k=>k+' — '+r.rejected[k]).join(' · '))+'</span>'+
+    (got.length?('<span class="muted"> · pushed '+escapeHtml(got.join(', '))+'</span>'):'');
+    if(got.length) pollFmtReadback(true); }
+  else if(ok){
     note.innerHTML='<span style="color:var(--ok)">pushed '+
-      escapeHtml(Object.keys(r.applied||body).join(', '))+
-      ' — no readback on this body, watch the delivered frame size</span>'; }
+      escapeHtml(got.join(', '))+
+      ' — confirm against the per-camera readback below</span>';
+    pollFmtReadback(true); }
+  else {
+    // A transport failure or a 500 has neither 'rejected' nor 'applied'.
+    // This used to take the SUCCESS branch: green "pushed", dirty cleared,
+    // while the cameras kept shooting the old format. Keep the amber edits
+    // so the operator can retry, and say plainly that nothing was pushed.
+    note.innerHTML='<span style="color:var(--bad)">apply failed ('+
+      escapeHtml((r&&r.error)||'no response')+') — '+
+      escapeHtml(Object.keys(body).join(', '))+' NOT pushed, edits kept</span>'; }
   await hydrateSettings();
 };
+// Per-camera format readback (contract C2): filetypeLabel/imagesizeLabel/
+// transsizeLabel/rawtypeLabel/qualityLabel/pcsaveLabel from /api/status?node=.
+// Read LIVE per body — rigd's fleet vector carries the raw values but not the
+// labels — and throttled (see the period below). Until this existed the format
+// card was blind: it stated what rigd had pushed and called it the setting.
+const FMT_RB={};              // node -> {at, s} | {at, err}
+let FMT_RB_AT=0, FMT_RB_BUSY=false;
+const FMT_RB_FIELDS=[['file','filetypeLabel'],['size','imagesizeLabel'],
+  ['transfer','transsizeLabel'],['raw','rawtypeLabel'],
+  ['quality','qualityLabel'],['pcsave','pcsaveLabel']];
+async function pollFmtReadback(force){
+  if(FMT_RB_BUSY) return;
+  // /api/status is a LIVE proxy that takes ilxctl's SDK mutex — the same lock
+  // the pull path uses. Idle that is cheap; mid-transect it competes with
+  // frame delivery, so back right off while a run is recording (the format is
+  // not supposed to change mid-run anyway).
+  const period=(FLEET.run||{}).active?20000:5000;
+  if(!force && Date.now()-FMT_RB_AT<period) return;
+  FMT_RB_BUSY=true; FMT_RB_AT=Date.now();
+  try{
+    for(const n of (FLEET.nodes||[]).filter(n=>n.connected)){
+      const s=await api('/api/status?node='+encodeURIComponent(n.name),null,7000);
+      // Keep three answers apart, because they mean different things to an
+      // operator confirming a format push: a body that answered and reports
+      // the fields; a body that answered without them (an ilxctl too old to
+      // emit the C2 readback); and no answer at all (rigcore http_json gives
+      // {ok:false,_unreachable}, api() gives {_err} on an abort). Rendering
+      // the last as "no readback — older ilxctl" would tell the operator to
+      // stop looking at the very moment the camera went away.
+      FMT_RB[n.name] = (s && !s._err && s.ok!==false)
+        ? {at:Date.now(), s:s}
+        : {at:Date.now(), err:(s&&s.error)||'no answer'};
+    }
+  } finally { FMT_RB_BUSY=false; FMT_RB_AT=Date.now(); }
+  renderFmtReadback();
+}
+function renderFmtReadback(){
+  const el=$('#fmtReadback'); if(!el) return;
+  const roster=(FLEET.nodes||[]);
+  if(!roster.length){ el.innerHTML=''; return; }
+  el.innerHTML=roster.map(n=>{
+    const nm='Cam'+n.cam_num+' '+escapeHtml(n.name);
+    if(!n.connected) return kvrow(nm,'<span class="muted">offline</span>');
+    const rb=FMT_RB[n.name];
+    if(!rb) return kvrow(nm,'<span class="muted">reading…</span>');
+    if(rb.err) return kvrow(nm,'<span class="neq">status unreadable</span> '+
+      '<span class="muted">'+escapeHtml(String(rb.err))+'</span>');
+    const st=rb.s||{};
+    const have=FMT_RB_FIELDS.filter(([,k])=>st[k]!=null);
+    if(!have.length) return kvrow(nm,'<span class="neq">no readback</span> '+
+      '<span class="muted">this ilxctl does not report the format fields — '+
+      'confirm by delivered frame size</span>');
+    const age=Math.round((Date.now()-rb.at)/1000);
+    // Render ALL SIX, marking the ones the body did not answer. camera.cpp
+    // emits <name>Value/<name>Label per property and omits the pair when the
+    // read came back < 0 ("the body did not answer ... or the property is
+    // hidden in this mode"), so fields go missing ONE at a time, not only all
+    // six together. This row used to render only the fields that survived, so
+    // a body that withheld filetype printed a full-looking "size S · transfer
+    // Small · quality Fine · pcsave RAW+JPEG" — and the format push's own
+    // success line sends the operator here to "confirm against the per-camera
+    // readback below". An unconfirmed field has to look unconfirmed; this
+    // panel exists so the operator sees what each body actually reported
+    // instead of assuming. The all-absent badge above stays its own case: that
+    // is an ilxctl too old to emit the C2 readback at all, not a gap.
+    return kvrow(nm, FMT_RB_FIELDS.map(([lbl,k])=> st[k]!=null
+        ? lbl+' <b>'+escapeHtml(String(st[k]))+'</b>'
+        : lbl+' <span class="neq">not reported</span>').join(' · ')+
+      ' <span class="muted">· read '+age+'s ago</span>');
+  }).join('');
+}
 
 // Per-camera exposure: a change goes LIVE to that body, immediately, via
 // POST /api/exposure {node, which, value}. The fleet vector is untouched —
@@ -938,9 +1298,63 @@ $('#btnFmt').onclick=async()=>{
 // workflow. "Apply exposure to fleet" copies ONE camera's exposure into the
 // fleet vector: a hard whitelist, nothing else can ride along.
 const EXP_ALLOWED=['aperture','shutter','iso','expcomp'];
+// The three fields the Apply button's promise covers, and where each one is
+// read from. expcomp is deliberately NOT one of them: it has no readback, so
+// its source is the pushed ledger and it cannot be "unread".
+const EXP_TRIPLE=[['ap','aperture','apertureValue'],
+                  ['sh','shutter','shutterValue'],
+                  ['iso','iso','isoValue']];
 const CHOICES_BY={};   // node -> its own choice lists (fetched per body)
 const EV_LEDGER={};    // node -> mEV pushed (expcomp has no readback)
 let LAST_EDITED=null;  // the column Apply uses as its source
+// Build the fleet body from ONE camera, and say which fields could NOT be
+// sourced. Split out of the Apply handler so it can be tested directly, and
+// because the answer the operator needs is not "did the POST succeed" but
+// "was the whole exposure actually read off that body".
+//
+// What failed: only a COMPLETELY empty body was refused, so a body that
+// answered for iso alone was posted and then reported with the same green
+// "fleet now on cam2's exposure" line as a full apply. rigd applies exactly
+// what it is sent (reconcile_all(force=True, exposure=["iso"])), so aperture
+// and shutter are not written to either body — the pair stays split while the
+// UI says it was unified. Two ways in, both reachable mid-run when ilxctl is
+// on its SDK mutex: the live read times out, or ilxctl answers its degraded
+// {"connected":true,"busy":true,...} body, which carries NO exposure keys and
+// no "ok" key — so `live.ok!==false` waved it through as a good readback.
+function exposureSource(src, live){
+  const ok=!!(live && !live._err && live.ok!==false && live.busy!==true);
+  const body={}, missing=[];
+  EXP_TRIPLE.forEach(([pfx,field,liveKey])=>{
+    const el=$('#'+pfx+'-'+src.name);
+    // 1. any select of the source column still carrying 'edited' — the
+    //    operator's on-screen intent, which has not echoed back yet;
+    // 2. the LIVE /api/status read of the source body, made right now.
+    if(el && el.classList.contains('edited') && selVal(el)!=null)
+      body[field]=selVal(el);
+    else if(ok && live[liveKey]!=null) body[field]=live[liveKey];
+    else missing.push(field);
+  });
+  // expcomp: prefer the body's own readback (ilxctl 2026-08-23+ emits
+  // expcompValue), else the pushed-ledger
+  if(ok && live.expcompValue!=null) body.expcomp=live.expcompValue;
+  else if(EV_LEDGER[src.name]!=null) body.expcomp=EV_LEDGER[src.name];
+  Object.keys(body).forEach(k=>{ if(!EXP_ALLOWED.includes(k)) delete body[k]; });
+  return {body:body, missing:missing, live_ok:ok};
+}
+// The verdict line. Green ONLY when the whole promised exposure landed; a
+// partial apply is amber and names what was not read and not applied, because
+// "fleet now on cam2's exposure: iso" is a true sentence that reads as a
+// finished job.
+function applyVerdict(srcName, applied, missing){
+  const nm=escapeHtml(srcName);
+  if(!missing.length)
+    return '<span style="color:var(--ok)">fleet now on '+nm+"'s exposure: "+
+      escapeHtml(applied.join(', '))+'</span>';
+  return '<span style="color:var(--warn)">partly applied — fleet now on '+nm+
+    "'s "+escapeHtml(applied.join(', '))+'; '+escapeHtml(missing.join(', '))+
+    ' could NOT be read from '+nm+' and '+(missing.length>1?'were':'was')+
+    ' NOT applied — the pair may still be split, retry Apply</span>';
+}
 async function nodeExposure(node, which, value, noteEl){
   const r=await api('/api/exposure',{node,which,value},6000);
   if(!r || r.ok===false){
@@ -953,38 +1367,112 @@ async function nodeExposure(node, which, value, noteEl){
   syncApplyBtn();
   return true;
 }
+// True when every connected body reads back the same exposure (and no EV push
+// diverges): the moment this holds, the Apply button's per-camera promise is
+// finished and its label reverts to the generic one.
+function bodiesMatch(){
+  const live=(FLEET.nodes||[]).filter(n=>n.connected);
+  if(live.length<2) return false;
+  const raws=['aperture_raw','shutter_raw','iso_raw'].every(k=>
+    live.every(n=>n[k]!=null && n[k]===live[0][k]));
+  // expcomp has no readback: compare the pushed-ledger instead
+  const evs=live.map(n=>EV_LEDGER[n.name]??((DESIRED||{}).expcomp||0));
+  return raws && evs.every(v=>v===evs[0]);
+}
+// An apply is in flight. pollFleet calls syncApplyBtn every 2 s and used to
+// re-enable the button under a running apply, so a second click could push a
+// second fleet reconcile on top of the first.
+let APPLY_BUSY=false;
 function syncApplyBtn(){
-  $('#btnApply').textContent='Apply '+(LAST_EDITED?LAST_EDITED+"'s":'')+' exposure to fleet';
+  const btn=$('#btnApply');
+  if(APPLY_BUSY) return;
+  const nodes=(FLEET.nodes||[]);
+  const src=LAST_EDITED?nodes.find(n=>n.name===LAST_EDITED):null;
+  const offline=!!(LAST_EDITED && (!src || !src.connected));
+  // Revert to the generic label only once every edit has echoed back AND the
+  // bodies agree — before the echo (≤4 s) they still LOOK identical, which
+  // must not clear the promise the operator just created by editing.
+  const match=bodiesMatch();
+  if(LAST_EDITED && !offline && !document.querySelector('#ctlCols select.edited')
+     && match)
+    LAST_EDITED=null;
+  // Name the camera Apply reads FROM whenever the answer depends on which one
+  // it is — an outstanding edit, or two bodies that disagree. The button used
+  // to read a bare "Apply exposure to fleet" while it would have silently
+  // taken whichever body happened to be first in the roster. Only when the
+  // bodies already match is the unnamed label unambiguous.
+  const auto=LAST_EDITED?null:nodes.find(n=>n.connected);
+  const named=LAST_EDITED||((auto&&!match)?auto.name:null);
+  // Built as two whole strings, not a hole in one: 'Apply '+''+' exposure…'
+  // left a double space in the generic label, which is the label the operator
+  // is supposed to read as "the bodies agree, either one will do".
+  btn.textContent=(named?('Apply '+named+"'s exposure to fleet")
+                        :'Apply exposure to fleet')+
+    (offline?' — '+LAST_EDITED+' OFFLINE':'');
+  btn.disabled=offline || !nodes.some(n=>n.connected);
+  btn.title=offline
+    ? (LAST_EDITED+' is offline — its exposure cannot be read; '+
+       'reconnect it (or edit the other camera) before applying')
+    : (named?('reads '+named+' live, then pushes that exposure to every camera')
+            :'the bodies already agree — either one is the same answer');
 }
 $('#btnApply').onclick=async()=>{
   const note=$('#applyNote');
-  const src=(FLEET.nodes||[]).find(n=>n.name===LAST_EDITED&&n.connected)
-        || (FLEET.nodes||[]).find(n=>n.connected);
+  // Refuse, never silently switch source: if the operator tuned cam2 the
+  // button promises cam2 — falling back to cam1 pushed cam1's exposure over
+  // the tuning the moment cam2 reconnected (reconnect forces exposure).
+  let src=null;
+  if(LAST_EDITED){
+    src=(FLEET.nodes||[]).find(n=>n.name===LAST_EDITED);
+    if(!src || !src.connected){
+      applyNote('<span style="color:var(--bad)">'+escapeHtml(LAST_EDITED)+
+        ' is offline — its exposure cannot be read; not applied</span>');
+      return; }
+  } else {
+    src=(FLEET.nodes||[]).find(n=>n.connected);
+  }
   if(!src){ note.innerHTML='<span class="muted">no camera connected</span>'; return; }
-  // The source body's own readback, whitelisted: ONLY the exposure section.
-  const body={};
-  if(src.aperture_raw!=null) body.aperture=src.aperture_raw;
-  if(src.shutter_raw!=null)  body.shutter =src.shutter_raw;
-  if(src.iso_raw!=null)      body.iso     =src.iso_raw;
-  if(EV_LEDGER[src.name]!=null) body.expcomp=EV_LEDGER[src.name];
-  Object.keys(body).forEach(k=>{ if(!EXP_ALLOWED.includes(k)) delete body[k]; });
-  if(!Object.keys(body).length){
-    note.innerHTML='<span class="muted">no exposure readback from '+escapeHtml(src.name)+' yet</span>';
+  const btn=$('#btnApply'); btn.disabled=true; APPLY_BUSY=true;
+  note.innerHTML='<span class="muted">reading '+escapeHtml(src.name)+' live…</span>';
+  // NEVER build the body from FLEET: that is rigd's poll cache, up to ~4 s
+  // old, and applying it 1–3 s after an edit pushed the PRE-edit exposure
+  // back onto both bodies while reporting success. Read the body LIVE, right
+  // now; exposureSource says which fields that read actually produced.
+  const live=await api('/api/status?node='+encodeURIComponent(src.name),null,7000);
+  const plan=exposureSource(src, live);
+  // Refuse on the EXPOSURE TRIPLE, not on the whole body. Testing
+  // Object.keys(body).length made this refusal all but unreachable: the
+  // success path below writes EV_LEDGER for every connected node, so from the
+  // first successful apply onwards `body` always carried an expcomp and a
+  // camera that answered for nothing at all still posted — a fleet reconcile
+  // forced from a stale ledger value, reported as an apply of "expcomp".
+  if(plan.missing.length===EXP_TRIPLE.length){
+    APPLY_BUSY=false; syncApplyBtn();
+    applyNote('<span style="color:var(--bad)">no live exposure readback from '+
+      escapeHtml(src.name)+' — not applied'+
+      (plan.live_ok?'':' (the body did not answer — it may be busy on a pull)')+
+      '</span>');
     return; }
-  const btn=$('#btnApply'); btn.disabled=true;
-  const r=await api('/api/settings',body);
-  btn.disabled=false;
+  const r=await api('/api/settings',plan.body);
+  APPLY_BUSY=false;
   const rej=Object.keys((r&&r.rejected)||{});
   if(rej.length)
-    note.innerHTML='<span style="color:var(--bad)">refused: '+
-      escapeHtml(rej.map(k=>k+' — '+r.rejected[k]).join(' · '))+'</span>';
-  else if(r && r.applied && Object.keys(r.applied).length)
-    note.innerHTML='<span style="color:var(--ok)">fleet now on '+escapeHtml(src.name)+
-      "'s exposure: "+escapeHtml(Object.keys(r.applied).join(', '))+'</span>';
-  else
-    note.innerHTML='<span style="color:var(--bad)">apply failed: '+
-      escapeHtml((r&&r.error)||'no response')+'</span>';
+    applyNote('<span style="color:var(--bad)">refused: '+
+      escapeHtml(rej.map(k=>k+' — '+r.rejected[k]).join(' · '))+'</span>');
+  else if(r && r.applied && Object.keys(r.applied).length){
+    applyNote(applyVerdict(src.name, Object.keys(r.applied), plan.missing));
+    // The forced reconcile pushes expcomp fleet-wide: the per-node pushed
+    // ledger must follow, or bodiesMatch() reads a stale split forever.
+    if(r.applied.expcomp!=null)
+      (FLEET.nodes||[]).filter(n=>n.connected).forEach(n=>{
+        EV_LEDGER[n.name]=r.applied.expcomp;
+        const ev=$('#ev-'+n.name); if(ev) ev.textContent=r.applied.expcomp+' mEV (pushed)';
+      });
+  } else
+    applyNote('<span style="color:var(--bad)">apply failed: '+
+      escapeHtml((r&&r.error)||'no response')+'</span>');
   await hydrateSettings();
+  syncApplyBtn();
 };
 
 // ---- controls: one column per camera ---------------------------------------
@@ -1237,8 +1725,11 @@ $('#fMode').onchange=async()=>{
   const r=await api('/api/focus/mode',{mode:+v});
   FMODE_BUSY=false;
   const rej=(r&&r.rejected&&r.rejected.focus_mode);
-  if(rej) $('#applyNote').innerHTML='<span style="color:var(--bad)">focus mode '+
-    'refused: '+escapeHtml(rej)+'</span>';
+  // Through applyNote, or the hydrate on the next line erases the refusal
+  // before it can be read — and a focus mode that did not take is the one
+  // message on this page that must never be missed (always manual focus).
+  if(rej) applyNote('<span style="color:var(--bad)">focus mode '+
+    'refused: '+escapeHtml(rej)+'</span>');
   await hydrateSettings();
 };
 function refreshLive(prefix, nodes, framed){
@@ -1268,6 +1759,7 @@ async function pollControls(){
   renderCtlCols();
   if(!document.hidden) refreshLive('lv-', (FLEET.nodes||[]).filter(n=>n.connected));
   renderLensWarn(); renderBodyOnly();
+  pollFmtReadback();     // self-throttled to one live pass per 5 s
   if(Date.now()-SET_AT>5000) hydrateSettings();
   const prim=(FLEET.nodes||[]).find(n=>n.connected);
   if(prim && $('#fMode').options.length && !FMODE_BUSY){
@@ -1332,6 +1824,25 @@ $('#stPulse').onchange=()=>pushStrobe({pulse_ms:+$('#stPulse').value});
 // flight_log — one with half its columns empty and no second view to make a
 // stereo pair from. The check happens BEFORE the first frame is written.
 function pfRow(k,cls,v,why){ return {k:k,cls:cls,v:v,why:why}; }
+// Which connected bodies are shooting FASTER than 1/30 — the point below which
+// a scheduled flash can land after that camera's curtain has closed. Named per
+// camera, from each BODY's own shutter readback: this check used to read the
+// fleet desired vector only, and the per-camera exposure split is a supported
+// balancing workflow, so a body put on 1/250 while desired still said 1/30
+// sailed through the check and its whole transect came back unlit. The desired
+// vector is the fallback ONLY when no body has answered with a readback yet.
+function strobeFastCams(live, desired){
+  const durOf=sh=>{ if(!sh) return 0;
+    const num=(sh>>>16)&0xFFFF, den=sh&0xFFFF; return den?num/den*1000:0; };
+  const isFast=ms=>ms>0&&ms<33;
+  const rb=(live||[]).filter(n=>n.shutter_raw!=null);
+  if(rb.length)
+    return rb.filter(n=>isFast(durOf(n.shutter_raw)))
+             .map(n=>n.name+' ('+labShutter(n.shutter_raw)+')');
+  const sh=(desired||{}).shutter;
+  return isFast(durOf(sh))
+    ? ['fleet desired ('+labShutter(sh)+') — no readback yet'] : [];
+}
 async function preflight(){
   const [f,d,an,nv]=await Promise.all([api('/api/fleet'),api('/api/diag'),
                                        api('/api/anomalies'),api('/api/nav')]);
@@ -1389,15 +1900,14 @@ async function preflight(){
   // Strobe: armed and plausible, or off.
   if(STROBE.enabled){
     const sn=live.find(n=>n.name===STROBE.node);
-    const sh=(d&&d.desired||{}).shutter, num=sh?((sh>>>16)&0xFFFF):0, den=sh?(sh&0xFFFF):1;
-    const durMs=den?num/den*1000:0;
-    const fast=durMs>0&&durMs<33;
+    const fast=strobeFastCams(live, (d&&d.desired)||{});
     if(!sn){ hard.push('strobe is armed on '+STROBE.node+' which is not connected');
       rows.push(pfRow('strobe','bad','armed on '+STROBE.node+' — not connected')); }
-    else if(fast){ warn.push('strobe armed but shutter is faster than 1/30');
+    else if(fast.length){ warn.push('strobe armed but shutter is faster than 1/30 on '+
+        fast.join(', '));
       rows.push(pfRow('strobe','warn','T+'+STROBE.delta_ms+' ms on '+STROBE.node+
-        ' · shutter '+labShutter(sh),
-        'faster than 1/30: the flash may land after the curtain closes')); }
+        ' · '+fast.join(', '),
+        'faster than 1/30: the flash may land after that camera’s curtain closes')); }
     else rows.push(pfRow('strobe','ok','T+'+STROBE.delta_ms+' ms on '+STROBE.node));
   }
 
@@ -1478,7 +1988,20 @@ function renderPreflight(pf,extra){
       ('<span class="muted"> — '+escapeHtml(r.why)+'</span>'):''}</span></div>`).join('')
     + (extra||'');
 }
-$('#btnStart').onclick=async()=>{
+// What the pre-flight snapshot was checked AGAINST: if these change (or the
+// snapshot ages out) "Start anyway" re-runs the check instead of committing a
+// stale one — startRun() re-reads the inputs, so what was checked and what
+// starts must be the same thing.
+function startInputsSig(){
+  return [$('#cLabel').value.trim(), $('#cInt').value, $('#cFrames').value,
+          $('#cAuto').checked].join('|');
+}
+const PF_TTL_MS=20000;
+// staleWhy: set when this pass was triggered by "Start anyway" on a snapshot
+// that had expired or whose inputs had changed. It is threaded through so the
+// re-check's own verdict line can carry the reason — writing it to #runInfo
+// before re-running would just be overwritten by the new pass.
+async function runStartFlow(staleWhy){
   const btn=$('#btnStart'); btn.disabled=true;
   $('#preflight').innerHTML='<span class="muted small">pre-flight…</span>';
   let pf;
@@ -1487,7 +2010,7 @@ $('#btnStart').onclick=async()=>{
       '<span class="pfv">check failed: '+escapeHtml(String(e))+'</span></div>';
     $('#runInfo').innerHTML='<span style="color:var(--bad)">not started — pre-flight '+
       'could not read the rig state</span>'; return; }
-  finally { btn.disabled=false; }
+  finally { btn.disabled=!!(FLEET.run&&FLEET.run.active); }
   if(pf.hard.length){
     renderPreflight(pf,`<div class="pf bad" style="margin-top:6px"><span class="pfk">blocked</span>`+
       `<span class="pfv">${escapeHtml(pf.hard.join(' · '))}</span></div>`);
@@ -1496,20 +2019,34 @@ $('#btnStart').onclick=async()=>{
     return;
   }
   if(pf.warn.length){
+    pf.at=Date.now(); pf.sig=startInputsSig();
     renderPreflight(pf,`<div class="row" style="margin-top:8px">`+
       `<span class="small" style="color:var(--warn)">${pf.warn.length} warning`+
       `${pf.warn.length>1?'s':''} — this run will record with the above</span>`+
       `<button class="act go" id="btnStartAnyway" style="margin-left:auto">Start anyway</button>`+
       `<button class="act" id="btnStartCancel">Cancel</button></div>`);
-    $('#btnStartAnyway').onclick=()=>{ renderPreflight(pf); startRun(); };
+    $('#btnStartAnyway').onclick=()=>{
+      const aged=Date.now()-pf.at>PF_TTL_MS, changed=startInputsSig()!==pf.sig;
+      if(aged||changed){
+        runStartFlow(changed
+          ? 'the transect settings changed after the check'
+          : 'the check was over '+Math.round(PF_TTL_MS/1000)+' s old');
+        return;
+      }
+      renderPreflight(pf); startRun(); };
     $('#btnStartCancel').onclick=()=>{ $('#preflight').innerHTML='';
       $('#runInfo').textContent='start cancelled'; };
     $('#runInfo').innerHTML='<span style="color:var(--warn)">not started yet — review the '+
-      'pre-flight above, then Start anyway.</span>';
+      'pre-flight above, then Start anyway.</span>'+(staleWhy
+        ? ' <span class="muted">(re-checked: '+escapeHtml(staleWhy)+')</span>':'');
     return;
   }
   renderPreflight(pf); startRun();
-};
+}
+// Wrapped, not passed by name: runStartFlow's first argument is the reason a
+// stale pre-flight was re-checked, and a bare assignment would hand it the
+// click event to print at the operator.
+$('#btnStart').onclick=()=>runStartFlow();
 async function startRun(){
   $('#runInfo').textContent='starting…';
   const r=await api('/api/run/start',{label:$('#cLabel').value.trim(),
@@ -1538,16 +2075,58 @@ async function startRun(){
   btn.addEventListener('pointerdown',dn);
   ['pointerup','pointerleave','pointercancel'].forEach(ev=>btn.addEventListener(ev,up));
 })();
+// A stop is in flight. The hold-to-stop gesture can be repeated during the
+// ~20 s a real stop takes; the second POST answers "no active run" and its red
+// error would overwrite the pulled/FAILED tally from the first — the one line
+// that says whether the survey came home.
+let STOP_BUSY=false;
 async function doStop(){
-  const r=await api('/api/run/stop',{});
-  if(!r.ok){ $('#runInfo').innerHTML='<span style="color:var(--bad)">stop: '+
-    escapeHtml(r.error||'no active run')+'</span>'; return; }
+  const el=$('#runInfo');
+  if(STOP_BUSY){ el.innerHTML='<span style="color:var(--warn)">already stopping — '+
+    'wait for the tally</span>'; return; }
+  STOP_BUSY=true;
+  try{ await doStopInner(el); } finally { STOP_BUSY=false; }
+}
+async function doStopInner(el){
+  el.innerHTML='<span style="color:var(--warn)">stopping… (draining in-flight '+
+    'frames can take ~20 s)</span>';
+  // RunManager.stop legitimately runs 12–20 s (joins the capture loop, waits
+  // a delivery grace when pulled < fired, joins each PullWorker). The default
+  // 8 s api() abort declared a healthy stop failed and the pulled/FAILED
+  // tally — the one line saying whether the survey came home — never showed.
+  const r=await api('/api/run/stop',{},30000);
+  if(!r || !r.ok){
+    if(!r || r._err){
+      // The request aborted/failed but the stop may well be running: watch
+      // the fleet until the run flag clears instead of declaring failure.
+      el.innerHTML='<span style="color:var(--warn)">stop sent — no reply yet, '+
+        'watching the rig…</span>';
+      for(let i=0;i<10;i++){
+        await new Promise(res=>setTimeout(res,2000));
+        const f=await api('/api/fleet');
+        if(f && f.run && !f.run.active){
+          el.innerHTML='<span style="color:var(--ok)">stopped</span> '+
+            '<span class="muted">— the reply was lost; the pull tally is in '+
+            'Transects</span>';
+          RUNS_HEAD=null; pollPairs(true); return;
+        }
+      }
+      el.innerHTML='<span style="color:var(--bad)">stop: no response and the '+
+        'run still reads active — see docs/FIELD-RUN.md</span>';
+      return;
+    }
+    el.innerHTML='<span style="color:var(--bad)">stop: '+
+      escapeHtml((r&&r.error)||'no active run')+'</span>'; return;
+  }
   const s=r.summary||{};
   const tally=Object.keys(s).map(k=>k+' '+(s[k].pulled||0)+' ok'+
     (s[k].failed?' / '+s[k].failed+' FAILED':'')).join(' · ');
   $('#runInfo').innerHTML='<span style="color:var(--ok)">stopped '+escapeHtml(r.run_id||'')+
-    '</span>'+(tally?' <span class="muted">· '+escapeHtml(tally)+'</span>':'');
-  RUNS_HEAD=null; pollPairs(true);
+    '</span>'+(tally?' <span class="muted">· '+escapeHtml(tally)+'</span>':'')+
+    (r.drain_started?' <span class="muted">· card drain started</span>':'');
+  // The stop normally STARTS a drain (drain_started above): show it at once
+  // rather than leaving the panel idle for a poll interval.
+  RUNS_HEAD=null; pollPairs(true); pollDrain(true);
 }
 $('#btnCap').onclick=async()=>{
   const el=$('#runInfo'); el.textContent='firing…';
@@ -1567,6 +2146,212 @@ $('#btnCap').onclick=async()=>{
       ' fired over USB, not GPIO: unsynchronised</span>' : '');
   setTimeout(()=>pollPairs(true), 1500);
 };
+
+// ---- card drain — the step between this transect and the next --------------
+// Server contract (rigd.Rig.drain_status / /api/drain):
+//   {active, node, queue:[...], skipped:{node:why}, cancel_requested,
+//    wedged:{node:{at, at_iso, rebooted_at}},
+//    last:{node, at, pulled, bytes, deleted, verified, errors:<count>, cancelled}}
+// `last` is ONE report — whichever node finished most recently — so draining
+// cam1 then cam2 erases cam1's numbers from the API. This page keeps what it
+// has seen per node and stamps every row with the time it finished, so a row
+// can be old but never reads as current. Nothing here is invented: a node this
+// page has not watched drain has no row at all.
+// `skipped` is NOT cleared when a drain ends, so it is labelled as belonging to
+// the last drain START rather than shown as live state.
+let DRAIN={active:false, node:null, queue:[], wedged:{}}, DRAIN_LAST={},
+    DRAIN_ERR='', DRAIN_BUSY=false;
+// Kept separate from the fetch so the whole decision - what counts as a
+// readable status, what is remembered, what is drawn - is one synchronous,
+// testable step.
+function applyDrain(d){
+  // A failed read must never render as "idle": that would tell the operator the
+  // cards are free while a drain may still be holding a camera. Keep the last
+  // state seen and say plainly that it is not live.
+  if(!d || d._err || typeof d.active!=='boolean'){
+    DRAIN_ERR=(d && d.error) ? String(d.error) : 'no reply from rigd';
+    renderDrain(); return false;
+  }
+  DRAIN_ERR=''; DRAIN=d;
+  if(d.last && d.last.node) DRAIN_LAST[d.last.node]=d.last;
+  renderDrain(); return true;
+}
+async function pollDrain(force){
+  if(!force && !liveOk('review')) return;
+  applyDrain(await api('/api/drain'));
+}
+function drainBytes(b){
+  if(typeof b!=='number' || !isFinite(b)) return '—';
+  return b>=1e9 ? (b/1e9).toFixed(1)+' GB' : Math.round(b/1e6)+' MB';
+}
+// rigd's epochs are its own host clock; render them absolute (as everywhere
+// else on this page) rather than as "N min ago" against the browser's clock,
+// which may be a tablet's.
+function drainWhen(ep){
+  return (typeof ep==='number' && isFinite(ep)) ? tstamp(ep) : '—';
+}
+// Counts come from rigd as JSON numbers. Anything else is not a count, so it
+// is shown as unknown rather than printed into the page: the same rule
+// escapeHtml enforces for the strings, applied to the numbers.
+function drainNum(v){
+  return (typeof v==='number' && isFinite(v)) ? String(v) : '—';
+}
+function syncDrainNodes(){
+  const sel=$('#drNode'); if(!sel) return;
+  const ns=FLEET.nodes||[];
+  const sig=ns.map(n=>n.name+(n.connected?':1':':0')).join(',');
+  if(sel.dataset.sig===sig) return;
+  const cur=sel.value;
+  sel.dataset.sig=sig; sel.innerHTML='';
+  const add=(v,l)=>{ const o=document.createElement('option');
+    o.value=v; o.textContent=l; sel.appendChild(o); };
+  add('','all connected cameras');
+  ns.forEach(n=>add(n.name, n.name+(n.connected?'':' — offline, cannot drain')));
+  if(cur && ns.some(n=>n.name===cur)) sel.value=cur;
+}
+function renderDrain(){
+  const st=$('#drainState'); if(!st) return;
+  syncDrainNodes();
+  const act=!!DRAIN.active, node=DRAIN.node||'', q=DRAIN.queue||[];
+  let h='';
+  if(DRAIN_ERR)
+    h+='<div style="color:var(--warn)">drain status unreadable — '+escapeHtml(DRAIN_ERR)+
+       ' · what follows is the last state this page saw, not live</div>';
+  if(act){
+    h+='<div><span style="color:var(--warn)">draining <b>'+escapeHtml(node||'?')+
+       '</b></span>'+(q.length?(' <span class="muted">· queue '+
+       q.map(escapeHtml).join(' → ')+'</span>'):'')+
+       ' <span class="muted">· the next transect cannot start until it finishes</span></div>';
+    h+= DRAIN.cancel_requested
+      ? '<div style="color:var(--warn)">cancelling — it finishes the shot it is on, '+
+        'then stops. Everything already verified stays pulled; the rest of the card '+
+        'is untouched.</div>'
+      : '<div class="muted">no per-shot progress is reported — the file-by-file log '+
+        'is in Events. A full card takes 10–15 min.</div>';
+  } else {
+    h+='<div>idle <span class="muted">— cards drain automatically after Stop; '+
+       'drain by hand here when a card is filling. Nothing is deleted from a card '+
+       'until the host has verified its bytes.</span></div>';
+  }
+  st.innerHTML=h;
+
+  const cb=$('#btnDrainCancel');
+  cb.style.display = act ? '' : 'none';
+  cb.disabled = !!DRAIN.cancel_requested;
+  cb.textContent = DRAIN.cancel_requested ? 'cancelling…' : 'Cancel drain';
+  cb.title = 'stops between shots — never between a verify and a card delete';
+  const db=$('#btnDrain'), running=!!(FLEET.run||{}).active;
+  db.disabled = act || DRAIN_BUSY || running;
+  db.title = act ? ('a drain is already running on '+(node||'a camera'))
+    : running ? 'a run is recording — a body cannot shoot and drain at once'
+    : 'hold 1 s — every shot the host verifies is then DELETED from the card, '+
+      'and the next transect cannot start until the drain finishes';
+
+  const rows=Object.keys(DRAIN_LAST).sort();
+  const sk=DRAIN.skipped||{}, skn=Object.keys(sk).sort();
+  $('#drainLast').innerHTML = (rows.length
+    ? '<table><tr><th>camera</th><th>drain finished</th><th>shots pulled</th>'+
+      '<th>bytes</th><th>deleted from card</th><th>errors</th></tr>'+
+      rows.map(n=>{ const L=DRAIN_LAST[n]||{};
+        const left=(typeof L.pulled==='number' && typeof L.deleted==='number')
+          ? L.pulled-L.deleted : 0;
+        const errs=(typeof L.errors==='number' && isFinite(L.errors))?L.errors:null;
+        return '<tr><td class="n">'+escapeHtml(n)+'</td>'+
+          '<td class="n">'+drainWhen(L.at)+'</td>'+
+          '<td class="n">'+drainNum(L.pulled)+
+          (L.cancelled?' <span style="color:var(--warn)">CANCELLED</span>':'')+'</td>'+
+          '<td class="n">'+drainBytes(L.bytes)+'</td>'+
+          '<td class="n">'+drainNum(L.deleted)+
+          (left>0?(' <span class="muted">· '+left+' still on the card</span>'):'')+'</td>'+
+          '<td class="n"'+(errs?' style="color:var(--bad)"':'')+'>'+
+          drainNum(errs)+(errs?' — see Events':'')+'</td></tr>'; }).join('')+
+      '</table>'
+    : '<span class="muted small">no drain has finished since this page was opened</span>')
+    + skn.map(n=>'<div class="small" style="color:var(--warn);margin-top:6px">'+
+        'the last drain start skipped '+escapeHtml(n)+' — '+
+        escapeHtml(String(sk[n]))+'</div>').join('');
+
+  const w=DRAIN.wedged||{}, wn=Object.keys(w).sort();
+  $('#drainWedge').innerHTML = wn.map(n=>
+    '<div class="anom bad" style="margin-top:8px"><b>'+escapeHtml(n)+
+    ' — card transfer subsystem wedged</b> <span class="muted">since '+
+    escapeHtml(String((w[n]||{}).at_iso||'?'))+'</span>'+
+    '<br><span class="muted small">→ power-cycle that camera body, then drain it '+
+    'again from here. Its card keeps every frame in the meantime; the automatic '+
+    'drain after Stop will SKIP '+escapeHtml(n)+' until rigd sees it power-cycle.'+
+    '</span></div>').join('');
+}
+// Hold-to-confirm, generalised from the Stop button's gesture.
+function holdConfirm(btn, ms, onDone, onAbort){
+  if(!btn) return;
+  const fill=btn.querySelector('.fill');
+  let t0=null, raf=null;
+  const tick=()=>{ if(t0==null) return;
+    const p=Math.min(1,(Date.now()-t0)/ms);
+    if(fill) fill.style.width=(p*100)+'%';
+    if(p>=1){ t0=null; if(fill) fill.style.width='0'; onDone(); return; }
+    raf=requestAnimationFrame(tick); };
+  const dn=e=>{ if(e&&e.preventDefault) e.preventDefault();
+    if(btn.disabled||t0!=null) return;
+    t0=Date.now(); raf=requestAnimationFrame(tick); };
+  const up=()=>{ if(t0!=null){ t0=null; if(fill) fill.style.width='0';
+      if(onAbort) onAbort(); }
+    if(raf) cancelAnimationFrame(raf); };
+  btn.addEventListener('pointerdown',dn);
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>btn.addEventListener(ev,up));
+}
+// Starting a drain is the irreversible half of this panel: every shot the host
+// verifies is DELETED from the card, and the card original is the only other
+// copy of that RAW. It also blocks the next transect for 10-15 min. So it wears
+// Stop's hold-to-confirm.
+// CANCEL is the reversible half and stays a single click: the server stops
+// between shots and never between a verify and a card delete, so a cancel
+// cannot cost a frame — anything not reached is still on the card and a
+// re-drain finishes it. Putting a 1 s hold on the escape hatch would only tax
+// the operator who needs the camera back NOW. Instead the click is made
+// unrepeatable: the button disables and relabels the moment rigd reports
+// cancel_requested, so a second press cannot produce a confusing error.
+async function startDrain(){
+  if(DRAIN_BUSY) return;
+  const sel=$('#drNode'), pick=sel?sel.value:'';
+  const body={keep:!!($('#drKeep')||{}).checked};
+  if(pick) body.nodes=[pick];
+  DRAIN_BUSY=true;
+  $('#drainNote').innerHTML='<span class="muted">starting…</span>';
+  renderDrain();          // grey the button out now, not a poll from now
+  const r=await api('/api/drain', body, 15000);
+  DRAIN_BUSY=false;
+  if(!r || !r.ok){
+    $('#drainNote').innerHTML='<span style="color:var(--bad)">drain not started: '+
+      escapeHtml((r&&r.error)||'no response')+'</span>';
+  } else {
+    const sk=r.skipped||{};
+    $('#drainNote').innerHTML='<span style="color:var(--ok)">draining '+
+      escapeHtml((r.draining||[]).join(', ')||'—')+'</span>'+
+      Object.keys(sk).sort().map(n=>' <span style="color:var(--warn)">· '+
+        escapeHtml(n)+' skipped: '+escapeHtml(String(sk[n]))+'</span>').join('');
+  }
+  pollDrain(true);
+}
+async function cancelDrain(){
+  const b=$('#btnDrainCancel');
+  if(b.disabled) return;
+  b.disabled=true; b.textContent='cancelling…';
+  $('#drainNote').innerHTML='<span style="color:var(--warn)">cancel sent — the drain '+
+    'finishes the shot it is on, then stops. Nothing already verified is lost.</span>';
+  const r=await api('/api/drain/cancel',{});
+  if(!r || !r.ok){
+    b.disabled=false; b.textContent='Cancel drain';
+    $('#drainNote').innerHTML='<span style="color:var(--bad)">cancel failed: '+
+      escapeHtml((r&&r.error)||'no response')+'</span>';
+  }
+  pollDrain(true);
+}
+holdConfirm($('#btnDrain'), 1000, startDrain, ()=>{
+  $('#drainNote').innerHTML='<span class="muted">hold Drain for a full second — '+
+    'it empties the cards it verifies, and blocks the next transect while it runs'+
+    '</span>'; });
+$('#btnDrainCancel').onclick=()=>cancelDrain();
 
 // ---- anomalies (global, tab-independent) -----------------------------------
 // Polled on its own timer: rigd only runs the detectors when /api/anomalies
@@ -1594,7 +2379,11 @@ function renderAnomPill(){
   const top=bad[0]||ANOMS[0];
   pill(el,'⚠ '+top.kind+(top.node?(' '+top.node):'')+
        (ANOMS.length>1?(' +'+(ANOMS.length-1)):''), bad.length?'bad':'warn');
-  el.title=ANOMS.map(a=>(a.node?a.node+': ':'')+a.kind+' — '+a.msg+
+  // A detector kind the UI has never heard of (host_clock_offset,
+  // node_clock_unmeasurable, nav_no_fix, …) renders generically — but only if
+  // an absent msg/action stays blank instead of printing "undefined" at the
+  // operator.
+  el.title=ANOMS.map(a=>(a.node?a.node+': ':'')+a.kind+(a.msg?(' — '+a.msg):'')+
     (a.suggested_action?('\n    → '+a.suggested_action):'')).join('\n');
   const sig=ANOMS.map(a=>a.kind+'/'+(a.node||'')).sort().join(',');
   if(sig!==ANOM_SIG){ ANOM_SIG=sig;
@@ -1605,9 +2394,10 @@ $('#hAnom').onclick=()=>{ showTab('review');
 function renderAnoms(){
   const el=$('#anoms'); if(!el) return;
   el.innerHTML = ANOMS.length ? ANOMS.map(x=>
-    `<div class="anom ${anomSev(x)==='bad'?'bad':''}"><b>${escapeHtml(x.kind)}</b> `+
-    `${x.node?('· '+escapeHtml(x.node)):''} — ${escapeHtml(x.msg)}<br>`+
-    `<span class="muted small">→ ${escapeHtml(x.suggested_action||'')}</span></div>`).join('')
+    `<div class="anom ${anomSev(x)==='bad'?'bad':''}"><b>${escapeHtml(x.kind||'?')}</b> `+
+    `${x.node?('· '+escapeHtml(x.node)):''}${x.msg?(' — '+escapeHtml(x.msg)):''}`+
+    `${x.suggested_action?('<br><span class="muted small">→ '+
+      escapeHtml(x.suggested_action)+'</span>'):''}</div>`).join('')
     : '<span class="muted small">none</span>';
 }
 
@@ -1699,9 +2489,13 @@ function renderRunDetail(){
     h+='<h2 style="margin-top:14px">Latest shots</h2>'+
       `<div class="row"><button class="act" id="shPrev">◀</button>`+
       `<span class="mono small">${RUN_SHOT+1}/${rec.length} · ${tstamp(s.epoch)}`+
-      `${s.missing.length?(' · <span style="color:var(--bad)">missing '+
-        escapeHtml(s.missing.join(','))+'</span>'):' · pair complete'}`+
-      ` · spread ${s.spread_ms} ms</span>`+
+      `${(s.missing||[]).length?(' · <span style="color:var(--bad)">missing '+
+        escapeHtml((s.missing||[]).join(','))+'</span>'):' · pair complete'}`+
+      // A one-camera shot has no inter-camera spread: the server computes 0
+      // over the single member, and "spread 0 ms" beside "missing cam2" reads
+      // as perfect sync for a shot that has no second camera to be in sync
+      // with. Print the number only for a complete pair that has one.
+      `${(s.missing||[]).length||s.spread_ms==null?'':(' · spread '+s.spread_ms+' ms')}</span>`+
       (s.strobe?('<span style="margin-left:6px">'+strobeChip(s)+'</span>'):'')+
       `<button class="act" id="shNext">▶</button></div>`+
       '<div class="cams" style="margin-top:8px">'+cams.map(c=>{
@@ -1752,12 +2546,18 @@ function fmt(v,n){return v==null||isNaN(v)?'—':(+v).toFixed(n);}
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 pollFleet(); pollEvents(); pollAnoms(); hydrateSettings(); hydrateStrobe();
+pollDrain(true);
 syncApplyBtn();
 setInterval(pollFleet, 2000);
 // The pair list reads rigd's own disk (RunBrowser caches on file mtimes), so
 // polling it while Review is visible is cheap; the camera-spool fallback is
 // the only branch that touches a node, and only when no run exists.
 setInterval(()=>{ if(liveOk('review')) pollPairs(); }, 3000);
+// The drain panel rides Review's own 3 s cadence and its gating: it is only
+// read while the tab that shows it is selected AND the document is visible.
+// There is no faster mode — rigd reports no per-shot progress, so a tighter
+// poll would buy nothing and still contend with the drain's own HTTP.
+setInterval(()=>{ if(liveOk('review')) pollDrain(); }, 3000);
 setInterval(()=>{ if(liveOk('transects')) pollTransects(); }, 3000);
 // Nav is NOT tab-gated: the header's nav pill is a run-time indicator, and the
 // track buffer fills while you are on Review, which is where you are mid-run.

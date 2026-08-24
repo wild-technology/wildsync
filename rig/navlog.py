@@ -286,19 +286,46 @@ def read_records(path):
                 yield rec
 
 
-def replay(path, reader, use_recorded_time=True, limit=None):
+def replay(path, reader, use_recorded_time=True, limit=None,
+           freeze_clock=True):
     """Push a recorded log back through a nav.NavReader.
 
     `use_recorded_time` stamps each line with the wall epoch it was received
     at, so staleness/`fix_at()` behave exactly as they did live.  Returns the
     number of lines fed.
+
+    WHAT FAILED: this docstring promised the recorded run's behaviour, but
+    every "now" judgement — TimeAuthority freshness, gateway_online — was made
+    against TODAY's time.time().  Replaying yesterday's log therefore always
+    reported time_source='jetson', gps_offset_s=0.0 and gateway_online=False,
+    so a "wrong datetime" or "dropped to jetson mid-run" field report could
+    not be reproduced at a desk at all.
+
+    WHY THIS SHAPE: two complementary halves.  (1) nav.fix_at(t) now judges
+    at `t` itself, so per-frame lookups — what run.py's flight_log rows
+    actually use — come back as they were on the water with no extra
+    ceremony.  (2) `freeze_clock` parks the reader's judgement clock at the
+    last recorded line (nav.NavReader.set_clock), so the instant-less views —
+    snapshot(), health(), gateway_online — describe the END of the log rather
+    than this afternoon.  Freezing is skipped for a reader whose serial
+    thread is running: a live reader with a frozen clock would call a dead
+    gateway online forever.  Pass freeze_clock=False to keep the wall clock.
     """
     n = 0
+    last_wall = None
     for rec in read_records(path):
         reader.feed_line(rec["line"], rec["wall"] if use_recorded_time else None)
+        if rec["wall"] is not None:
+            last_wall = rec["wall"]
         n += 1
         if limit and n >= limit:
             break
+    if freeze_clock and use_recorded_time and last_wall is not None:
+        run = getattr(reader, "_run", None)
+        running = bool(run is not None and run.is_set())
+        setter = getattr(reader, "set_clock", None)
+        if callable(setter) and not running:
+            setter(lambda t=last_wall: t)
     return n
 
 

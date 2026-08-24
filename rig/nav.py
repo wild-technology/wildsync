@@ -601,31 +601,96 @@ class TimeAuthority:
          in 1970 or 2400);
       3. |gps - jetson| <= MAX_OFFSET_S (rejects a plausible-looking but wrong
          decode; a real rig is chrony-disciplined and within seconds);
-      4. TWO successive accepted feeds agree on the offset to within
-         CONFIRM_TOL_S — one lucky garbage frame cannot promote us to "gps";
-      5. the last accepted feed is younger than STALE_S.
+      4. TWO successive accepted feeds from the SAME sender (pgn, src address)
+         agree on the offset to within CONFIRM_TOL_S — one lucky garbage
+         frame cannot promote us to "gps";
+      5. a confirmation covers the instant being asked about, to within
+         STALE_S (for source()/offset_to() with no argument that instant is
+         "now", which is the old meaning).
 
     STALE_S is the staleness bound.  126992/129029 are 1 Hz PGNs, so 5 s means
     "four consecutive messages missed".  The moment that budget is blown the
     Jetson clock is the authority again and offset_to() returns 0.0 — a stale
     GPS offset is never applied to a timestamp.
 
+    Freshness is judged AT AN INSTANT, not at call time.  Confirmations are
+    recorded as spans (_spans) so fix_at(t) can ask "was GPS the authority at
+    t, and with what offset" — which is what a frame pulled seconds after its
+    exposure needs, and the only way navlog.replay() of yesterday's log can
+    reproduce the judgements the run actually made.  `now` (a replaceable
+    callable, see NavReader.set_clock) is the clock the argument-less form
+    uses.
+
+    Candidates are kept PER SENDER.  The old single candidate slot meant two
+    trusted senders whose time words differ by > CONFIRM_TOL_S (a GNSS
+    sender's 129029 next to a plotter's relayed 126992, interleaved at 1 Hz)
+    could never produce two consecutive agreeing feeds, so a perfectly good
+    GPS was silently rejected for the whole run.  Now each sender confirms
+    against ITSELF, the authority is taken from the best-ranked live sender —
+    PGN_PRIORITY first (129029 is the satellite fix instant; 126992 may be a
+    relay), most consistent recent cadence as the tiebreak — and a
+    disagreement between live senders is exposed in status()["disagreement"]
+    and warned about (on_warn hook, else stderr) instead of being swallowed.
+
+    ABSOLUTE-TIME ACCURACY (read before trusting datetime to better than
+    ~LATENCY_BOUND_S): the offset is (time word) - (USB receive epoch), so
+    the sender->bus->gateway->USB path latency is baked into it.  A GNSS
+    sender computes and transmits the fix typically 0.1-0.5 s after the
+    instant its time word names; iKonvert reassembly and USB add ~ms more.
+    Nothing here measures that latency, so nothing is subtracted (never
+    fabricate) — LATENCY_BOUND_S documents the assumed bound and is exposed
+    in status() so consumers know corrected stamps are absolute to ~0.5 s,
+    not to milliseconds.  offset_scatter_s (measured spread of the confirmed
+    sender's recent offsets) gives the observed jitter floor on top of it.
+
     Feed it decoded 126992/129029 dicts (must contain 'epoch') together with
-    the local receive epoch.  Thread-safe.
+    the local receive epoch and, when known, the NMEA2000 source address.
+    Thread-safe.
     """
 
     STALE_S = 5.0            # a GPS time word older than this is not authority
     MAX_OFFSET_S = 86400.0   # refuse an implausible gps-vs-jetson difference
     CONFIRM_TOL_S = 0.5      # two feeds must agree within this to be believed
     SANE_EPOCH = (1735689600.0, 4102444800.0)   # 2025-01-01 .. 2100-01-01
+    # Assumed (not measured) upper bound on the sender->bus->gateway->USB
+    # latency baked into the offset; documented above, exposed in status().
+    LATENCY_BOUND_S = 0.5
+    # Lower rank wins the authority. 129029's time word is the satellite fix
+    # instant; 126992 can legally relay another clock, so it ranks after.
+    PGN_PRIORITY = {129029: 0, 126992: 1}
+    SENDER_FORGET_S = 20.0   # drop a sender quiet this long from the table
+    WARN_REPEAT_S = 300.0    # re-warn about a PERSISTING disagreement this often
 
     def __init__(self):
         self._lock = threading.Lock()
+        # The wall clock every "is it fresh NOW / how old is it" judgement is
+        # made against.  A replaceable attribute rather than an inline
+        # time.time() so navlog.replay() can hand a recorded run a frozen
+        # clock and get back the judgements that run made, not today's
+        # (NavReader.set_clock threads it in).
+        self.now = time.time
         self._offset = 0.0       # gps - jetson, seconds (confirmed)
         self._fed_local = None   # local epoch of last CONFIRMED feed
         self._fed_pgn = None
-        self._cand_offset = None  # unconfirmed candidate
+        self._fed_src = None
+        self._cand_offset = None  # last accepted feed (any sender)
         self._cand_local = None
+        # local epoch of the FIRST accepted feed — the clock that
+        # unconfirmed_for_s runs from when nothing has EVER confirmed
+        self._first_accept_local = None
+        # (pgn, src) -> {"pgn","src","offset","local","streak","gaps","offsets"}
+        self._senders = {}
+        # Confirmation coverage spans [(start, end, offset)], newest last.
+        # fix_at() judges freshness at the CAPTURE instant, not at call time,
+        # so we must remember WHEN the authority was confirmed, not only that
+        # it is confirmed now — this is what lets navlog.replay() reproduce
+        # the live time_source for an instant hours in the past.
+        self._spans = collections.deque(maxlen=64)
+        self._disagreement = None
+        self._disagree_sig = None
+        self._warned_sig = None
+        self._last_warning = None
+        self.on_warn = None      # optional callable(str); else stderr
         self._accepted = 0
         self._rejected = collections.Counter()
 
@@ -666,11 +731,109 @@ class TimeAuthority:
 
     # -- feeding ------------------------------------------------------------
 
-    def feed(self, pgn, decoded, local_epoch=None):
-        """Offer a decoded 126992/129029 dict.  Returns True if it was
-        accepted as a candidate/confirmation, False if rejected."""
+    @staticmethod
+    def _sender_rank(slot):
+        """Sort key for choosing the authority among live confirmed senders:
+        PGN priority, then the most consistent recent cadence (a healthy 1 Hz
+        time sender ticks like a metronome; a relay stutters), then the lowest
+        source address for determinism."""
+        gaps = slot["gaps"]
+        jitter = (max(gaps) - min(gaps)) if len(gaps) >= 2 else 9e9
+        src = slot["src"]
+        return (TimeAuthority.PGN_PRIORITY.get(slot["pgn"], 9), jitter,
+                -1 if src is None else src)
+
+    def _confirm_locked(self, off, local_epoch, pgn, src):
+        self._offset = off
+        self._fed_local = local_epoch
+        self._fed_pgn = pgn
+        self._fed_src = src
+        # Extend the open span while the offset is still the same offset;
+        # start a new one on a gap OR on a step bigger than CONFIRM_TOL_S
+        # (a failover to a different sender, or the GPS stepping the host
+        # clock).  Extending across a step would rewrite history: a frame
+        # exposed before the step would be re-stamped with the offset that
+        # only came into force after it.
+        if (self._spans and local_epoch >= self._spans[-1][0]
+                and local_epoch - self._spans[-1][1] <= self.STALE_S
+                and abs(off - self._spans[-1][2]) <= self.CONFIRM_TOL_S):
+            s0, e0, _ = self._spans[-1]
+            self._spans[-1] = (s0, max(e0, local_epoch), off)
+        else:
+            self._spans.append((local_epoch, local_epoch, off))
+
+    def _judge_disagreement_locked(self, live, best, now):
+        """Record (and return a warn message for) live confirmed senders whose
+        offsets differ from the chosen sender by more than CONFIRM_TOL_S.
+        The old code silently failed to confirm in this situation; the whole
+        point here is that it is VISIBLE: status()['disagreement'] always
+        names the senders, and the warn fires on each new disagreement set
+        and then every WARN_REPEAT_S while it persists."""
+        others = [s for s in live if s is not best
+                  and abs(s["offset"] - best["offset"]) > self.CONFIRM_TOL_S]
+        if not others:
+            self._disagreement = None
+            self._disagree_sig = None
+            return None
+        sig = (best["pgn"], best["src"],
+               tuple(sorted((s["pgn"], -1 if s["src"] is None else s["src"])
+                            for s in others)))
+        since = (self._disagreement["since"]
+                 if self._disagreement is not None
+                 and self._disagree_sig == sig else now)
+        self._disagreement = {
+            "chosen": {"pgn": best["pgn"], "src": best["src"],
+                       "offset_s": round(best["offset"], 3)},
+            "others": [{"pgn": s["pgn"], "src": s["src"],
+                        "offset_s": round(s["offset"], 3),
+                        "delta_s": round(s["offset"] - best["offset"], 3)}
+                       for s in others],
+            "spread_s": round(max(abs(s["offset"] - best["offset"])
+                                  for s in others), 3),
+            "since": since,
+        }
+        self._disagree_sig = sig
+        # Warn on every NEW disagreement set, then at most once per
+        # WARN_REPEAT_S while it persists.  Not "once ever": a two-hour
+        # transect wants a periodic reminder that its datetimes are only as
+        # good as the sender it picked.  Not "every feed" either: a sender
+        # flapping across CONFIRM_TOL_S at 1 Hz would flood rigd's event ring
+        # and push the real warnings out of it.
+        last_at = (self._last_warning or {}).get("at")
+        if (sig == self._warned_sig and last_at is not None
+                and now - last_at < self.WARN_REPEAT_S):
+            return None
+        self._warned_sig = sig
+        msg = ("time senders disagree: " +
+               "; ".join("pgn %s src %s offset %+.2f s (%.2f s from chosen)"
+                         % (s["pgn"], s["src"], s["offset"],
+                            abs(s["offset"] - best["offset"]))
+                         for s in others) +
+               " — confirming from pgn %s src %s offset %+.2f s"
+               % (best["pgn"], best["src"], best["offset"]))
+        self._last_warning = {"at": now, "msg": msg}
+        return msg
+
+    def _emit_warn(self, msg):
+        cb = self.on_warn
+        if callable(cb):
+            try:
+                cb(msg)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            print("nav: WARN %s" % msg, file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def feed(self, pgn, decoded, local_epoch=None, src=None):
+        """Offer a decoded 126992/129029 dict (with its NMEA2000 source
+        address when known).  Returns True if it was accepted as a
+        candidate/confirmation, False if rejected."""
         if local_epoch is None:
-            local_epoch = time.time()
+            local_epoch = self.now()
+        warn = None
         with self._lock:
             if not self._trustworthy(pgn, decoded):
                 return False
@@ -678,37 +841,102 @@ class TimeAuthority:
             if abs(off) > self.MAX_OFFSET_S:
                 return self._reject("offset_too_large")
             self._accepted += 1
-            fresh_cand = (self._cand_local is not None
-                          and local_epoch - self._cand_local <= self.STALE_S)
-            if fresh_cand and abs(off - self._cand_offset) <= self.CONFIRM_TOL_S:
-                # second agreeing observation -> confirmed authority
-                self._offset = off
-                self._fed_local = local_epoch
-                self._fed_pgn = pgn
+            if self._first_accept_local is None:
+                self._first_accept_local = local_epoch
+            key = (pgn, src)
+            slot = self._senders.get(key)
+            if (slot is not None
+                    and local_epoch - slot["local"] <= self.STALE_S):
+                # a sender confirms against ITSELF: consecutive agreement
+                # from one (pgn, src) — an interleaved second sender with a
+                # different offset can no longer reset the streak.
+                if abs(off - slot["offset"]) <= self.CONFIRM_TOL_S:
+                    slot["streak"] += 1
+                else:
+                    slot["streak"] = 1
+                slot["gaps"].append(local_epoch - slot["local"])
+            else:
+                slot = self._senders[key] = {
+                    "pgn": pgn, "src": src, "streak": 1,
+                    "gaps": collections.deque(maxlen=8),
+                    "offsets": collections.deque(maxlen=8)}
+            slot["offset"] = off
+            slot["local"] = local_epoch
+            slot["offsets"].append(off)
+            # bound the table: forget long-quiet senders (address changes,
+            # devices leaving the bus) so it cannot grow without limit
+            for k in [k for k, s in self._senders.items()
+                      if local_epoch - s["local"] > self.SENDER_FORGET_S]:
+                if k != key:
+                    del self._senders[k]
             self._cand_offset = off
             self._cand_local = local_epoch
-            return True
+            live = [s for s in self._senders.values()
+                    if s["streak"] >= 2
+                    and local_epoch - s["local"] <= self.STALE_S]
+            if live:
+                best = min(live, key=self._sender_rank)
+                if best is slot:
+                    self._confirm_locked(off, local_epoch, pgn, src)
+                warn = self._judge_disagreement_locked(live, best, local_epoch)
+        if warn:
+            self._emit_warn(warn)
+        return True
 
     # -- reading ------------------------------------------------------------
 
-    def _fresh(self, now=None):
-        if self._fed_local is None:
-            return False
-        return ((now if now is not None else time.time()) - self._fed_local) \
-            <= self.STALE_S
+    def _covering_span(self, x):
+        """The confirmation span whose coverage includes instant `x`, or None.
 
-    def source(self):
-        """'gps' when a fresh, confirmed, satellite-sourced time word is held,
-        else 'jetson'."""
+        A span (start, end, offset) covers [start - STALE_S, end + STALE_S]:
+        within STALE_S either side of a confirmation the offset is the best
+        available estimate (it is modeled constant over the span).  The
+        NEAREST covering span wins, not simply the newest — after an offset
+        step the new span's leading STALE_S pad overlaps the old span's live
+        range, and letting it win there would hand a frame exposed before the
+        step the offset that only came into force after it.  Ties (an instant
+        in the dead zone between two spans) go to the newer span.
+
+        The newest span's end is taken from _fed_local so tests that age the
+        authority by moving _fed_local back keep working exactly as before."""
+        spans = list(self._spans)
+        if spans:
+            s0, _, off0 = spans[-1]
+            if self._fed_local is not None:
+                spans[-1] = (s0, self._fed_local, off0)
+        elif self._fed_local is not None:
+            spans = [(self._fed_local, self._fed_local, self._offset)]
+        best = best_key = None
+        for i, (s, e, off) in enumerate(spans):
+            if x < s - self.STALE_S or x > e + self.STALE_S:
+                continue
+            dist = 0.0 if s <= x <= e else (s - x if x < s else x - e)
+            key = (dist, -i)          # nearest span; newer breaks the tie
+            if best_key is None or key < best_key:
+                best_key, best = key, (s, e, off)
+        return best
+
+    def _fresh(self, now=None):
+        return self._covering_span(
+            self.now() if now is None else now) is not None
+
+    def source(self, now=None):
+        """'gps' when a confirmed, satellite-sourced time word covers the
+        instant `now` (default: the wall clock), else 'jetson'."""
         with self._lock:
-            return "gps" if self._fresh() else "jetson"
+            return "gps" if self._fresh(now) else "jetson"
 
     def offset_to(self, local_epoch=None):
         """Seconds to ADD to a local (Jetson) epoch to express it in GPS time.
-        0.0 when falling back to Jetson time.  local_epoch is accepted for
-        symmetry; the offset is modeled as constant over a run."""
+        0.0 when falling back to Jetson time.  Freshness — and the offset
+        used — are judged AT `local_epoch` (default: now) against the recorded
+        confirmation spans, so a frame pulled long after its exposure, or a
+        navlog replay of yesterday's run, is stamped with the authority that
+        held at that instant rather than with today's wall clock."""
         with self._lock:
-            return self._offset if self._fresh() else 0.0
+            span = self._covering_span(
+                self.now() if local_epoch is None else local_epoch)
+            return span[2] if span is not None else 0.0
 
     def correct(self, local_epoch):
         """local epoch -> log-stamp epoch (GPS-corrected when available)."""
@@ -716,29 +944,82 @@ class TimeAuthority:
 
     def gps_epoch(self):
         """Best current epoch: GPS-corrected now if fresh, else Jetson now."""
-        return time.time() + self.offset_to()
+        now = self.now()
+        return now + self.offset_to(now)
 
     def age_s(self):
         """Seconds since the last confirmed GPS time word, or None."""
         with self._lock:
             if self._fed_local is None:
                 return None
-            return time.time() - self._fed_local
+            return self.now() - self._fed_local
 
     def status(self):
+        now = self.now()
         with self._lock:
+            fresh = self._fresh(now)
+            conf = self._senders.get((self._fed_pgn, self._fed_src))
+            scatter = (round(max(conf["offsets"]) - min(conf["offsets"]), 4)
+                       if conf is not None and len(conf["offsets"]) >= 2
+                       else None)
+            pending = (self._cand_local is not None
+                       and (self._fed_local is None
+                            or self._cand_local - self._fed_local
+                            > self.STALE_S))
             return {
-                "source": "gps" if self._fresh() else "jetson",
-                "offset_s": self._offset if self._fresh() else 0.0,
+                "source": "gps" if fresh else "jetson",
+                "offset_s": self._offset if fresh else 0.0,
                 "raw_offset_s": self._offset,
                 "age_s": (None if self._fed_local is None
-                          else time.time() - self._fed_local),
+                          else now - self._fed_local),
                 "stale_bound_s": self.STALE_S,
                 "from_pgn": self._fed_pgn,
+                "from_src": self._fed_src,
                 "accepted": self._accepted,
                 "rejected": dict(self._rejected),
-                "candidate_pending": (self._cand_local is not None
-                                      and self._fed_local != self._cand_local),
+                # accepted feeds keep arriving but nothing has confirmed for
+                # longer than the stale bound (or ever): the exact starvation
+                # the per-sender candidates exist to prevent — surfaced so
+                # rigd can alarm on it instead of silently running on jetson
+                "candidate_pending": pending,
+                # How much accepted feed has run without confirming: last
+                # accepted feed minus last confirmation (minus the FIRST
+                # accepted feed when nothing has ever confirmed).  rigd wants
+                # a duration, not a flag, so it can raise nav_time_unconfirmed
+                # only once the starvation has persisted.  Deliberately not
+                # measured against `now`: when the feed stops entirely this
+                # stops growing, because that is a dead gateway / no fix
+                # (nav_gateway_down territory), not confirmation starvation.
+                "unconfirmed_for_s": (
+                    None if not pending
+                    else round(self._cand_local
+                               - (self._fed_local
+                                  if self._fed_local is not None
+                                  else self._first_accept_local), 3)),
+                # absolute-time honesty (see class docstring): the assumed
+                # sender->bus->gateway->USB latency bound baked into offset_s
+                # (nothing is subtracted — consumers must know the bound),
+                # the measured jitter of the confirmed sender's offsets, and
+                # the total bound a consumer should put on a GPS-corrected
+                # stamp.  latency_subtracted_s is 0.0 on purpose and stays
+                # that way until something MEASURES the path delay: guessing
+                # it would fabricate accuracy we do not have.
+                "latency_bound_s": self.LATENCY_BOUND_S,
+                "latency_subtracted_s": 0.0,
+                "offset_scatter_s": scatter,
+                "abs_error_bound_s": (
+                    None if not fresh
+                    else round(self.LATENCY_BOUND_S + (scatter or 0.0), 4)),
+                "disagreement": (dict(self._disagreement)
+                                 if self._disagreement is not None else None),
+                "last_warning": (dict(self._last_warning)
+                                 if self._last_warning is not None else None),
+                "senders": [{"pgn": s["pgn"], "src": s["src"],
+                             "offset_s": round(s["offset"], 3),
+                             "streak": s["streak"],
+                             "age_s": round(now - s["local"], 3)}
+                            for s in sorted(self._senders.values(),
+                                            key=self._sender_rank)],
             }
 
 
@@ -1044,6 +1325,11 @@ class NavReader:
         self.baud = baud
         self.auto_reopen = auto_reopen
         self.time_authority = TimeAuthority()
+        # Wall clock for JUDGEMENTS ("is this fresh now", "how old is this"),
+        # never for the reader thread's own receive stamping.  Replaceable so
+        # navlog.replay() can reproduce a recorded run's judgements — see
+        # set_clock().
+        self._now = time.time
         self._hook_lock = threading.Lock()
         self._hook = raw_log_hook
         self._ser = None
@@ -1116,13 +1402,35 @@ class NavReader:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def set_clock(self, fn):
+        """Replace the clock every freshness judgement is made against.
+
+        WHAT FAILED: navlog.replay() pushed yesterday's log through a reader
+        and then every "now" test — gateway_online, snapshot(), health(),
+        TimeAuthority freshness — was made against TODAY's time.time(), so a
+        desk reproduction of a field report always came back
+        'jetson'/offline/stale no matter what the log contained.
+
+        WHY THIS SHAPE: fix_at() already judges at the instant it is asked
+        about (which is the correct live behaviour too, and what run.py's
+        per-frame rows use).  The remaining views have no instant to judge
+        at — they mean "now" — so the only honest fix is to let the caller
+        say WHICH now.  `fn` is a zero-arg callable returning an epoch;
+        None restores the wall clock.  Replay-only: the live reader must
+        never be given anything but time.time(), or a stale gateway would
+        look online forever.
+        """
+        fn = time.time if fn is None else fn
+        self._now = fn
+        self.time_authority.now = fn
+
     @property
     def gateway_online(self):
         """True while the gateway is actually sending us lines.  This is
         derived from the last receive time, not a sticky flag: an unplugged or
         unpowered gateway goes False on its own."""
         lr = self._last_rx
-        return lr is not None and (time.time() - lr) <= self.ONLINE_S
+        return lr is not None and (self._now() - lr) <= self.ONLINE_S
 
     def resolve_port(self):
         """Pick the device path to use now.  Re-resolved on every reopen so a
@@ -1360,7 +1668,11 @@ class NavReader:
             while ring and now - ring[0][0] > self.HISTORY_S:
                 ring.popleft()
         if full["pgn"] in (126992, 129029):
-            self.time_authority.feed(full["pgn"], decoded, now)
+            # src identifies the SENDER: TimeAuthority keeps per-sender
+            # candidates so two devices with disagreeing time words cannot
+            # starve each other out of confirmation (see its docstring)
+            self.time_authority.feed(full["pgn"], decoded, now,
+                                     src=full["src"])
 
     def feed_line(self, line, epoch=None):
         """Inject one gateway line as if it had just arrived on the port.
@@ -1373,7 +1685,7 @@ class NavReader:
         if isinstance(line, str):
             line = line.encode("ascii", "backslashreplace")
         self._handle_line(bytes(line).rstrip(b"\r\n"),
-                          time.time() if epoch is None else float(epoch),
+                          self._now() if epoch is None else float(epoch),
                           time.monotonic())
 
     # -- consumers ----------------------------------------------------------
@@ -1418,12 +1730,22 @@ class NavReader:
             return (None, None)
         return (best_t, best_v)
 
-    def _blank_view(self, epoch, source_epoch=None):
+    def _gateway_online_at(self, at):
+        """gateway_online judged at instant `at` instead of at call time, so
+        fix_at(old_epoch) — and navlog.replay() followed by fix_at() — report
+        whether the gateway was talking AROUND that instant.  A line received
+        at or after `at` counts: during replay _last_rx ends up at the log's
+        final line, which is at-or-after any instant inside the log."""
+        lr = self._last_rx
+        return lr is not None and (at - lr) <= self.ONLINE_S
+
+    def _blank_view(self, epoch, source_epoch=None, at=None):
         return {
             "epoch": epoch,
             "time_source": None,
             "gps_offset_s": 0.0,
-            "gateway_online": self.gateway_online,
+            "gateway_online": (self.gateway_online if at is None
+                               else self._gateway_online_at(at)),
             "lat": None, "lon": None, "alt_m": None,
             "xutm": None, "yutm": None, "utm_zone": None,
             "heading_true_deg": None, "heading_mag_deg": None,
@@ -1525,10 +1847,10 @@ class NavReader:
         key is still present with the same meaning, so rigd's /api/nav and
         run.py keep working unchanged.
         """
-        now = time.time()
+        now = self._now()
         ta = self.time_authority
         snap = self._blank_view(ta.correct(now))
-        snap["time_source"] = ta.source()
+        snap["time_source"] = ta.source(now)
         snap["gps_offset_s"] = ta.offset_to(now)
         snap["local_epoch"] = now
         return self._fill(snap, now, lambda pgn: self._latest_pair(pgn, now))
@@ -1557,11 +1879,20 @@ class NavReader:
 
         Never raises; a dead gateway yields valid=False with every value None,
         which run.py writes as empty CSV cells (PROTOCOL.md: never fabricate).
+
+        time_source / gps_offset_s / gateway_online are judged AT `epoch`
+        (against the TimeAuthority confirmation spans and the gateway's
+        receive history), not at call time: a frame pulled 8 s after its
+        exposure gets the authority that held at the exposure, and
+        navlog.replay() of yesterday's log followed by fix_at(t_cap)
+        reproduces the judgements the live run made — replaying with today's
+        wall clock used to force time_source='jetson' and gateway_online=False
+        on every replayed instant.
         """
-        at = time.time() if epoch is None else float(epoch)
+        at = self._now() if epoch is None else float(epoch)
         ta = self.time_authority
-        snap = self._blank_view(ta.correct(at))
-        snap["time_source"] = ta.source()
+        snap = self._blank_view(ta.correct(at), at=at)
+        snap["time_source"] = ta.source(at)
         snap["gps_offset_s"] = ta.offset_to(at)
         snap["local_epoch"] = at
         self._fill(snap, at, lambda pgn: self._nearest(pgn, at, max_age_s))
@@ -1593,7 +1924,7 @@ class NavReader:
         address, rate, AGE and the raw payload. The sniffing surface: a device
         this driver has never heard of still lists here, raw, instead of
         vanishing at decode_pgn()."""
-        now = time.time()
+        now = self._now()
         with self._lock:
             items = [(pgn, {"n": e["n"], "first": e["first"],
                             "last": e.get("last", e["first"]),
@@ -1634,7 +1965,7 @@ class NavReader:
             "online": self.gateway_online,
             "seen_pdgy": self._seen_pdgy,
             "last_rx_age_s": (None if self._last_rx is None
-                              else round(time.time() - self._last_rx, 3)),
+                              else round(self._now() - self._last_rx, 3)),
             "lines": self._line_count,
             "data_lines": self._data_count,
             "bad_lines": self._bad_line_count,

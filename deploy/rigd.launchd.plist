@@ -40,6 +40,19 @@
   <string>Interactive</string>
   <key>ThrottleInterval</key>
   <integer>3</integer>
+  <!-- SIGKILL budget after SIGTERM. launchd's default is 20 s, and a stop
+       that lands mid-transect against a wedged node can spend longer than
+       that finalising: RunManager.stop waits cap_thread.join(6), then a 6 s
+       grace loop that never clears while pulled < fired, then w.join(8)
+       behind a pull that can sit in a 30 s http_bytes. rigd was killed before
+       run.json was marked final, so `launchctl kickstart -k` during a run
+       (FIELD-RUN's own restart recipe) reliably produced an interrupted
+       manifest that the next start had to rebuild. rigd now caps its own
+       finalisation at Rig.STOP_DEADLINE_S = 12 s so it always exits inside
+       the budget; this raises the budget too, so an ordinary slow-but-healthy
+       stop is never cut short in the first place. -->
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
   <key>StandardOutPath</key>
   <string>__HOME__/rig/rigd-launchd.log</string>
   <key>StandardErrorPath</key>

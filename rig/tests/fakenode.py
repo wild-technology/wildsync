@@ -74,18 +74,98 @@ def _alias_bindable():
     return _ALIAS_BINDABLE
 
 
+# One test process owns one contiguous BLOCK of ports on 127.0.0.1, and every
+# nominal 127.0.0.x:port maps into it at a fixed offset. The block used to be
+# picked as 20000 + (pid % 40) * 640 and used unchecked, which made the whole
+# gate flaky in a way no lane could see from its own suite: pid % 40 has only
+# 40 values, so any long-lived process holding one block (a devrig_ctl.py left
+# running, an earlier soaktest that has not exited) collides with 1 in 40 of
+# all future soaktest processes, and the collision is a HARD abort — FakeNode
+# construction raises OSError(48) out of _mkserver's 5 s retry and the suite
+# dies with "suite <x> ran to completion". Measured 2026-08-24: devrig_ctl.py
+# (pid 451, up 13 h) held 27044-27047, i.e. the block for pid % 40 == 11, and
+# a soaktest that drew pid 32091 aborted on it. 1 run in 40 is exactly the
+# "passes twice, fails once" signature of a flaky gate.
+#
+# So the base is now CHOSEN rather than computed: candidate blocks are probed
+# and the first genuinely free one is claimed. The pid slot is still tried
+# first, so the common case keeps the old layout and two concurrent runs still
+# usually land on different blocks without probing past their first candidate.
+_BLOCK = 640                       # ports reserved per test process
+_BASE0, _SLOTS = 20000, 40         # the grid the pid scheme laid down
+_PORT_BASE = None
+_PORT_CLAIM = None                 # held for the process lifetime; see below
+_PORT_LOCK = threading.Lock()
+
+
+def _claim_block(base):
+    """Take [base, base+_BLOCK) for this process, or return False.
+
+    base+0 is bound and HELD until the process exits. The mapping below starts
+    at base+2 (2*x, x>=1), so base+0 is never a node port and losing it costs
+    nothing — but holding it is what makes the claim atomic: another process
+    probing this block sees it occupied instead of racing us through the gap
+    between "looked free" and "actually bound". The rest of the block is then
+    walked so a stranger sitting anywhere inside it disqualifies the block now,
+    at import, rather than aborting a suite twenty minutes in."""
+    claim = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    claim.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        claim.bind(("127.0.0.1", base))
+        claim.listen(1)
+    except OSError:
+        claim.close()
+        return False
+    for p in range(base + 2, base + _BLOCK):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            s.close()
+            claim.close()
+            return False
+        finally:
+            s.close()
+    global _PORT_BASE, _PORT_CLAIM
+    _PORT_BASE, _PORT_CLAIM = base, claim
+    return True
+
+
+def _port_base():
+    """This process's port block, chosen once and never moved.
+
+    Every suite in a process must map a nominal address to the SAME port — the
+    soaktest netguard rewrites outgoing URLs through this very function, so a
+    base that moved mid-run would point rig code at a port nothing is serving."""
+    global _PORT_BASE
+    if _PORT_BASE is not None:
+        return _PORT_BASE
+    with _PORT_LOCK:
+        if _PORT_BASE is not None:
+            return _PORT_BASE
+        slot = os.getpid() % _SLOTS
+        order = [slot] + [s for s in range(_SLOTS) if s != slot]
+        for s in order:
+            if _claim_block(_BASE0 + s * _BLOCK):
+                return _PORT_BASE
+        # Every block is spoken for. Fall back to the old unchecked base rather
+        # than refuse to run: _mkserver still retries for 5 s, and a loud bind
+        # error beats a test harness that will not start at all.
+        _PORT_BASE = _BASE0 + slot * _BLOCK
+        return _PORT_BASE
+
+
 def loopback_map(host, port):
     """The (host, port) to actually bind/connect for a nominal 127.0.0.x:port
     node address: identity where loopback aliases exist, else 127.0.0.1 with a
-    port unique to (pid, x, port). The pid term keeps two test PROCESSES (a
-    lingering previous run, a devrig next to a soaktest) off each other's
-    ports; within one process every suite maps the same nominal address to the
-    same port, which is what lets the client-side URL rewrite stay stateless."""
+    port unique to (this process's claimed block, x, port). Within one process
+    every suite maps the same nominal address to the same port, which is what
+    lets the client-side URL rewrite stay stateless."""
     if not host.startswith("127.") or host == "127.0.0.1" or _alias_bindable():
         return host, port
     x = int(host.rsplit(".", 1)[1])
-    return "127.0.0.1", 20000 + (os.getpid() % 40) * 640 \
-        + 2 * x + (port - ILX_PORT)
+    return "127.0.0.1", _port_base() + 2 * x + (port - ILX_PORT)
 
 # Sony encodings — PROTOCOL.md "Measured constants".
 SHUTTER_1_200 = (1 << 16) | 200          # 65736
@@ -754,16 +834,48 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"present": node.has_imu, "samples": sel})
         elif method == "GET" and path == "/gpio/exposure/events":
             since = int((query.get("since") or [0])[0])
-            # Same shape the real piagent serves: epoch_hw (kernel timestamp
-            # converted to wall time — here identical to epoch) and the
-            # fire_seq each edge belongs to, so identity-based pairing and the
-            # strobe acceptance windows are exercised for real.
+            # Same shape the real piagent serves: `hw_meta` marking this node
+            # as one that publishes the per-edge hardware fields, epoch_hw
+            # (kernel timestamp converted to wall time — here identical to
+            # epoch), the node's own error bar on it, the measured pipe-read
+            # latency, and the fire_seq each edge belongs to. Identity-based
+            # pairing and the strobe acceptance windows are exercised for real.
+            #
+            # node.hw_reject (default None) simulates a node that cannot stamp
+            # its edges in the kernel — a gpiomon build that prints no
+            # timestamp ("no_stamp"), or one whose stamp is in the wrong clock
+            # domain ("domain"). piagent then publishes the edge with
+            # epoch_hw null and the reason, and `epoch` alone is left, carrying
+            # an UNMEASURED pipe-read latency. Without this knob the fakes can
+            # never reach the host's soft-edge path, which is exactly how that
+            # path went unexercised (audit 2026-08-24, VERIFY).
             with node._lock:
-                evs = [{"i": i, "edge": ed, "epoch": ep, "epoch_hw": ep,
+                why = getattr(node, "hw_reject", None)
+                lag = getattr(node, "hw_lag_ms", 0.09)
+                # `ep` is the true instant. The kernel sees it; Python sees
+                # it `lag` later, after the pipe read — so epoch_hw stays `ep`
+                # and `epoch` is the late one, which is the real direction and
+                # leaves every existing check reading the same instant it did
+                # before (the host prefers epoch_hw).
+                evs = [{"i": i, "edge": ed, "epoch": ep + lag / 1000.0,
+                        "epoch_hw": None if why else ep,
+                        "hw_lag_ms": None if why else lag,
+                        "hw_err_ms": None if why else 0.0005,
+                        "hw_reject": why,
                         "raw_ts": None, "fire_seq": fs}
                        for (i, ed, ep, fs) in node.edges if i > since]
                 nxt = node._edge_seq
-            self._send_json({"next": nxt, "events": evs})
+            if getattr(node, "hw_strip", False):
+                # An older piagent: no hw_meta, no per-edge hw fields, and no
+                # epoch_hw at all. The host must keep the previous behaviour
+                # here - this is NOT a refusal, and reading it as one would
+                # downgrade every frame from a node that is merely older.
+                evs = [{k: v for k, v in e.items()
+                        if not k.startswith("hw_") and k != "epoch_hw"}
+                       for e in evs]
+                self._send_json({"next": nxt, "events": evs})
+            else:
+                self._send_json({"next": nxt, "hw_meta": 1, "events": evs})
         elif method == "GET" and path == "/gpio/state":
             self._send_json(node.health()["gpio"])
         elif method == "POST" and path == "/gpio/focus":

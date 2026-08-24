@@ -313,6 +313,196 @@ std::string crErrorString(CrInt32u err) {
 }
 
 // ---------------------------------------------------------------------------
+// X7: bounding a wedged SDK
+//
+// The audit's X2 pass bounded the READ side (statusJson, enumerate, connect)
+// and left every property WRITE on a plain lock_guard, on the argument that a
+// bounded write which is merely SLOW would be reported as a failure - and
+// rigcore records a failed write as blind_fail / settings_divergent, i.e. an
+// invented divergence alarm. That argument is right about the lie and wrong
+// about the trade: SetDeviceProperty, SendCommand, the choice-list read the
+// X3 validation added, cardList/cardDelete and live view all took the mutex
+// unconditionally, so a body wedged inside an SDK call (HANDOFF 2.1: one
+// frame the card will not accept locks the property table while slotStatus
+// still reads OK) stranded one httplib worker per request. The pool is
+// max(8, hw-1) = 8 on a Pi 4, and rigd's reconcile pushes into a body that
+// answers busy:true every 3 s, so the node eventually stopped answering
+// ANYTHING - /api/status included, which is the one thing that was still
+// diagnosing it correctly (rigd body_locked).
+//
+// The shape that bounds the hang without manufacturing the lie:
+//
+//   * Only the ACQUISITION is bounded. Once the lock is ours we wait out the
+//     SDK however long it takes, so a slow write (6 s measured in
+//     SetDeviceProperty on this rig) still returns its REAL result.
+//   * A caller waits kSdkWait for a busy-but-progressing SDK - longer than
+//     any call measured on this hardware, shorter than rigcore's 12 s POST
+//     timeout so the answer arrives instead of the client timing out.
+//   * A caller does NOT wait for a WEDGED one. A single SDK call that has
+//     held the camera for kSdkWedged is past every measured healthy call, so
+//     further waiting only feeds workers into it: refuse immediately. This is
+//     what keeps the pool alive, and it keeps the polite wait for the merely
+//     slow case where the refusal would be a lie.
+//   * The refusal is not a refusal BY THE CAMERA. It carries kSdkBusyPrefix,
+//     main.cpp answers it 409 {"busy":true} rather than a plain failure, and
+//     /api/status names the call that is in the way and how long it has been
+//     there. "Still in flight" and "the body said no" are different facts.
+//
+// The one worker that is INSIDE the wedged SDK call is still lost - nothing
+// short of running every SDK call on its own thread pool can change that, and
+// a write that lands minutes late, mid-transect, is a worse hazard than a
+// lost worker. One is survivable; eight is the node going dark.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Longest an HTTP-facing call will wait for a busy SDK. Above the 6 s
+// SetDeviceProperty stall measured on the live rig (main.cpp), below
+// rigcore's 12 s POST timeout.
+constexpr auto kSdkWait = 8000ms;
+// A single SDK call holding the camera this long is not slow, it is wedged.
+// Above every call this rig has measured (enumerate ~4 s camera-less, the 6 s
+// property stall), so nothing healthy trips it.
+constexpr auto kSdkWedged = 10000ms;
+// statusJson's own bound (X2): longer than a healthy enumerate so an ordinary
+// reconnect still gets the FULL body, shorter than the monitor's 6 s poll
+// timeout so even the degraded answer counts as "the node answered".
+constexpr auto kSdkStatusWait = 4500ms;
+// Re-check the wedge test this often while waiting.
+constexpr auto kSdkSlice = 250ms;
+
+// Every bounded-acquisition failure starts with this. Camera::isBusyError
+// keys on it; nothing the SDK itself produces looks like it (SDK errors are
+// formatted "0x........").
+const char* const kSdkBusyPrefix = "SDK busy";
+
+long long steadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// The MF operator rule's escape hatch: ilxctl --allow-autofocus. Process-wide
+// and set once from main() before the server binds.
+std::atomic<bool> g_afAllowed{false};
+
+}  // namespace
+
+Camera::SdkHold::SdkHold(Camera& cam, const char* op,
+                         std::chrono::milliseconds wait)
+    : m_cam(cam), m_op(op), m_lk(cam.m_sdkMutex, std::defer_lock) {
+    take(wait);
+}
+
+Camera::SdkHold::~SdkHold() { release(); }
+
+bool Camera::SdkHold::take(std::chrono::milliseconds wait) {
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    for (;;) {
+        // Slices rather than one long try_lock_for: the wedge test below has
+        // to be re-evaluated while we wait, because the call in the way can
+        // cross kSdkWedged after we started waiting.
+        if (m_lk.try_lock_for(kSdkSlice)) {
+            m_cam.sdkEnter(m_op);
+            m_held = true;
+            return true;
+        }
+        std::string who;
+        double heldSec = 0.0;
+        if (m_cam.sdkBusyInfo(who, heldSec) &&
+            heldSec >= std::chrono::duration<double>(kSdkWedged).count()) {
+            return false;      // wedged, not slow: waiting only burns a worker
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+    }
+}
+
+void Camera::SdkHold::release() {
+    if (!m_held) return;
+    m_held = false;
+    m_cam.sdkExit();
+    m_lk.unlock();
+}
+
+bool Camera::SdkHold::retake(std::chrono::milliseconds wait) {
+    return m_held ? true : take(wait);
+}
+
+std::string Camera::SdkHold::error() const {
+    std::string who;
+    double heldSec = 0.0;
+    std::ostringstream os;
+    os << kSdkBusyPrefix << ": ";
+    if (m_cam.sdkBusyInfo(who, heldSec)) {
+        os << "the camera has been inside " << (who.empty() ? "an SDK call" : who)
+           << " for " << std::fixed << std::setprecision(1) << heldSec << " s";
+    } else {
+        os << "the SDK did not come free";
+    }
+    os << " - '" << (m_op ? m_op : "?")
+       << "' was NOT sent to the body (nothing was refused)";
+    return os.str();
+}
+
+void Camera::sdkEnter(const char* op) {
+    if (m_sdkDepth.fetch_add(1) == 0) {
+        m_sdkSinceMs.store(steadyMs());
+        m_sdkOp.store(op);
+    }
+}
+
+void Camera::sdkExit() {
+    if (m_sdkDepth.fetch_sub(1) == 1) m_sdkOp.store(nullptr);
+}
+
+bool Camera::sdkBusyInfo(std::string& op, double& heldSec) const {
+    if (m_sdkDepth.load() <= 0) {
+        op.clear();
+        heldSec = 0.0;
+        return false;
+    }
+    const char* o = m_sdkOp.load();
+    op = o ? o : "";
+    const long long since = m_sdkSinceMs.load();
+    heldSec = since ? (steadyMs() - since) / 1000.0 : 0.0;
+    if (heldSec < 0.0) heldSec = 0.0;
+    return true;
+}
+
+bool Camera::isBusyError(const std::string& err) {
+    return err.rfind(kSdkBusyPrefix, 0) == 0;
+}
+
+void Camera::allowAutofocus(bool on) { g_afAllowed.store(on); }
+bool Camera::autofocusAllowed() { return g_afAllowed.load(); }
+
+std::string Camera::autofocusRefusal(const std::string& what) {
+    return "refusing " + what +
+           ": this rig is ALWAYS manual focus (operator rule) - piagent holds "
+           "FOCUS as a half-press before every TRIGGER, so one autofocus frame "
+           "moves the lens and the pair's interior orientation with it. Start "
+           "ilxctl with --allow-autofocus for bench work.";
+}
+
+bool Camera::autofocusBlocked(const std::string& what, std::string& err) {
+    if (autofocusAllowed()) return false;
+    err = autofocusRefusal(what);
+    log("REFUSED " + what + " - manual focus only");
+    return true;
+}
+
+void Camera::holdSdkForTest(int ms) {
+    if (ms < 0) ms = 0;
+    if (ms > 60000) ms = 60000;      // a test hook may not wedge a node for ever
+    log("TEST HOOK: holding the SDK for " + std::to_string(ms) + " ms");
+    std::thread([this, ms] {
+        SdkHold hold(*this, "test-hold", kSdkWait);
+        if (!hold) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }).detach();
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -337,14 +527,29 @@ std::vector<std::string> Camera::takeLog() {
     return m_log;
 }
 
-std::string Camera::modelName() const {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
-    return m_model;
+std::string Camera::modelName() {
+    // X7: bounded. /api/connect answers "already connected" by calling this,
+    // so an unbounded read here stranded a worker on every reconnect attempt
+    // against a wedged body - on the ONE route rigcore retries hardest.
+    SdkHold hold(*this, "modelName", kSdkStatusWait);
+    return hold ? m_model : std::string();
 }
 
 std::vector<CameraInfo> Camera::enumerate(int timeoutSec) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
     std::vector<CameraInfo> out;
+    // X2 (stuck-connect audit): a wedged SDK::Connect holds m_sdkMutex until
+    // the body is power-cycled, and enumerate() blocking on it stranded one
+    // HTTP worker per /api/connect until the pool was gone and /api/status
+    // went dark. Bound the wait: if the SDK has been busy for 5 s the honest
+    // answer is "nothing found right now" - the caller retries next poll.
+    // X7: the same bound, now through SdkHold so /api/status can name the
+    // call in the way and so a WEDGED holder is refused at once rather than
+    // waited out.
+    SdkHold lk(*this, "enumerate", 5000ms);
+    if (!lk) {
+        log("enumerate skipped: " + lk.error());
+        return out;
+    }
     if (m_enumInfo) {
         m_enumInfo->Release();
         m_enumInfo = nullptr;
@@ -373,17 +578,33 @@ std::vector<CameraInfo> Camera::enumerate(int timeoutSec) {
 }
 
 bool Camera::connect(int index, std::string& err, SDK::CrSdkControlMode mode) {
-    std::unique_lock<std::recursive_mutex> lk(m_sdkMutex);
+    // X2: bounded, so a connect that races a wedged SDK call fails fast with a
+    // "pending" answer instead of stranding its HTTP worker on the mutex.
+    SdkHold lk(*this, "connect", 5000ms);
+    if (!lk) {
+        err = "connect in progress";
+        return false;
+    }
     if (m_handle) {
         bool pending;
         {
             std::lock_guard<std::mutex> clk(m_connectMutex);
             pending = (m_connectResult == 0);
         }
-        if (m_connected || pending) {
+        if (m_connected) {
             // A second racing /api/connect must not overwrite (and leak) the
-            // handle of a connection that is already up or underway.
+            // handle of a connection that is already up.
             err = "already connected";
+            return false;
+        }
+        if (pending) {
+            // X5 (boot race): the handshake is underway - SDK::Connect
+            // returned a handle but OnConnected has not fired yet. This used
+            // to answer "already connected", which rigcore diagnoses as a
+            // DEAD handle: a false "restart ilxctl on the node" alarm plus a
+            // 60 s backoff on every deploy while the startup connect was
+            // still settling. The distinct error becomes pending:true.
+            err = "connect in progress";
             return false;
         }
         // A handle left behind by a dropped session: OnDisconnected clears
@@ -434,12 +655,17 @@ bool Camera::connect(int index, std::string& err, SDK::CrSdkControlMode mode) {
     }
     // Waiting for the callback with m_sdkMutex held would stall /api/status
     // and every other SDK call for up to 15 s.
-    lk.unlock();
+    lk.release();
 
     auto abandon = [this] {
         m_attemptAbandoned = true;
-        std::lock_guard<std::recursive_mutex> relk(m_sdkMutex);
-        if (m_handle) {
+        // X7: bounded. This runs on the HTTP worker that is giving up on the
+        // connect; if the SDK is wedged the handle cannot be released anyway,
+        // and blocking here is how that worker was lost for good.
+        SdkHold relk(*this, "abandonConnect", kSdkWait);
+        if (!relk) {
+            log("Abandoning the connect attempt: " + relk.error());
+        } else if (m_handle) {
             SDK::Disconnect(m_handle);
             SDK::ReleaseDevice(m_handle);
             m_handle = 0;
@@ -507,7 +733,8 @@ void Camera::claimPcPriority() {
 // indistinguishable from a broken camera. Cheap enough to attach to every
 // read-only error, which is exactly where it is needed.
 std::string Camera::modeSummary() {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "modeSummary", kSdkWait);
+    if (!hold) return kSdkBusyPrefix;
     if (!m_handle) return "not connected";
     std::string s;
     auto add = [&](const char* label, CrInt32u code, std::string (*fmt)(long long)) {
@@ -545,9 +772,21 @@ std::string Camera::modeSummary() {
     return s;
 }
 
-void Camera::disconnect() {
+bool Camera::disconnect(std::string* err) {
     stopInterval();
-    // Drop the flag first so any in-flight claimPcPriority loop exits promptly,
+    // Audit finding 3: this used to race the SDK's own auto-reconnect
+    // (CrReconnecting_ON). disconnect() drops m_connected and then spends up
+    // to seconds joining the priority thread and taking m_sdkMutex; a
+    // reconnect completing inside that window fired OnConnected, which set
+    // m_connected=true and spawned a new priority thread - and then
+    // disconnect() released the handle. The result was m_connected=true with
+    // m_handle=0: a camera the UI and the monitor both call "connected" that
+    // no operation can reach, and nothing ever clears it. Claim the same
+    // abandon flag the timed-out-connect path uses (connect() clears it at
+    // the top of the next attempt) so a late OnConnected is ignored. Set
+    // BEFORE m_connected drops - the callback reads the flag first.
+    m_attemptAbandoned = true;
+    // Drop the flag next so any in-flight claimPcPriority loop exits promptly,
     // then join it before we touch the SDK so it can never run against a
     // released core.
     m_connected = false;
@@ -555,7 +794,17 @@ void Camera::disconnect() {
         std::lock_guard<std::mutex> lk(m_priorityThreadMutex);
         if (m_priorityThread.joinable()) m_priorityThread.join();
     }
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    // X7: bounded. Releasing the handle is exactly what a wedged SDK will not
+    // let us do, and blocking here stranded the worker of the one request an
+    // operator reaches for to recover the node. Say so instead; the session
+    // stays open, which HANDOFF 2.2 already resolves with a daemon restart
+    // plus a USB rebind.
+    SdkHold hold(*this, "disconnect", kSdkWait);
+    if (!hold) {
+        if (err) *err = hold.error();
+        log("Disconnect: " + hold.error() + " - the SDK handle stays open");
+        return false;
+    }
     if (m_handle) {
         SDK::Disconnect(m_handle);
         SDK::ReleaseDevice(m_handle);
@@ -565,6 +814,7 @@ void Camera::disconnect() {
         m_enumInfo->Release();
         m_enumInfo = nullptr;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -573,13 +823,26 @@ void Camera::disconnect() {
 
 void Camera::OnConnected(SDK::DeviceConnectionVersioin) {
     if (m_attemptAbandoned) {
-        // connect() already gave up on this attempt and released the handle;
-        // resurrecting m_connected here would report a live camera with no
-        // handle, so every op fails until a manual reconnect. Ignore it.
+        // connect() already gave up on this attempt (or disconnect() closed
+        // the session) and released the handle; resurrecting m_connected here
+        // would report a live camera with no handle, so every op fails until
+        // a manual reconnect. Ignore it.
         log("Ignoring a late connect callback for an abandoned attempt");
         return;
     }
     m_connected = true;
+    // Re-read the flag AFTER the store (audit finding 3). disconnect() sets
+    // m_attemptAbandoned before it clears m_connected, so a callback that had
+    // already passed the test above - a window of nanoseconds, but the state
+    // it leaves is unrecoverable - is caught here and undone. Both are
+    // sequentially consistent atomics, so one of the two orders always wins
+    // cleanly: either we see the flag, or disconnect() clears m_connected
+    // after us.
+    if (m_attemptAbandoned) {
+        m_connected = false;
+        log("Ignoring a connect callback that raced an explicit disconnect");
+        return;
+    }
     log("Connected to " + m_model);
     bool wasExplicit;
     {
@@ -611,8 +874,13 @@ void Camera::OnConnected(SDK::DeviceConnectionVersioin) {
             // frames to the host. Re-register whatever connect() last set.
             std::string dir;
             {
-                std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
-                dir = m_saveDir;
+                // X7: bounded like every other take of this mutex. No HTTP
+                // worker is at stake here (this is a detached thread), but a
+                // wedge would keep the thread - and the "frames will stay on
+                // the camera" line the operator needs - waiting for ever.
+                SdkHold hold(*this, "reconnectSaveDir", kSdkWait);
+                if (hold) dir = m_saveDir;
+                else log("Save directory not re-registered: " + hold.error());
             }
             if (!dir.empty() && m_connected) {
                 std::string e;
@@ -629,6 +897,16 @@ void Camera::OnConnected(SDK::DeviceConnectionVersioin) {
 void Camera::OnDisconnected(CrInt32u error) {
     m_connected = false;
     log("Disconnected (" + crErrorString(error) + ")");
+    // X4: a session drop mid-pull left cardPull waiting out its full timeout
+    // (180 s per file - nothing else ever notified m_rtCv). Fail the pull in
+    // milliseconds instead; the drain keeps the card copy and retries.
+    {
+        std::lock_guard<std::mutex> rl(m_rtMutex);
+        if (m_rtResult == 0 && !m_rtWant.empty()) {
+            m_rtResult = -3;
+            m_rtCv.notify_all();
+        }
+    }
     std::lock_guard<std::mutex> lk(m_connectMutex);
     if (m_connectResult == 0) {
         m_lastError = error;
@@ -685,7 +963,11 @@ static long long captureDateToEpoch(const SDK::CrCaptureDate& d) {
 }
 
 bool Camera::cardList(std::vector<CardEntry>& out, std::string& err, int maxNums) {
-    std::unique_lock<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold lk(*this, "cardList", kSdkWait);
+    if (!lk) {
+        err = lk.error();
+        return false;
+    }
     if (!m_handle) {
         err = "not connected";
         return false;
@@ -718,9 +1000,14 @@ bool Camera::cardList(std::vector<CardEntry>& out, std::string& err, int maxNums
                 m_handle, SDK::CrSlotNumber_Slot1, SDK::CrGetContentsInfoListType_Range_Day, &day,
                 static_cast<CrInt32u>(maxNums), &list, &n);
             if (e != SDK::CrError_RemoteTransfer_GetContentsInfoListProcessing) break;
-            lk.unlock();
+            lk.release();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            lk.lock();
+            // X7: bounded like the first take - an unbounded retake handed the
+            // index retry loop straight back to a wedged SDK.
+            if (!lk.retake(kSdkWait)) {
+                err = lk.error();
+                return false;
+            }
             if (!m_handle) {
                 err = "disconnected while listing";
                 return false;
@@ -765,17 +1052,42 @@ bool Camera::cardPull(CrInt32u contentId, CrInt32u fileId, const std::string& di
         m_rtResult = 0;
         m_rtPercent = 0;
         m_rtFile.clear();
+        // X4: key this pull's completion to the file it asked for, so a late
+        // result from a previous timed-out transfer cannot complete this one.
+        m_rtWant = fileName;
     }
+    // X4: every path out of here has to disarm the keyed slot, or a stale
+    // m_rtWant would keep filtering results after this pull is gone (and a
+    // failure BEFORE the transfer even started would leave the slot armed for
+    // a file nobody is waiting on).
+    auto disarm = [this] {
+        std::lock_guard<std::mutex> rl(m_rtMutex);
+        m_rtWant.clear();
+    };
     {
-        std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+        SdkHold hold(*this, "cardPull", kSdkWait);
+        if (!hold) {
+            err = hold.error();
+            disarm();
+            return false;
+        }
         if (!m_handle) {
             err = "not connected";
+            disarm();
             return false;
         }
         if (!makeDirs(dir)) {
             err = "could not create " + dir;
+            disarm();
             return false;
         }
+        // X4: a leftover copy from an earlier failed/timed-out pass (nothing
+        // unlinks it) made the post-transfer stat() below succeed even when
+        // THIS transfer never ran to completion, so a stale or partial file
+        // could be hashed and reported ok (the host's size check caught it,
+        // but the file was then mis-reported as a hash mismatch). Only bytes
+        // written by this very transfer may exist at the destination.
+        ::remove((dir + "/" + fileName).c_str());
         std::string d = dir, f = fileName;
         // divisionSize is the transfer chunk; 0 is refused (InvalidParameter).
         // 8 MB balances round-trips against RAM on the Pi.
@@ -785,6 +1097,7 @@ bool Camera::cardPull(CrInt32u contentId, CrInt32u fileId, const std::string& di
             const_cast<CrChar*>(d.c_str()), const_cast<CrChar*>(f.c_str()));
         if (e != SDK::CrError_None) {
             err = "GetRemoteTransferContentsDataFile: " + crErrorString(e);
+            disarm();
             return false;
         }
     }
@@ -794,11 +1107,31 @@ bool Camera::cardPull(CrInt32u contentId, CrInt32u fileId, const std::string& di
     std::unique_lock<std::mutex> rl(m_rtMutex);
     if (!m_rtCv.wait_for(rl, std::chrono::seconds(timeoutSec),
                          [this] { return m_rtResult != 0; })) {
+        m_rtWant.clear();          // no result may complete this slot any more
+        rl.unlock();
+        // X4: the SDK keeps transferring after our timeout, and its late
+        // Result_OK used to satisfy the NEXT pull's wait. Cancel the transfer
+        // (best effort - the filename key already stops the cross-talk even
+        // if the body ignores the cancel). Bounded like every other HTTP-
+        // facing SDK call (X2): we have ALREADY decided to fail this pull, so
+        // waiting out a wedged SDK here would only strand the worker that is
+        // about to answer the drain.
+        {
+            SdkHold lk(*this, "cardPull-cancel", 3000ms);
+            if (lk && m_handle) {
+                SDK::ControlGetRemoteTransferContentsDataFile(
+                    m_handle, SDK::CrGetContentsDataControlType_Cancel);
+            }
+        }
         err = "transfer timed out after " + std::to_string(timeoutSec) + " s";
         return false;
     }
-    if (m_rtResult != 1) {
-        err = m_rtResult == -2 ? "device busy" : "transfer failed";
+    const int result = m_rtResult;
+    m_rtWant.clear();
+    if (result != 1) {
+        err = result == -2 ? "device busy"
+            : result == -3 ? "disconnected during transfer"
+                           : "transfer failed";
         return false;
     }
     const std::string path = dir + "/" + fileName;
@@ -812,7 +1145,11 @@ bool Camera::cardPull(CrInt32u contentId, CrInt32u fileId, const std::string& di
 }
 
 bool Camera::cardDelete(CrInt32u contentId, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "cardDelete", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!m_handle) {
         err = "not connected";
         return false;
@@ -829,11 +1166,48 @@ bool Camera::cardDelete(CrInt32u contentId, std::string& err) {
 void Camera::OnNotifyRemoteTransferResult(CrInt32u notify, CrInt32u per, CrChar* filename) {
     std::lock_guard<std::mutex> rl(m_rtMutex);
     m_rtPercent = per;
-    if (filename) m_rtFile = reinterpret_cast<const char*>(filename);
-    if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) m_rtResult = 1;
-    else if (notify == SDK::CrNotify_RemoteTransfer_Result_NG) m_rtResult = -1;
-    else if (notify == SDK::CrNotify_RemoteTransfer_Result_DeviceBusy) m_rtResult = -2;
+    std::string reported;
+    if (filename) {
+        reported = reinterpret_cast<const char*>(filename);
+        m_rtFile = reported;
+    }
+    int result = 0;
+    if (notify == SDK::CrNotify_RemoteTransfer_Result_OK) result = 1;
+    else if (notify == SDK::CrNotify_RemoteTransfer_Result_NG) result = -1;
+    else if (notify == SDK::CrNotify_RemoteTransfer_Result_DeviceBusy) result = -2;
+    // X4: a transfer our timeout path cancelled reports Stopped/Canceled -
+    // that is a real terminal state, not progress; without it a waiting pull
+    // sat out its whole timeout.
+    else if (notify == SDK::CrNotify_RemoteTransfer_Control_Stopped ||
+             notify == SDK::CrNotify_RemoteTransfer_Control_Canceled) result = -1;
     else return;                       // InProgress etc.: keep waiting
+    // X4: only a result for the file the current pull armed may complete the
+    // wait. The single unkeyed slot let a late Result_OK from a previous
+    // timed-out transfer complete the NEXT pull, which then stat'd/hashed a
+    // file its own transfer never delivered. A null filename cannot be
+    // disproven, so it passes; a mismatched one is logged and dropped.
+    // Residual, deliberately accepted: an UNNAMED late OK can still complete
+    // the wrong pull. It can no longer fabricate a result, though - cardPull
+    // now removes the destination before starting, so the stat() that follows
+    // either fails outright or returns a short file the host's size+sha256
+    // gate rejects. Failing that direction keeps the card copy; refusing every
+    // unnamed OK would break the drain outright on a body that never reports
+    // the name, which is the far worse trade.
+    if (!m_rtWant.empty() && !reported.empty()) {
+        const std::string& w = m_rtWant;
+        const bool match =
+            reported.size() >= w.size() &&
+            reported.compare(reported.size() - w.size(), w.size(), w) == 0 &&
+            (reported.size() == w.size() ||
+             reported[reported.size() - w.size() - 1] == '/' ||
+             reported[reported.size() - w.size() - 1] == '\\');
+        if (!match) {
+            log("Dropping a stale transfer result for " + reported +
+                " (waiting on " + w + ")");
+            return;
+        }
+    }
+    m_rtResult = result;
     m_rtCv.notify_all();
 }
 
@@ -861,8 +1235,8 @@ void Camera::OnCompleteDownload(CrChar* filename, CrInt32u) {
 // ---------------------------------------------------------------------------
 
 bool Camera::getProp(CrInt32u code, SDK::CrDeviceProperty& out) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
-    if (!m_handle) return false;
+    SdkHold hold(*this, "getProp", kSdkWait);
+    if (!hold || !m_handle) return false;
     SDK::CrDeviceProperty* list = nullptr;
     CrInt32 n = 0;
     const SDK::CrError e = SDK::GetSelectDeviceProperties(m_handle, 1, &code, &list, &n);
@@ -880,15 +1254,38 @@ bool Camera::getProp(CrInt32u code, SDK::CrDeviceProperty& out) {
 // Range triple of a property, extracted while the SDK still owns the value
 // buffer - the one thing getProp's returned copy cannot provide.
 bool Camera::getPropRange(CrInt32u code, PropRange& out) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
     out = PropRange{};
-    if (!m_handle) return false;
+    SdkHold hold(*this, "getPropRange", kSdkWait);
+    if (!hold || !m_handle) return false;
     SDK::CrDeviceProperty* list = nullptr;
     CrInt32 n = 0;
     const SDK::CrError e = SDK::GetSelectDeviceProperties(m_handle, 1, &code, &list, &n);
     bool ok = false;
     if (e == SDK::CrError_None && list && n >= 1) {
         out = rangeOf(list[0]);
+        ok = true;
+    }
+    if (list) SDK::ReleaseDeviceProperties(m_handle, list);
+    return ok;
+}
+
+// Choice list of an array-typed property, read while the SDK still owns the
+// value buffer. getProp's returned copy cannot provide this (its GetValues()
+// points into an array released before returning), which is why the X3
+// validation below cannot simply reuse it.
+bool Camera::getPropChoices(CrInt32u code, std::vector<long long>& out,
+                            std::size_t& elemBytes) {
+    out.clear();
+    elemBytes = 0;
+    SdkHold hold(*this, "getPropChoices", kSdkWait);
+    if (!hold || !m_handle) return false;
+    SDK::CrDeviceProperty* list = nullptr;
+    CrInt32 n = 0;
+    const SDK::CrError e = SDK::GetSelectDeviceProperties(m_handle, 1, &code, &list, &n);
+    bool ok = false;
+    if (e == SDK::CrError_None && list && n >= 1) {
+        out = choicesOf(list[0]);
+        elemBytes = elemSize(list[0].GetValueType());
         ok = true;
     }
     if (list) SDK::ReleaseDeviceProperties(m_handle, list);
@@ -933,7 +1330,14 @@ bool Camera::setPropLocked(CrInt32u code, long long value, std::string& err) {
 }
 
 bool Camera::setProp(CrInt32u code, long long value, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    // X7: bounded. This is the acquisition the audit left unbounded, and the
+    // one rigd drives hardest: store_dest / focus_mode / every exposure field,
+    // once per node per 3 s reconcile pass.
+    SdkHold hold(*this, "setProp", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     return setPropLocked(code, value, err);
 }
 
@@ -955,7 +1359,11 @@ bool Camera::setProp(CrInt32u code, long long value, std::string& err) {
 // own reported type first and fall back through the others.
 bool Camera::setPropForced(CrInt32u code, long long value, long long expect,
                            std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "setPropForced", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!m_handle) {
         err = "not connected";
         return false;
@@ -992,7 +1400,13 @@ bool Camera::setPropForced(CrInt32u code, long long value, long long expect,
 }
 
 bool Camera::sendCmd(CrInt32u cmd, SDK::CrCommandParam param, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    // X7: bounded. Every release - including the one a stereo pair is waiting
+    // on - goes through here.
+    SdkHold hold(*this, "sendCmd", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!m_handle) {
         err = "not connected";
         return false;
@@ -1019,6 +1433,12 @@ bool Camera::releaseUp(std::string& err) {
 }
 
 bool Camera::captureOnce(bool useAf, std::string& err) {
+    // Same operator rule as setFocusMode, at the other door: S1=Locked IS the
+    // half-press that drives AF, so {"af":true} on /api/shutter or
+    // /api/interval/start is an autofocus path even with the mode left at MF.
+    // rigd refuses af on /api/capture; this is the node's own copy of that
+    // refusal, for every caller rigd does not own.
+    if (useAf && autofocusBlocked("an autofocus release", err)) return false;
     if (useAf) {
         // Half-press to drive AF, give it a moment to lock, then release.
         std::string ignored;
@@ -1090,7 +1510,11 @@ long long Camera::readProp(CrInt32u code, long long dflt) {
 // instead of taking one frame - which looks exactly like "the shutter does
 // nothing". Disarm it first, stopping a running sequence if necessary.
 bool Camera::ensureIntervalRecOff(std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "intervalRecOff", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (readProp(SDK::CrDeviceProperty_Interval_Rec_Mode, SDK::CrIntervalRecMode_OFF) ==
         SDK::CrIntervalRecMode_OFF) {
         return true;
@@ -1142,7 +1566,11 @@ bool Camera::shutter(bool useAf, std::string& err) {
 
 bool Camera::configureCameraInterval(double intervalSec, int shots, int startDelaySec,
                                      std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "cameraInterval", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!isConnected()) {
         err = "not connected";
         return false;
@@ -1203,7 +1631,11 @@ bool Camera::configureCameraInterval(double intervalSec, int shots, int startDel
 bool Camera::setCameraIntervalArmed(bool armed, std::string& err) {
     if (!armed) return ensureIntervalRecOff(err);
 
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "intervalArm", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (m_intervalRun.load()) {
         err = "the host intervalometer is running - stop it first";
         return false;
@@ -1227,7 +1659,11 @@ bool Camera::setCameraIntervalArmed(bool armed, std::string& err) {
 }
 
 bool Camera::cameraIntervalRun(bool start, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "intervalRun", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (readProp(SDK::CrDeviceProperty_Interval_Rec_Mode, SDK::CrIntervalRecMode_OFF) !=
         SDK::CrIntervalRecMode_ON) {
         err = "arm the camera's Interval REC first";
@@ -1262,6 +1698,9 @@ bool Camera::startInterval(double intervalSec, int count, bool useAf, std::strin
         err = "frame count cannot be negative";
         return false;
     }
+    // Refuse an autofocus sequence at the door rather than starting a thread
+    // that fails on every frame (the rule itself is enforced in captureOnce).
+    if (useAf && autofocusBlocked("an autofocus sequence", err)) return false;
     if (!isConnected()) {
         err = "not connected";
         return false;
@@ -1364,13 +1803,38 @@ IntervalStatus Camera::intervalStatus() {
 // ---------------------------------------------------------------------------
 
 bool Camera::setFocusMode(long long mode, std::string& err) {
+    // OPERATOR RULE: the rig is ALWAYS manual focus, on every path. rigd pins
+    // its desired vector to MF and refuses AF on /api/capture, but ilxctl is
+    // the process that actually talks to the SDK and it accepted AF-S from
+    // its own :8080 page, from a curl, and from anything at all while rigd
+    // was stopped or the node suspended for a drain. That is not theoretical:
+    // rigcore.py records "verified live 2026-08-23: POST /api/focus/mode 2
+    // put the whole fleet in AF-S and the lens positions moved". piagent
+    // asserts FOCUS (the body's half-press) 120 ms before every TRIGGER, so
+    // the very next fire drives the lens - and focus POSITION is deliberately
+    // never converged, so rigd pushing the mode back to MF 3 s later does NOT
+    // undo the travel: the pair's interior orientation is changed for the
+    // rest of the dive and no frame carries a marker saying so.
+    //
+    // Only CrFocus_MF passes. DMF and PF drive the lens too, so "manual-ish"
+    // is not manual. The hatch for bench work is out-of-band on purpose
+    // (ilxctl --allow-autofocus): a field unit is never started with it, so
+    // the rule cannot be reached over the network at all.
+    if (mode != SDK::CrFocus_MF &&
+        autofocusBlocked("focus mode " + formatFocusMode(mode), err)) {
+        return false;
+    }
     const bool ok = setProp(SDK::CrDeviceProperty_FocusMode, mode, err);
     log(ok ? "Focus mode -> " + formatFocusMode(mode) : "Focus mode failed: " + err);
     return ok;
 }
 
 bool Camera::focusDrive(int step, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "focusDrive", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     // NearFar only responds in MF; nudge the camera there rather than failing
     // silently with the lens parked in AF.
     if (step != 0) {
@@ -1393,7 +1857,11 @@ bool Camera::setFocusPosition(long long value, std::string& err) {
 // ---------------------------------------------------------------------------
 
 bool Camera::zoomDrive(int speed, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "zoomDrive", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (speed != 0) {
         SDK::CrDeviceProperty st;
         if (getProp(SDK::CrDeviceProperty_Zoom_Operation_Status, st) &&
@@ -1455,6 +1923,52 @@ bool Camera::setExposure(const std::string& which, long long value, std::string&
         err = "unknown exposure control '" + which + "'";
         return false;
     }
+    // X7: one hold for the validation read AND the write below. They used to
+    // take the SDK mutex separately, so against a busy-but-not-wedged SDK a
+    // single /api/exposure could wait the bound twice - past rigcore's 12 s
+    // POST timeout, turning a write that was only slow into an unanswered
+    // one. Holding once also means the value cannot stop being offered
+    // between the check and the write. Both calls below re-enter recursively,
+    // which is free for the owning thread.
+    SdkHold hold(*this, "setExposure", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
+    // X3: validate against the body's own choice list BEFORE touching
+    // SetDeviceProperty. A value the body does not offer (live rig 2026-08-23:
+    // "abc" that parsed as 0) stalled the SDK ~6 s inside SetDeviceProperty;
+    // the monitor's status poll timed out behind it and the node flapped to
+    // "no connected camera" over one bad POST. A property that publishes no
+    // list (range-typed like colortemp, or a body that locks its table in
+    // transfer mode reports an empty one) passes through unchecked as before.
+    std::vector<long long> choices;
+    std::size_t elemBytes = 0;
+    if (isConnected() && getPropChoices(code, choices, elemBytes) && !choices.empty()) {
+        // Compare modulo the wire width: negative expcomp arrives here as
+        // -1000 but the body lists the UInt16 two's complement 64536.
+        const unsigned long long mask =
+            (elemBytes == 0 || elemBytes >= 8) ? ~0ULL
+                                               : ((1ULL << (elemBytes * 8)) - 1);
+        bool offered = false;
+        for (const long long c : choices) {
+            if ((static_cast<unsigned long long>(c) & mask) ==
+                (static_cast<unsigned long long>(value) & mask)) {
+                offered = true;
+                break;
+            }
+        }
+        if (!offered) {
+            std::ostringstream os;
+            os << "value " << value << " is not offered by the body for '"
+               << which << "' (valid:";
+            for (std::size_t i = 0; i < choices.size(); ++i)
+                os << (i ? "," : " ") << choices[i];
+            os << ")";
+            err = os.str();
+            return false;
+        }
+    }
     return setProp(code, value, err);
 }
 
@@ -1475,7 +1989,11 @@ bool Camera::setDateTime(long long unixSeconds, std::string& err) {
     // SDK crash outright instead, so this form is deliberately kept: it fails
     // cleanly. Camera clocks must be set from the body's own menu; correlate
     // frames by measuring each body's constant EXIF offset instead.
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "setDateTime", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!m_handle) {
         err = "not connected";
         return false;
@@ -1506,7 +2024,11 @@ bool Camera::setStoreDestination(long long value, std::string& err) {
 // ---------------------------------------------------------------------------
 
 bool Camera::liveViewJpeg(std::vector<unsigned char>& out, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "liveView", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!m_handle || !isConnected()) {
         err = "not connected";
         return false;
@@ -1565,7 +2087,11 @@ bool Camera::formatMedia(bool quick, std::string& err) {
 }
 
 bool Camera::setSaveDir(const std::string& dir, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+    SdkHold hold(*this, "setSaveDir", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
     if (!m_handle) {
         err = "not connected";
         return false;
@@ -1609,30 +2135,68 @@ bool Camera::makeDirs(const std::string& dir) {
 // Status snapshot
 // ---------------------------------------------------------------------------
 
+// The two answers /api/status can give with no property table behind them: a
+// connect in flight, and an SDK call in the way. Same shape - the state flags,
+// what we can say about the call that is blocking (X7: it is the only thing
+// anyone can act on, and it reads atomics so it answers while the mutex is
+// wedged), and the log tail. Contract: PROTOCOL.md - busy:true means "the node
+// answered and told us nothing", NOT a disconnect and NOT a set of diverged
+// fields, so a reconcile pass must skip the node rather than push into it.
+std::string Camera::shortStatusJson(bool connected, const char* flag) {
+    std::ostringstream os;
+    os << "{\"connected\":" << (connected ? "true" : "false")
+       << ",\"" << flag << "\":true,\"model\":\"\",\"id\":\"\""
+       << ",\"afAllowed\":" << (autofocusAllowed() ? "true" : "false");
+    std::string op;
+    double heldSec = 0.0;
+    if (sdkBusyInfo(op, heldSec)) {
+        os << ",\"sdkOp\":\"" << jsonEscape(op) << "\",\"sdkHeldS\":"
+           << std::fixed << std::setprecision(1) << heldSec
+           // "one SDK call has held the camera past kSdkWedged", which is
+           // what makes every other caller refuse at once. A big cardList can
+           // reach it legitimately; a wedged body never leaves it.
+           << ",\"sdkOverdue\":"
+           << (heldSec >= std::chrono::duration<double>(kSdkWedged).count()
+                   ? "true" : "false");
+    }
+    os << ",\"log\":[";
+    const auto logLines = takeLog();
+    const std::size_t from = logLines.size() > 40 ? logLines.size() - 40 : 0;
+    for (std::size_t i = from; i < logLines.size(); ++i) {
+        if (i > from) os << ",";
+        os << "\"" << jsonEscape(logLines[i]) << "\"";
+    }
+    os << "]}";
+    return os.str();
+}
+
 std::string Camera::statusJson() {
     // A connect in flight holds m_sdkMutex for as long as SDK::Connect takes
     // — which against a stalled PTP session is "until the body is power-
     // cycled". Taking the mutex here then froze /api/status too, and the
     // daemon looked dead (rigd: ILX_DOWN). Answer without it while a connect
     // is pending: connected:false, connecting:true, and the log.
-    if (m_connecting && !m_connected) {
-        {
-            std::ostringstream pos;
-            pos << "{\"connected\":false,\"connecting\":true,\"model\":\"\","
-                   "\"id\":\"\",\"log\":[";
-            const auto logLines = takeLog();
-            const std::size_t from = logLines.size() > 40 ? logLines.size() - 40 : 0;
-            for (std::size_t i = from; i < logLines.size(); ++i) {
-                if (i > from) pos << ",";
-                pos << "\"" << jsonEscape(logLines[i]) << "\"";
-            }
-            pos << "]}";
-            return pos.str();
-        }
-    }
+    if (m_connecting && !m_connected) return shortStatusJson(false, "connecting");
     std::string model, id;
     {
-        std::lock_guard<std::recursive_mutex> lk(m_sdkMutex);
+        // X2: bounded. The m_connecting guard above only covers the connect
+        // handshake itself; during the ENUMERATE phase of a reconnect, a card
+        // index build, or any other long SDK call this read used to block
+        // /api/status behind m_sdkMutex - the monitor's 6 s poll then timed
+        // out, the node was declared unreachable and a live run paused. If
+        // the SDK is that busy, answer from the atomics and say so.
+        //
+        // The 4.5 s bound sits in a narrow window on purpose. It must be
+        // LONGER than a healthy enumerate (enumerate(3) measures ~4 s
+        // camera-less) so an ordinary reconnect still gets the FULL body -
+        // the degraded body below carries no property keys, and rigcore's
+        // reconcile reads a missing readback key as a divergence - and
+        // SHORTER than the monitor's 6 s poll timeout, so even the degraded
+        // answer still counts as "the node answered". X7 shortens it further
+        // for a holder that is past kSdkWedged: once the SDK is wedged the
+        // 4.5 s buys nothing and the status poll every 2 s would queue.
+        SdkHold lk(*this, "statusJson", kSdkStatusWait);
+        if (!lk) return shortStatusJson(isConnected(), "busy");
         model = m_model;
         id = m_id;
     }
@@ -1641,6 +2205,11 @@ std::string Camera::statusJson() {
     os << "\"connected\":" << (isConnected() ? "true" : "false");
     os << ",\"model\":\"" << jsonEscape(model) << "\"";
     os << ",\"id\":\"" << jsonEscape(id) << "\"";
+    // A node started with the manual-focus rule lifted (--allow-autofocus) is
+    // a fleet-visible fact, not a local one: it says this body can be put in
+    // AF by anything that can reach :8080. Every status body carries it,
+    // degraded ones included.
+    os << ",\"afAllowed\":" << (autofocusAllowed() ? "true" : "false");
 
     if (isConnected()) {
         // One batched read keeps the USB round-trips down while the UI polls.
@@ -1696,6 +2265,19 @@ std::string Camera::statusJson() {
             // confirm what the bodies render.
             SDK::CrDeviceProperty_WhiteBalance,
             SDK::CrDeviceProperty_Colortemp,
+            // Recording format. Until 2026-08-23 these were write-only from
+            // the host's point of view ("blind fields"): rigd pushed them and
+            // hoped. Asking for them here turns every one into a readable
+            // field the convergence engine can verify, so the two bodies of a
+            // stereo pair are PROVEN to write the same file type / size / RAW
+            // compression, not assumed to. expcomp is read for the same reason.
+            SDK::CrDeviceProperty_FileType,
+            SDK::CrDeviceProperty_ImageSize,
+            SDK::CrDeviceProperty_Still_Image_Trans_Size,
+            SDK::CrDeviceProperty_RAW_FileCompressionType,
+            SDK::CrDeviceProperty_StillImageQuality,
+            SDK::CrDeviceProperty_RAW_J_PC_Save_Image,
+            SDK::CrDeviceProperty_ExposureBiasCompensation,
         };
         const CrInt32u nCodes = sizeof(codes) / sizeof(codes[0]);
 
@@ -1705,7 +2287,14 @@ std::string Camera::statusJson() {
         // frees the device handle under this same lock, so a concurrent
         // /api/disconnect cannot pull the property array out from under the
         // parse loop below.
-        std::unique_lock<std::recursive_mutex> lk(m_sdkMutex);
+        //
+        // X7: bounded, like the model/id read above. This second acquisition
+        // was left unbounded by the X2 pass, which defeated the first one
+        // whenever the SDK went busy BETWEEN them (a write starting right
+        // after the model read is enough): the worker then sat here for ever
+        // and /api/status lost a worker per poll. Same bound, same answer.
+        SdkHold lk(*this, "statusProps", kSdkStatusWait);
+        if (!lk) return shortStatusJson(isConnected(), "busy");
         if (m_handle) {
             SDK::GetSelectDeviceProperties(m_handle, nCodes, codes, &list, &n);
         }
@@ -1728,6 +2317,11 @@ std::string Camera::statusJson() {
         // 0x0100 = fixed color temperature); colorTemp is the Kelvin value
         // that applies while the mode is ColorTemp.
         long long whiteBalance = -1, colorTemp = -1;
+        // -1 = the body did not answer the read (older firmware, or the
+        // property is hidden in this mode) - distinct from any legal value.
+        long long fileType = -1, imageSize = -1, transSize = -1, rawType = -1;
+        long long jpegQuality = -1, pcSave = -1, expComp = 0;
+        bool expCompSeen = false;
         // -1 = the body did not report it, which is different from "fine".
         long long overheat = -1, liveViewStatus = -1, slotWriting = -1;
         long long powerStatus = 0, opMode = 0, menuStatus = 0, sdkCtlMode = -1;
@@ -1766,6 +2360,13 @@ std::string Camera::statusJson() {
                     flagOf("storeDest", p);
                     break;
                 case SDK::CrDeviceProperty_WhiteBalance: flagOf("whiteBalance", p); break;
+                case SDK::CrDeviceProperty_FileType: flagOf("filetype", p); break;
+                case SDK::CrDeviceProperty_ImageSize: flagOf("imagesize", p); break;
+                case SDK::CrDeviceProperty_Still_Image_Trans_Size: flagOf("transsize", p); break;
+                case SDK::CrDeviceProperty_RAW_FileCompressionType: flagOf("rawtype", p); break;
+                case SDK::CrDeviceProperty_StillImageQuality: flagOf("quality", p); break;
+                case SDK::CrDeviceProperty_RAW_J_PC_Save_Image: flagOf("pcsave", p); break;
+                case SDK::CrDeviceProperty_ExposureBiasCompensation: flagOf("expcomp", p); break;
                 case SDK::CrDeviceProperty_Colortemp: flagOf("colorTemp", p); break;
                 default: break;
             }
@@ -1825,6 +2426,17 @@ std::string Camera::statusJson() {
                     break;
                 case SDK::CrDeviceProperty_WhiteBalance: whiteBalance = cur; break;
                 case SDK::CrDeviceProperty_Colortemp: colorTemp = cur; break;
+                case SDK::CrDeviceProperty_FileType: fileType = cur; break;
+                case SDK::CrDeviceProperty_ImageSize: imageSize = cur; break;
+                case SDK::CrDeviceProperty_Still_Image_Trans_Size: transSize = cur; break;
+                case SDK::CrDeviceProperty_RAW_FileCompressionType: rawType = cur; break;
+                case SDK::CrDeviceProperty_StillImageQuality: jpegQuality = cur; break;
+                case SDK::CrDeviceProperty_RAW_J_PC_Save_Image: pcSave = cur; break;
+                // UInt16 two's complement in thousandths of an EV (+333 = +1/3).
+                case SDK::CrDeviceProperty_ExposureBiasCompensation:
+                    expComp = static_cast<long long>(static_cast<CrInt16>(cur & 0xFFFF));
+                    expCompSeen = true;
+                    break;
                 case SDK::CrDeviceProperty_BatteryRemain: battery = cur; break;
                 case SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber: remainShots = cur; break;
                 case SDK::CrDeviceProperty_MediaSLOT1_Status: slotStatus = cur; break;
@@ -1879,7 +2491,7 @@ std::string Camera::statusJson() {
             }
         }
         if (list) SDK::ReleaseDeviceProperties(m_handle, list);
-        lk.unlock();
+        lk.release();
 
         auto emitChoices = [&](const char* key, const std::vector<PropChoice>& c) {
             os << ",\"" << key << "\":[";
@@ -2009,6 +2621,68 @@ std::string Camera::statusJson() {
                 : whiteBalance < 0      ? "--"
                                         : "other");
         emitNum("colorTemp", colorTemp);
+        // Recording-format readback. The "<name>Value" keys are what rigd's
+        // convergence engine compares (it ignores labels); the labels are for
+        // the Controls tab. Absent on bodies that do not answer the read.
+        auto emitFmt = [&](const char* key, long long v, std::string (*fmt)(long long)) {
+            if (v < 0) return;
+            os << ",\"" << key << "Value\":" << v;
+            os << ",\"" << key << "Label\":\"" << jsonEscape(fmt(v)) << "\"";
+        };
+        emitFmt("filetype", fileType, [](long long v) -> std::string {
+            switch (v) {
+                case SDK::CrFileType_Jpeg: return "JPEG";
+                case SDK::CrFileType_Raw: return "RAW";
+                case SDK::CrFileType_RawJpeg: return "RAW+JPEG";
+                case SDK::CrFileType_RawHeif: return "RAW+HEIF";
+                case SDK::CrFileType_Heif: return "HEIF";
+                default: return "other";
+            }
+        });
+        emitFmt("imagesize", imageSize, [](long long v) -> std::string {
+            switch (v) {
+                case SDK::CrImageSize_L: return "L";
+                case SDK::CrImageSize_M: return "M";
+                case SDK::CrImageSize_S: return "S";
+                case SDK::CrImageSize_VGA: return "VGA";
+                default: return "other";
+            }
+        });
+        emitFmt("transsize", transSize, [](long long v) -> std::string {
+            return v == SDK::CrPropertyStillImageTransSize_Original ? "Original"
+                 : v == SDK::CrPropertyStillImageTransSize_SmallSize ? "Small" : "other";
+        });
+        emitFmt("rawtype", rawType, [](long long v) -> std::string {
+            switch (v) {
+                case SDK::CrRAWFile_Uncompression: return "Uncompressed";
+                case SDK::CrRAWFile_Compression: return "Compressed";
+                case SDK::CrRAWFile_LossLess: return "Lossless";
+                case SDK::CrRAWFile_LossLessS: return "LossLessS";
+                case SDK::CrRAWFile_LossLessM: return "LossLessM";
+                case SDK::CrRAWFile_LossLessL: return "LossLessL";
+                default: return "other";
+            }
+        });
+        emitFmt("quality", jpegQuality, [](long long v) -> std::string {
+            switch (v) {
+                case SDK::CrJpegQuality_Light: return "Light";
+                case SDK::CrJpegQuality_Standard: return "Standard";
+                case SDK::CrJpegQuality_Fine: return "Fine";
+                case SDK::CrJpegQuality_ExFine: return "ExFine";
+                default: return "other";
+            }
+        });
+        emitFmt("pcsave", pcSave, [](long long v) -> std::string {
+            switch (v) {
+                case SDK::CrPropertyRAWJPCSaveImage_RAWAndJPEG: return "RAW+JPEG";
+                case SDK::CrPropertyRAWJPCSaveImage_JPEGOnly: return "JPEG only";
+                case SDK::CrPropertyRAWJPCSaveImage_RAWOnly: return "RAW only";
+                case SDK::CrPropertyRAWJPCSaveImage_RAWAndHEIF: return "RAW+HEIF";
+                case SDK::CrPropertyRAWJPCSaveImage_HEIFOnly: return "HEIF only";
+                default: return "other";
+            }
+        });
+        if (expCompSeen) emitNum("expcompValue", expComp);
     }
 
     const IntervalStatus iv = intervalStatus();
