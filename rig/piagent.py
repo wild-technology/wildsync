@@ -22,12 +22,24 @@ Design notes that matter:
   * FOCUS is held by a long-lived `gpioset --mode=signal ... 17=0` process in
     open-drain. Releasing = killing it; the line then floats to the camera's
     own 2.8 V, which is the safe "not pressed" state. We never drive it high.
+  * A FOCUS hold is a LEASE, not a latch: /gpio/focus {hold:true} grants it for
+    30 s (`ttl_s` overrides), repeating the call renews it, and a fire that
+    relies on the hold renews it too. A watchdog releases a lapsed hold and
+    logs `focus_hold_expired`. Before this, a host that died (or whose one
+    unretried release call was dropped) left the body half-pressed for the
+    rest of the session, AE-locked, with the per-shot FOCUS restore
+    faithfully re-asserting it on every survey frame.
   * TRIGGER is pulsed with `gpioset --mode=time` in open-drain. To fire on a
     shared clock, we busy-wait to the requested epoch and stamp the instant the
     low actually starts, so the Jetson can measure real inter-camera skew.
   * The kernel edge timestamps from gpiomon are a different clock across
     libgpiod builds, so we stamp each EXPOSURE edge with wall time at read and
-    keep the raw device ts only for interval math.
+    keep the raw device ts only for interval math. Where the kernel stamp IS
+    usable it is converted here and published as `epoch_hw`, with its own
+    error bar (`hw_err_ms`) and the measured pipe-read latency (`hw_lag_ms`)
+    beside it. When this node cannot produce one, `epoch_hw` is null and
+    `hw_reject` says why: that edge's `epoch` is late by an unmeasured amount
+    and the host must not write it as a hardware capture instant.
   * Shots are identified, not counted. Each /gpio/fire answers with a
     `fire_seq` and the `edge_seq` in force just before the TRIGGER, and each
     EXPOSURE edge carries its own index plus the `fire_seq` it belongs to, so
@@ -71,6 +83,69 @@ STROBE_MAX_AFTER_S = 2.0
 # specifies for the assert (measured ~13 ms), and far above the ~60 us bursts a
 # ringing harness produces.
 EDGE_DEBOUNCE_S = 0.001
+
+# A held FOCUS is a lease, not a latch. The 2026-08 audit found the calibration
+# hold could outlive its owner: the host's release is one HTTP call with no
+# retry, so a host crash/sleep (or that one call being dropped) left the body
+# half-pressed for the rest of the session - AE locked at calibration light,
+# and the per-shot FOCUS restore faithfully re-asserted the stale hold on
+# every survey frame. A hold now expires this long after the last
+# /gpio/focus {hold:true} (repeating the call renews it; `ttl_s` in the body
+# overrides, clamped to MIN..MAX) and a watchdog releases it with a
+# `focus_hold_expired` log the host can grep. 30 s covers the longest
+# legitimate hold today (trigger calibration, ~15-25 s per node).
+FOCUS_HOLD_DEFAULT_TTL_S = 30.0
+FOCUS_HOLD_MIN_TTL_S = 1.0
+FOCUS_HOLD_MAX_TTL_S = 600.0
+
+# How long a fall edge may keep its exposure "open" for rise attribution.
+# Sony asserts EXPOSURE for ~13 ms at survey shutter speeds; anything still
+# "open" 10 s later is a lost rise, and tagging some later spurious rise with
+# the stale fire_seq made the host discard the genuine window (the 523 ms
+# cam2 windows in the 2026-08 audit).
+EDGE_FIRE_MAX_OPEN_S = 10.0
+
+# What "the IMU is running slow" means, judged against what THIS device does.
+# docs/HANDOFF.md's ">= 60 Hz" requirement is satisfied in that same document
+# by "174 Hz measured" - which is the FRAME rate (quat + euler + inertial +
+# baro). The YB-MRA02 publishes one quat and one euler per ~25 Hz device
+# cycle, so its ATTITUDE cadence is ~50 Hz (probe() measures 49.8 Hz) and can
+# never reach 60. The 2026-08 audit compared attitude_hz against the frame-rate
+# figure, so /health returned imu_rate_low:true on a perfectly healthy unit
+# from the first closed rate window onward - an alarm that is always on is an
+# alarm nobody reads. Each number is now judged against its own spec: frame_hz
+# against the HANDOFF figure, attitude_hz against a fraction of this device's
+# own measured normal (the probe's sample_rate_hz, sanity-bounded).
+IMU_MIN_FRAME_HZ = 60.0
+IMU_ATTITUDE_HZ_NOMINAL = 50.0     # 2 orientation frames per 25 Hz cycle
+IMU_ATTITUDE_LOW_FRAC = 0.6        # ~30 Hz here: a halved or stalled attitude
+                                   # stream trips it, a healthy one never does
+
+# Plausibility band for epoch_hw (the kernel edge stamp converted to wall
+# time). `lag` = epoch - epoch_hw is NOT a stamp-quality metric: it IS the
+# gpiomon pipe-read latency, measured on this hardware as a 0.09/0.32 ms
+# median "with occasional excursions into the hundreds of ms under load"
+# (see _monitor_loop). The 2026-08 audit capped it at 0.25 s, which cuts
+# INSIDE that measured distribution: a loaded Pi threw the correct kernel
+# stamp away precisely when `epoch` was worst, the host fell back to the late
+# `epoch` and still wrote capture_source=gpio_edge with a clock-error-only
+# bar - the exact error epoch_hw exists to remove. The corrupted-offset case
+# this band was written for is handled where it can actually be MEASURED, in
+# _wall_minus_mono(), whose bracket is published per edge as `hw_err_ms`.
+# What is left for a bound to catch is a stamp from the WRONG CLOCK DOMAIN (a
+# mis-scaled legacy gpiomon line is ~1e5 s or ~1.7e9 s out), so it sits far
+# above any read latency this hardware can produce.
+EDGE_HW_MAX_LAG_S = 5.0
+EDGE_HW_SLOP_S = 0.005
+
+# Floor under the per-edge `hw_err_ms`. The bracket can only resolve what the
+# wall clock can: time.time() reports 1 us granularity on the dev Mac (1 ns on
+# the Pis), so a bracket of exactly 0.0 means "below the tick", not "exact".
+# Publishing 0.0 would hand the host a claim of a perfect conversion.
+try:
+    EDGE_HW_CLOCK_RES_S = float(time.get_clock_info("time").resolution)
+except Exception:  # noqa: BLE001 - exotic platform; assume a 1 us tick
+    EDGE_HW_CLOCK_RES_S = 1e-6
 
 PORT = int(os.environ.get("PIAGENT_PORT", "8081"))
 LOG_PATH = os.path.expanduser("~/rig/piagent.jsonl")
@@ -315,16 +390,22 @@ class Gpio:
     # An `at_epoch` is a promise about a shared clock, and fire() waits for it on
     # a CPU. Bound it in both directions so a bad promise cannot pin a core or
     # fire a frame nobody is waiting for any more:
-    #  * the Jetson's own call times out at ~10 s, so anything further into the
-    #    future is a request whose answer can never be read - usually this node's
-    #    clock sitting minutes behind before chrony's first step. Waiting it out
-    #    fires the body long after the transect has moved on.
+    #  * the future bound used to be 10 s "because the host times out at ~10 s",
+    #    but the host's fire timeout is 2 s now: a node clock 2-10 s behind
+    #    accepted fires the host had already abandoned, held the fire lock for
+    #    seconds, then fired an orphan frame onto the card with no command
+    #    record - every shot - and the host saw only "stopped answering fires".
+    #    The longest LEGITIMATE lead a node can see is SYNC_LEAD_S (0.30 s)
+    #    plus the host's node-clock offset compensation, which is clamped to
+    #    5 s on its side; 5.5 s adds margin for HTTP transit. Anything further
+    #    out is a clock disagreement, not a schedule (contract: 0.3-5.5 s
+    #    ahead must always be accepted).
     #  * an at_epoch already well in the past is a stale schedule (a queued
     #    request, or this clock running ahead). Firing it immediately puts an
     #    unplanned frame on the card and reports late_ms in the thousands.
     # Both are answered with an explicit error the Jetson can count, which is
     # also the only way a node clock this wrong ever becomes visible.
-    FIRE_MAX_FUTURE_S = 10.0
+    FIRE_MAX_FUTURE_S = 5.5
     FIRE_MAX_PAST_S = 2.0
 
     def __init__(self):
@@ -333,6 +414,13 @@ class Gpio:
         self._focus_proc = None          # long-lived gpioset holding FOCUS low
         self._parkers = {}               # bcm -> Popen holding the line idle-high
         self._focus_direct = False       # FOCUS state when using the gpiod path
+        # FOCUS hold lease (see FOCUS_HOLD_* above): a hold that outlives its
+        # owner is a permanent half-press, so every hold carries an expiry the
+        # watchdog below enforces. Monotonic clock: a chrony step while held
+        # must not stretch or collapse the lease.
+        self._focus_held_since = None    # monotonic instant the hold began
+        self._focus_hold_expiry = None   # monotonic deadline; renewed per hold
+        self._focus_hold_ttl = None      # lease length this hold was granted
         # fire() drives shared lines and must never interleave with another
         # fire; a dedicated lock keeps that serialisation off `_lock`, which the
         # edge monitor and /health take, so a fire waiting on its at_epoch can
@@ -344,11 +432,19 @@ class Gpio:
         self._interval_stop = None
         self._interval_thread = None
         self._interval_state = {"running": False, "fired": 0, "target": 0,
-                                "period_s": 0.0, "last_late_ms": None}
+                                "period_s": 0.0, "last_late_ms": None,
+                                # Why a schedule ended early (FOCUS gone), so
+                                # "running:false, fired:1 of 20" is readable.
+                                "error": None}
         self._edges = deque(maxlen=20000)   # (epoch, edge, raw_ts, seq, hw, fire_seq)
         self._edge_seq = 0
+        self._edge_fire_at = None           # wall epoch the open exposure fell
         self._last_edge = {}                # edge -> last accepted timestamp
         self._bounced = 0                   # edges dropped as ring/bounce
+        self._hw_rejects = 0                # epoch_hw stamps outside the band
+        self._hw_reject_why = {}            # reason -> count (see _edge_hw)
+        self._hw_lag_ms_max = 0.0           # worst pipe-read latency seen
+        self._hw_lag_ms_last = None         # None until one edge is stamped
         self._mon_proc = None
         self._mon_thread = None
         self._mon_run = False
@@ -364,6 +460,11 @@ class Gpio:
         self._strobe_fires = 0
         self._strobe_last = None         # epoch of the last pulse
         self._strobe_err = None
+        # The FOCUS-hold watchdog runs regardless of `available`: any path
+        # that can assert FOCUS (gpiod or gpioset) must be covered, and the
+        # thread is idle unless a hold is actually live.
+        self._watchdog_run = True
+        threading.Thread(target=self._focus_watchdog_loop, daemon=True).start()
         if self.available:
             self._start_monitor()
             if not self.driver.ok:
@@ -425,7 +526,74 @@ class Gpio:
                 return self._focus_direct
             return self._focus_proc is not None and self._focus_proc.poll() is None
 
-    def focus(self, hold):
+    def focus_held_s(self):
+        """Seconds the current hold has been live, or None when not held.
+
+        The host never had a way to SEE a stale hold (a failed release during
+        calibration left the body half-pressed with nothing reporting it);
+        this plus the lease watchdog is that visibility."""
+        with self._lock:
+            if self.focus_held() and self._focus_held_since is not None:
+                return round(time.monotonic() - self._focus_held_since, 1)
+            return None
+
+    def _focus_lease(self, hold, ttl_s):
+        """Set/renew (hold) or clear (release) the hold lease. Under _lock.
+
+        `ttl_s` None on a RENEWAL means "the length this hold was granted", not
+        the default: a keepalive must never silently stretch a lease its owner
+        deliberately asked to be short."""
+        if hold:
+            try:
+                ttl = float(ttl_s) if ttl_s is not None \
+                    else (self._focus_hold_ttl or FOCUS_HOLD_DEFAULT_TTL_S)
+            except (TypeError, ValueError):
+                ttl = FOCUS_HOLD_DEFAULT_TTL_S
+            ttl = max(FOCUS_HOLD_MIN_TTL_S, min(ttl, FOCUS_HOLD_MAX_TTL_S))
+            now = time.monotonic()
+            if self._focus_held_since is None:
+                self._focus_held_since = now
+            self._focus_hold_ttl = ttl
+            self._focus_hold_expiry = now + ttl
+        else:
+            self._focus_held_since = None
+            self._focus_hold_expiry = None
+            self._focus_hold_ttl = None
+
+    def _focus_watchdog_loop(self):
+        while self._watchdog_run:
+            try:
+                self._focus_watchdog_tick()
+            except Exception as e:  # noqa: BLE001 - the watchdog must survive
+                log("warn", "gpio_focus", "focus watchdog error", err=str(e))
+            time.sleep(0.5)
+
+    def _focus_watchdog_tick(self):
+        """Release a held FOCUS whose lease has lapsed; True if it acted.
+
+        This is the recovery path for a dead host: without it a hold whose
+        release call never arrived kept the body half-pressed (AE locked, the
+        per-shot restore re-asserting it every frame) until someone pulled the
+        connector. `_lock` is an RLock, so releasing from in here is safe."""
+        with self._lock:
+            if not self.focus_held():
+                return False
+            exp = self._focus_hold_expiry
+            if exp is None or time.monotonic() < exp:
+                return False
+            held = self.focus_held_s()
+            log("warn", "focus_hold_expired",
+                "FOCUS hold lease lapsed without a renewal - releasing "
+                "(host dead or its release call was lost?)",
+                held_s=held)
+            self.focus(False)
+            if self.focus_held():
+                # Release failed (line write refused). Retry in 5 s rather
+                # than every tick, so a dead line does not flood the log.
+                self._focus_hold_expiry = time.monotonic() + 5.0
+            return True
+
+    def focus(self, hold, ttl_s=None):
         with self._lock:
             if self.driver.ok:
                 ok = self.driver.set(
@@ -433,11 +601,15 @@ class Gpio:
                     _LineDriver.ASSERT if hold else _LineDriver.IDLE)
                 if ok:
                     self._focus_direct = bool(hold)
+                    self._focus_lease(hold, ttl_s)
                     log("info", "gpio_focus",
                         "FOCUS held low" if hold else "FOCUS released")
                 return ok
             if hold:
                 if self.focus_held():
+                    # Idempotent hold doubles as the keepalive: renew the lease
+                    # rather than spawning a second holder.
+                    self._focus_lease(True, ttl_s)
                     return True
                 self._unpark(BCM_FOCUS)
                 cmd = _gpio(["gpioset", "--drive=open-drain", "--mode=signal",
@@ -456,6 +628,7 @@ class Gpio:
                     self._focus_proc = None
                     self._park(BCM_FOCUS)
                     return False
+                self._focus_lease(True, ttl_s)
                 log("info", "gpio_focus", "FOCUS held low")
                 return True
             else:
@@ -465,6 +638,14 @@ class Gpio:
     def _release_focus(self):
         p = self._focus_proc
         self._focus_proc = None
+        # The lease dies with the hold, whichever path releases it. This used
+        # to clear the timestamps but leave _focus_hold_ttl set, so on the
+        # gpioset path (no python3-libgpiod) the NEXT hold that omitted ttl_s
+        # inherited the previous one's length: hold ttl_s=600, release, then a
+        # plain hold, and the body sat half-pressed for ten minutes where the
+        # caller and PROTOCOL.md both say thirty seconds. One definition of
+        # "the lease dies", in _focus_lease.
+        self._focus_lease(False, None)
         if p and p.poll() is None:
             p.terminate()
             try:
@@ -517,14 +698,39 @@ class Gpio:
 
     def fire(self, at_epoch, pulse_ms, focus_lead_ms=0, strobe_at_epoch=0,
              strobe_pulse_ms=5):
+        res = self._fire(at_epoch, pulse_ms, focus_lead_ms, strobe_at_epoch,
+                         strobe_pulse_ms)
+        # node_epoch on EVERY answer, refusals included: a fire refused for a
+        # bad at_epoch (or abandoned by the host's 2 s timeout) is exactly the
+        # moment the host needs to see this node's clock to diagnose the
+        # disagreement, and only the success path used to carry it.
+        if isinstance(res, dict):
+            res.setdefault("node_epoch", time.time())
+        return res
+
+    def _fire(self, at_epoch, pulse_ms, focus_lead_ms=0, strobe_at_epoch=0,
+              strobe_pulse_ms=5):
         if not self.available:
             return {"ok": False, "error": "no gpio on this node"}
         focus_lead_ms = max(0, min(int(focus_lead_ms or 0), 500))
         # A caller that asks for its own FOCUS lead does not need FOCUS to be
         # held already - that is the point: per-shot FOCUS keeps auto-exposure
         # live, where a continuous hold would AE-lock the body for the run.
-        if not focus_lead_ms and not self.focus_held():
-            return {"ok": False, "error": "FOCUS not held", "code": 409}
+        if not focus_lead_ms:
+            if not self.focus_held():
+                return {"ok": False, "error": "FOCUS not held", "code": 409}
+            # A fire that RELIES on the held FOCUS is itself proof the hold's
+            # owner is alive, so it renews the lease. Without this the 30 s
+            # watchdog would cut a long trigger calibration short (the host
+            # holds FOCUS for the whole sample loop and sends no keepalive,
+            # and /api/calibrate does not clamp `samples`), and every later
+            # sample would come back "FOCUS not held". A SURVEY fire brings
+            # its own focus_lead_ms and therefore does NOT renew - which is
+            # the case that must stay bounded, since the per-shot FOCUS
+            # restore is exactly what kept a stale hold alive all run.
+            with self._lock:
+                if self.focus_held():
+                    self._focus_lease(True, None)
         pulse_ms = max(1, min(int(pulse_ms), 200))
         at_epoch, fault = self._epoch_fault(at_epoch)
         if fault:
@@ -787,9 +993,22 @@ class Gpio:
             if fault:
                 return fault
             period_s = max(0.05, float(period_s))
+            # The loop is the hold's owner for as long as it runs, and the
+            # watchdog has to be told so. Its own fires renew the lease (they
+            # carry focus_lead_ms=0), but only once per period: at period_s
+            # above the 30 s default the lease lapsed in the gap, the watchdog
+            # released FOCUS, and every frame after the first came back
+            # "FOCUS not held" while /gpio/state still said running:true with
+            # fired:1. Grant a lease that spans the gap; _interval_loop
+            # re-arms it on every tick, so it also outlives a long period,
+            # and it still lapses ~2.5 periods after the loop stops proving
+            # it is alive.
+            self._focus_lease(True, max(FOCUS_HOLD_DEFAULT_TTL_S,
+                                        2.5 * period_s))
             self._interval_stop = threading.Event()
             self._interval_state.update(running=True, fired=0,
-                                        target=int(count), period_s=period_s)
+                                        target=int(count), period_s=period_s,
+                                        error=None)
             t = threading.Thread(target=self._interval_loop,
                                  args=(at_epoch or time.time(), period_s,
                                        int(count)), daemon=True)
@@ -815,6 +1034,18 @@ class Gpio:
             else:
                 log("warn", "interval", "interval frame failed",
                     reason=res.get("error"))
+                # A lost FOCUS is not a bad frame, it is the end of the run:
+                # every remaining frame fails identically, so the loop used to
+                # log the same line `count` times and keep claiming
+                # running:true. Stop and say why. (`busy` is a genuine
+                # per-frame collision and does not end the schedule.)
+                if res.get("code") == 409 and not res.get("busy") \
+                        and not self.focus_held():
+                    with self._lock:
+                        self._interval_state["error"] = res.get("error")
+                    log("warn", "interval", "interval stopped: FOCUS gone",
+                        fired=self._interval_state["fired"])
+                    break
             k += 1
             # Wait for the next slot without holding the lock.
             nxt = start + k * period
@@ -823,8 +1054,28 @@ class Gpio:
                 if dt <= 0:
                     break
                 stop.wait(min(dt, 0.25))
+                # Keepalive. The loop, not the caller, is what keeps FOCUS
+                # legitimate while a schedule runs; without this tick a period
+                # longer than the lease expires it mid-gap and the watchdog
+                # takes the line out from under the next frame. Renew with
+                # ttl_s=None so it re-arms for the length interval_start
+                # granted, never longer.
+                with self._lock:
+                    if self.focus_held():
+                        self._focus_lease(True, None)
         with self._lock:
             self._interval_state["running"] = False
+            # The long lease existed only to span this schedule's gaps. With
+            # the loop gone nothing is proving the hold's owner is still
+            # alive, so bring it back to the default bound - shortening only,
+            # never extending a lease its owner asked to be shorter.
+            if self._focus_hold_expiry is not None:
+                self._focus_hold_ttl = min(self._focus_hold_ttl or
+                                           FOCUS_HOLD_DEFAULT_TTL_S,
+                                           FOCUS_HOLD_DEFAULT_TTL_S)
+                self._focus_hold_expiry = min(
+                    self._focus_hold_expiry,
+                    time.monotonic() + FOCUS_HOLD_DEFAULT_TTL_S)
         log("info", "interval", "interval finished",
             fired=self._interval_state["fired"])
 
@@ -921,9 +1172,11 @@ class Gpio:
                     # excursions into the hundreds of ms under load. For a stereo
                     # pair that read latency is pure, uncorrelated skew error, so
                     # the Jetson should prefer epoch_hw when pairing frames.
-                    hw = None
-                    if raw is not None:
-                        hw = raw + (time.time() - time.monotonic())
+                    # Note the direction: a BIG lag is exactly when epoch_hw is
+                    # worth the most, so the stamp is kept and the measured lag
+                    # is published beside it (`hw_lag_ms`) rather than used as
+                    # grounds to drop it - see _edge_hw.
+                    hw = self._edge_hw(raw, epoch)
                     # The reference carries its CLOCK DOMAIN. raw is kernel
                     # CLOCK_MONOTONIC (~1e5 s since boot); epoch is wall time
                     # (~1.7e9 s). One unparseable line used to store a wall
@@ -961,8 +1214,101 @@ class Gpio:
             if self._mon_run:
                 time.sleep(1)      # brief backoff before respawn
 
-    def _record_edge(self, epoch, edge, raw, hw):
+    @staticmethod
+    def _wall_minus_mono():
+        """(offset, bracket) — the wall-minus-monotonic offset and its bound.
+
+        The old single `time.time() - time.monotonic()` pair silently shifted
+        epoch_hw by the length of any preemption that landed between the two
+        reads (a GIL handoff to the IMU parser, a /health JSON dump) - and
+        epoch_hw is the preferred capture instant, so the shift went straight
+        into the stereo pairing. Read the pair twice, bracketing the monotonic
+        read with wall reads so the preemption is MEASURABLE, and keep the
+        sample with the smallest bracket.
+
+        The bracket is returned, not discarded: with midpoint pairing the
+        offset's own error is at most bracket/2, and that - not the pipe-read
+        latency - is the honest error bar on the converted stamp. Judging the
+        stamp by the read latency instead is what made the 0.25 s band throw
+        away good stamps under load."""
+        best, best_gap = None, None
+        for _ in range(2):
+            w1 = time.time()
+            m = time.monotonic()
+            w2 = time.time()
+            gap = w2 - w1
+            if best_gap is None or gap < best_gap:
+                # Midpoint pairing halves whatever preemption remains.
+                best_gap, best = gap, (w1 + w2) / 2.0 - m
+        return best, best_gap
+
+    def _hw_reject(self, why, lag):
+        """Count and log one edge published without a hardware instant."""
+        with self._lock:
+            self._hw_rejects += 1
+            self._hw_reject_why[why] = self._hw_reject_why.get(why, 0) + 1
+            n = self._hw_rejects
+        if n == 1 or n % 100 == 0:
+            log("warn", "gpio_monitor",
+                "no usable kernel edge stamp (%s) - publishing the edge "
+                "without epoch_hw; its `epoch` carries an unmeasured pipe-"
+                "read latency, so the host must not write it as a hardware "
+                "capture instant" % why, count=n,
+                lag_ms=None if lag is None else round(lag * 1000, 2))
+        return {"hw": None, "lag_ms": None, "err_ms": None, "reject": why}
+
+    def _edge_hw(self, raw, epoch):
+        """Kernel edge stamp -> {hw, lag_ms, err_ms, reject}, always a dict.
+
+        `hw` is the kernel's interrupt instant in wall time - the value the
+        host should use as the capture instant - or None when this node could
+        not produce one. The rest is what the host needs to be HONEST about
+        which it got:
+
+          lag_ms  epoch - hw, i.e. the measured gpiomon pipe-read latency.
+                  Diagnostic only when hw is published; it is also the load
+                  excursion signal the fleet view can alarm on.
+          err_ms  the node's own bound on hw (half the wall bracket used to
+                  convert it, floored at half a clock tick). Add this to the
+                  fleet clock error, do not ignore it.
+          reject  None normally; a short reason when the stamp was refused.
+                  hw is then None and `epoch` is late by an UNMEASURED amount
+                  (hundreds of ms under load), so the host must not write that
+                  edge as a hardware capture instant with a clock-error-only
+                  bar - see docs/PROTOCOL.md.
+
+        A large positive lag is a late READ, not a bad stamp: rejecting on it
+        discards the good value and keeps the bad one. Only a wrong clock
+        domain (EDGE_HW_MAX_LAG_S out) or a stamp that claims to postdate the
+        read (negative beyond EDGE_HW_SLOP_S) is refused."""
+        if raw is None:
+            # gpiomon printed no parseable timestamp. Not a bad stamp - no
+            # stamp at all - but the edge is just as hw-less downstream, so
+            # it is counted with the rest: a build that never prints one
+            # degrades EVERY edge to a software instant, silently.
+            return self._hw_reject("no_stamp", None)
+        off, gap = self._wall_minus_mono()
+        hw = raw + off
+        lag = epoch - hw
+        if lag < -EDGE_HW_SLOP_S:
+            return self._hw_reject("stamp_ahead", lag)
+        if lag > EDGE_HW_MAX_LAG_S:
+            return self._hw_reject("domain", lag)
+        lag_ms = lag * 1000.0
+        with self._lock:
+            if lag_ms > self._hw_lag_ms_max:
+                self._hw_lag_ms_max = lag_ms
+            self._hw_lag_ms_last = lag_ms
+        return {"hw": hw, "lag_ms": round(lag_ms, 3),
+                "err_ms": round(max(gap, EDGE_HW_CLOCK_RES_S) * 500.0, 5),
+                "reject": None}
+
+    def _record_edge(self, epoch, edge, raw, hw=None):
         """Ring one accepted edge, attributed to the fire that caused it.
+
+        `hw` is _edge_hw()'s dict (or None when the caller has no stamp at
+        all); it is carried through to exposure_events verbatim so the host
+        sees the same verdict this node reached.
 
         The identity matters as much as the instant: pairing a frame to a shot
         by queue position means one fire that produces no edge shifts every
@@ -980,11 +1326,24 @@ class Gpio:
                 pend = self._pending_fire
                 if pend and time.time() <= pend[1]:
                     fs = self._edge_fire = pend[0]
+                    self._edge_fire_at = epoch
                     self._pending_fire = None
                 else:
                     self._edge_fire = None
+                    self._edge_fire_at = None
             else:
-                fs = self._edge_fire
+                # An exposure has exactly ONE rise. The open fire_seq used to
+                # persist until the next fall, so a spurious/mislabelled rise
+                # minutes later still carried the stale id - and the host's
+                # identity match then took THAT rise and discarded the genuine
+                # window (the 523 ms cam2 windows). Hand the id to the first
+                # rise only, bounded in time, and close the window either way.
+                open_at = self._edge_fire_at
+                if open_at is not None and \
+                        (epoch - open_at) <= EDGE_FIRE_MAX_OPEN_S:
+                    fs = self._edge_fire
+                self._edge_fire = None
+                self._edge_fire_at = None
             self._edge_seq += 1
             self._edges.append((epoch, edge, raw, self._edge_seq, hw, fs))
             return self._edge_seq
@@ -997,19 +1356,50 @@ class Gpio:
             evs = [e for e in self._edges if e[3] > since]
             nxt = self._edge_seq
         # `fire_seq` is additive: an older Jetson ignores it and still pairs on
-        # `i`/`epoch_hw` exactly as before.
-        return {"next": nxt,
+        # `i`/`epoch_hw` exactly as before. So are the hw_* fields, but the
+        # host has to be able to tell "this node does not publish them" from
+        # "this node published null" - the first means fall back to `epoch`
+        # as before, the second means this edge has NO hardware instant and
+        # must not be written as one. `hw_meta` is that version marker: an
+        # older piagent omits it, and every edge from a node that sets it
+        # carries all four hw_* keys.
+        return {"next": nxt, "hw_meta": 1,
                 "events": [{"i": s, "edge": ed, "epoch": ep, "raw_ts": raw,
-                            "epoch_hw": hw, "fire_seq": fs}
+                            "epoch_hw": (hw or {}).get("hw"),
+                            "hw_lag_ms": (hw or {}).get("lag_ms"),
+                            "hw_err_ms": (hw or {}).get("err_ms"),
+                            "hw_reject": (hw or {}).get("reject"),
+                            "fire_seq": fs}
                            for (ep, ed, raw, s, hw, fs) in evs]}
 
     def state(self):
         parked = self.parked()
         return {"chip": self.chip, "available": self.available,
                 "focus_held": self.focus_held(),
+                # How long the hold has been live: a hold that outlived its
+                # owner used to be invisible to the host; now rigd can alarm on
+                # a hold running outside calibration.
+                "focus_held_s": self.focus_held_s(),
                 "monitor_running": self.monitor_running(),
                 "interval": self.interval_status(),
                 "edges_seen": self._edge_seq,
+                # Edges published WITHOUT epoch_hw - no parseable kernel
+                # stamp, or one outside the domain band (see _edge_hw). A
+                # bare count said
+                # nothing about WHY, and nothing at all about the load that
+                # made `epoch` late in the first place - so a node quietly
+                # degrading to software stamps looked identical to a healthy
+                # one. The reasons say which fault it is, and the lag figures
+                # are the pipe-read excursion itself, in ms, for the fleet
+                # view to alarm on before it reaches the capture instant.
+                "edges_hw_rejected": self._hw_rejects,
+                "edges_hw_reject_reasons": dict(self._hw_reject_why),
+                "edge_hw_lag_ms_max": (round(self._hw_lag_ms_max, 3)
+                                       if self._hw_lag_ms_last is not None
+                                       else None),
+                "edge_hw_lag_ms_last": (round(self._hw_lag_ms_last, 3)
+                                        if self._hw_lag_ms_last is not None
+                                        else None),
                 # Fires dispatched vs edges seen: if these stop tracking each
                 # other the harness is triggering without exposing (or the body
                 # is exposing without us), which no other field reveals.
@@ -1035,6 +1425,7 @@ class Gpio:
 
     def shutdown(self):
         self._mon_run = False
+        self._watchdog_run = False
         self.interval_stop()
         if self._mon_proc and self._mon_proc.poll() is None:
             self._mon_proc.terminate()
@@ -1097,9 +1488,7 @@ class Imu:
                 # Alive? If the sampler died or samples went stale, drop it and
                 # re-acquire.
                 try:
-                    s = self.reader.latest()
-                    fresh = s and s.get("epoch") and \
-                        (time.time() - s["epoch"]) < 5
+                    fresh = self._reader_fresh(self.reader)
                 except Exception:  # noqa: BLE001
                     fresh = False
                 if not fresh:
@@ -1134,6 +1523,45 @@ class Imu:
                     "(USB-serial on /dev/ttyUSB*/ttyACM*)")
             time.sleep(4)
 
+    @staticmethod
+    def _reader_fresh(reader):
+        """Is the reader still producing ATTITUDE, not merely bytes?
+
+        The old test used latest(), which trailing inertial/baro frames
+        deliberately refresh - so a fusion whose euler/quat output halted
+        while raw inertial kept streaming looked fresh forever and the
+        drop/re-acquire recovery never ran, while the host's imu_snapshot
+        found an empty ring and blanked every IMU column. Freshness must
+        mean the last RING publish (an orientation frame): imu_yb exposes
+        its epoch; fall back to latest() only for an older imu_yb without
+        the API (rolling deploy)."""
+        fn = getattr(reader, "last_attitude_epoch", None)
+        if callable(fn):
+            e = fn()
+            return bool(e) and (time.time() - e) < 5
+        s = reader.latest()
+        return bool(s and s.get("epoch") and (time.time() - s["epoch"]) < 5)
+
+    def _attitude_floor_hz(self):
+        """Below this attitude cadence, THIS device has departed from normal.
+
+        Not a spec number: a fraction of what the unit itself measured at
+        probe time (49.8 Hz on the YB-MRA02 here). A fixed 60 Hz was above
+        the device's healthy rate, so imu_rate_low was permanently true; a
+        fixed low number would miss a device whose fusion halved. The probe
+        figure is only trusted inside a sane band around the nominal cadence,
+        so a probe taken while the device was already sick cannot lower the
+        bar on itself for the rest of the session."""
+        base = IMU_ATTITUDE_HZ_NOMINAL
+        try:
+            probed = float(self.info.get("sample_rate_hz") or 0.0)
+        except (TypeError, ValueError):
+            probed = 0.0
+        if 0.5 * IMU_ATTITUDE_HZ_NOMINAL <= probed \
+                <= 4.0 * IMU_ATTITUDE_HZ_NOMINAL:
+            base = probed
+        return round(base * IMU_ATTITUDE_LOW_FRAC, 1)
+
     def _drop(self):
         with self._lock:
             r, self.reader, self.info = self.reader, None, {"present": False}
@@ -1165,22 +1593,73 @@ class Imu:
         if self.reader:
             try:
                 s = self.reader.latest()
-                # The LIVE ring rate, not the probe's figure: rate_hz is what
-                # the Jetson sizes "how stale may this attitude be" against, so
-                # it has to be the rate real samples are actually published at.
-                # Fall back to the probe value only until the first second of
-                # streaming has been measured.
-                # getattr, because a node mid-rolling-deploy may still be running
-                # an older imu_yb without these; health must answer regardless.
-                h["rate_hz"] = self.reader.rate_hz() or \
-                    self.info.get("sample_rate_hz")
+                # The LIVE ring rate, not the probe's figure. `rate_hz` used
+                # to substitute the probe's start-up number whenever the
+                # measured rate was FALSY - so a fusion whose attitude output
+                # stalled to a true 0.0 Hz read as a healthy 49.8 Hz forever.
+                # Fall back to the probe value only while the first
+                # measurement window is still open ("not yet measured", which
+                # imu_yb now distinguishes from "measured zero"); once
+                # measured, 0 means 0.
+                # getattr, because a node mid-rolling-deploy may still be
+                # running an older imu_yb without these; health must answer
+                # regardless.
+                rate = self.reader.rate_hz()
+                mfn = getattr(self.reader, "rate_measured", None)
+                measured = bool(mfn()) if callable(mfn) else bool(rate)
+                att = rate if measured else \
+                    (rate or self.info.get("sample_rate_hz"))
+                # attitude vs frame cadence, NAMED (the old pair rate_hz /
+                # frame_rate_hz kept getting read as one number): attitude_hz
+                # is what the "how stale may this attitude be" budget sizes
+                # against; frame_hz is link health. rate_hz/frame_rate_hz stay
+                # for older readers of /health.
+                h["rate_hz"] = att
+                h["attitude_hz"] = att
                 fr = getattr(self.reader, "frame_rate_hz", None)
                 h["frame_rate_hz"] = fr() if fr else None
+                h["frame_hz"] = h["frame_rate_hz"]
+                # The alarm bit rigd's anomaly scan reads. It compared
+                # attitude_hz against the 60 Hz figure, which is the FRAME
+                # rate spec - and this device's healthy attitude cadence is
+                # ~50 Hz, so /health reported imu_rate_low:true on a good
+                # unit for the whole session. Judge each rate against its own
+                # spec, and publish the thresholds so the number can be
+                # checked rather than trusted. None until measured, so the
+                # first second of streaming cannot false-alarm.
+                h["attitude_floor_hz"] = self._attitude_floor_hz()
+                h["frame_floor_hz"] = IMU_MIN_FRAME_HZ
+                if not measured:
+                    h["imu_rate_low"] = None
+                else:
+                    low = att is not None and att < h["attitude_floor_hz"]
+                    if h["frame_hz"] is not None and \
+                            h["frame_hz"] < IMU_MIN_FRAME_HZ:
+                        low = True
+                    h["imu_rate_low"] = low
+                # Frames the decoder refused (checksum mismatch, out-of-range
+                # or non-finite values): "quat frames present but discarded"
+                # used to be indistinguishable from "device sends none".
+                rj = getattr(self.reader, "rejected_frames", None)
+                h["rejected_frames"] = rj() if callable(rj) else None
+                # Whether frame-checksum verification is actually ON. The gate
+                # learns the device's scheme from the live stream and goes
+                # dormant if none of the candidates fits, so "corrupt frames
+                # are being rejected" is a claim /health has to be able to
+                # answer honestly rather than one the operator assumes.
+                cs = getattr(self.reader, "checksum_state", None)
+                h["checksum"] = cs() if callable(cs) else None
                 # Seconds since the attitude last MOVED. A locked-up fusion
                 # keeps streaming identical numbers at full rate, so age_s stays
                 # small and nothing else here would ever notice.
                 fz = getattr(self.reader, "orientation_frozen_s", None)
                 h["orient_frozen_s"] = fz() if fz else None
+                # Age of the last RING publish (attitude): latest() is
+                # refreshed by inertial-only traffic, so age_s alone cannot
+                # show an attitude stall.
+                la = getattr(self.reader, "last_attitude_epoch", None)
+                e = la() if callable(la) else None
+                h["attitude_age_s"] = round(time.time() - e, 3) if e else None
                 h["age_s"] = round(time.time() - s["epoch"], 3) if s and \
                     s.get("epoch") else None
             except Exception:  # noqa: BLE001
@@ -1215,9 +1694,19 @@ def _load1():
 
 
 def health():
-    return {
+    # Stamp the clock FIRST. The host derives this node's clock offset as
+    # time.epoch minus the midpoint of its request round trip; the stamp used
+    # to be the LAST field built, after GPIO subprocess polls, IMU state and a
+    # listdir of the whole spool, so it was biased by that work - and on a Pi 4
+    # with a few thousand spooled frames the inflated RTT pushed the node out
+    # of the host's clock-skew gate entirely. Stamp before the work, and
+    # report the work's duration so the host can see (and bound) what follows
+    # the stamp.
+    t0 = time.time()
+    h = {
         "node": NODE,
-        "uptime_s": round(time.time() - T_START, 1),
+        "time": {"epoch": t0, "source": "local"},
+        "uptime_s": round(t0 - T_START, 1),
         # The Pi's uptime, not this process's: a service restart (every
         # deploy) must not read as a power loss on the host.
         "host_uptime_s": _host_uptime(),
@@ -1227,8 +1716,9 @@ def health():
         "cam_frames": _count_frames(),
         "load1": _load1(),
         "power": _power(),
-        "time": {"epoch": time.time(), "source": "local"},
     }
+    h["time"]["work_ms"] = round((time.time() - t0) * 1000.0, 2)
+    return h
 
 
 def _host_uptime():
@@ -1331,8 +1821,11 @@ class Handler(BaseHTTPRequestHandler):
         b = self._body()
         try:
             if path == "/gpio/focus":
-                ok = GPIO.focus(bool(b.get("hold")))
-                self._send({"ok": ok, "focus_held": GPIO.focus_held()})
+                # Optional ttl_s: the hold lease length; absent means the
+                # 30 s default. Repeating {hold:true} is the keepalive.
+                ok = GPIO.focus(bool(b.get("hold")), ttl_s=b.get("ttl_s"))
+                self._send({"ok": ok, "focus_held": GPIO.focus_held(),
+                            "focus_held_s": GPIO.focus_held_s()})
             elif path == "/gpio/fire":
                 res = GPIO.fire(b.get("at_epoch", 0), b.get("pulse_ms", 5),
                                 b.get("focus_lead_ms", 0),

@@ -29,6 +29,7 @@ Two rules run through the whole file and are worth stating once:
 import csv
 import json
 import os
+import re
 import threading
 import time
 
@@ -63,24 +64,67 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
-def _exif_capture_epoch(jpeg_bytes):
-    """Camera capture epoch from EXIF, or None. Pure-bytes, no temp file."""
+def _exif_capture(jpeg_bytes):
+    """(camera capture epoch, sub-seconds present) from EXIF, or (None, False).
+
+    Whether the body wrote SubSecTimeOriginal is not a detail: DateTimeOriginal
+    alone is quantised to a WHOLE SECOND, which is two shot periods at the 2 Hz
+    survey rate, so EXIF can then only be used as a coarse sanity check on a
+    frame's claimed fire command. With SubSec it is good to ~10 ms and can
+    police a one-period shift. _claim_tolerance() needs to know which it has;
+    returning the epoch alone threw that away (audit 2026-08-23, R3).
+    Pure-bytes, no temp file."""
     if not PIL_AVAILABLE:
-        return None
+        return None, False
     try:
         from io import BytesIO
         Image = _PIL_Image
         with Image.open(BytesIO(jpeg_bytes)) as im:
             ex = im.getexif().get_ifd(0x8769)
         dt = ex.get(0x9003)
-        ss = str(ex.get(0x9291) or "0").strip()
+        raw_ss = ex.get(0x9291)
+        ss = str(raw_ss or "0").strip()
         if not dt:
-            return None
+            return None, False
         base = time.mktime(time.strptime(dt, "%Y:%m:%d %H:%M:%S"))
+        sub = bool(raw_ss is not None and ss.isdigit())
         frac = float("0." + ss) if ss.isdigit() else 0.0
-        return base + frac
+        return base + frac, sub
     except Exception:  # noqa: BLE001
-        return None
+        return None, False
+
+
+def _exif_capture_epoch(jpeg_bytes):
+    """Camera capture epoch from EXIF, or None. The epoch half of
+    _exif_capture(); kept as its own name because callers that only want the
+    instant (the EXIF clock calibration, the test harness) read better for it."""
+    return _exif_capture(jpeg_bytes)[0]
+
+
+# Sony appends "(n)" to a filename that repeats after a card rollover or a
+# format, and shooting RAW+JPEG delivers TWO files per shutter release.
+_DUP_SUFFIX_RE = re.compile(r"^(.*?)\((\d+)\)$")
+
+
+def _cam_stem(name):
+    """The camera's identity for ONE shutter release.
+
+    ILX01234.JPG, ILX01234.ARW and ILX01234(1).JPG are all the same exposure:
+    the body numbers a release once and writes every file of it under that
+    number. Claims, GPIO edges and the flight_log row belong to the RELEASE,
+    not to the file - keyed by filename, a RAW+JPEG pair claimed two
+    consecutive fire commands and the JPEG (the half that gets the row) was
+    stamped one shot period late as capture_source=gpio_edge (audit
+    2026-08-23, R4)."""
+    stem = os.path.splitext(name)[0]
+    m = _DUP_SUFFIX_RE.match(stem)
+    return m.group(1) if m else stem
+
+
+# The half of a RAW+JPEG release that carries the flight_log row. The JPEG is
+# what ingest, stereo_check and the run browser read; the RAW is archived
+# beside it under the same stem.
+_ROW_EXTS = (".jpg", ".jpeg")
 
 
 def _split_epoch(epoch):
@@ -164,6 +208,12 @@ class PullWorker(threading.Thread):
     # the shared PoE feed) resumes its retries when it comes back.
     MAX_ATTEMPTS = 4
     BACKOFF_S = (0.25, 0.35, 0.45, 0.55)
+    # How long a RAW half waits for its JPEG sibling to be listed. One listing
+    # poll plus slack: the two files of a release are written to the spool
+    # microseconds apart, but a listing can still fall between them.
+    RAW_SIBLING_GRACE_S = 0.6
+    # How long a written frame's name stays claimable by a same-stem sibling.
+    RAW_SIBLING_WINDOW_S = 30.0
 
     # A queued fire command whose frame has not been listed by now produced no
     # frame at all (the body refused the release, PC-save was off, the card was
@@ -180,6 +230,15 @@ class PullWorker(threading.Thread):
         self.cam_dir = cam_dir
         self.provider = provider          # RunManager, for nav/imu/time/events
         self.adopted = adopted            # joined an already-running transect
+        # This transect's PRESENTATION timebase, latched here. time_base()
+        # reads it from provider.active, and stop() clears that BEFORE a
+        # worker still mid-download has finished (it is only joined with a
+        # timeout). Such a straggler then stamped its row from the LIVE GPS
+        # offset while every other row of the same flight_log carried the
+        # start-of-run base - the exact cross-clock inconsistency the latch
+        # exists to prevent, on the last frame of the transect. One transect,
+        # one clock (audit 2026-08-23).
+        self._timebase = provider.time_base()
         self._stopev = threading.Event()
         # Set once the first poll has been through: a camera adopted mid-run
         # must get to list (and claim) its backlog before anything starts firing
@@ -208,7 +267,24 @@ class PullWorker(threading.Thread):
         # is written or abandoned, so a frame whose pull is failing cannot hand
         # its command to the next frame in line.
         self.cmd_epoch = {}
-        # name -> {"size", "attempts", "next_try"} for frames not yet on disk.
+        # camera stem -> the command that release claimed. One shutter release
+        # can deliver two files (RAW+JPEG); they are ONE exposure and share one
+        # command, one GPIO edge and one flight_log row.
+        self._stem_cmd = {}
+        # camera stem -> (CamN_<instant> base name already written for that
+        # release, when it was written), so the second file lands beside the
+        # first instead of being renamed to its own (later) pull instant.
+        # Time-bounded: the body's numbering ROLLS OVER (ILX09999 back to
+        # ILX00001), and a recycled stem inheriting a name from thousands of
+        # shots ago would be filed under the wrong instant AND silently lose
+        # its flight_log row. The two halves of one release land within a
+        # second of each other, so the window is generous either way.
+        self._stem_dest = {}
+        # name -> {"size", "attempts", "next_try", "cap"} for frames not yet on
+        # disk. "cap" caches the capture instant once it has been resolved: the
+        # GPIO edge is POPPED from the monitor's buffer to resolve it, so
+        # recomputing after a failed write would silently downgrade the frame
+        # from gpio_edge to exif/command (audit 2026-08-23, R9).
         self._pending = {}
         # The last few frames this worker has actually dealt with (pulled,
         # discarded or given up on). Calibration uses it to tell "this frame was
@@ -221,14 +297,23 @@ class PullWorker(threading.Thread):
         self._lock = threading.Lock()
 
     # ---- fire commands ----------------------------------------------------
-    def note_command(self, epoch, path="gpio", fire_seq=None, edge_seq=None):
+    def note_command(self, epoch, path="gpio", fire_seq=None, edge_seq=None,
+                     host_offset=None, clock_err=None):
         """Queue an expected exposure instant and return its record.
 
         Inserted in target order rather than appended: this is called from one
         thread per node per shot, so arrival order is not shot order under any
-        load worth worrying about."""
+        load worth worrying about.
+
+        `host_offset` is THIS SHOT's fleet clock offset, latched once by
+        capture_once for every member. Carried here because the pull workers
+        are two independent threads: reading the wall-time latch at pull time
+        gave the two halves of one pair different offsets whenever a fire
+        boundary fell between their conversions, and that difference lands
+        straight in the displayed pair spread (audit 2026-08-24)."""
         rec = {"epoch": float(epoch), "path": path, "fire_seq": fire_seq,
-               "edge_seq": edge_seq, "queued": time.time()}
+               "edge_seq": edge_seq, "queued": time.time(),
+               "host_offset": host_offset, "clock_err": clock_err}
         with self._lock:
             i = len(self._cmds)
             while i > 0 and self._cmds[i - 1]["epoch"] > rec["epoch"]:
@@ -256,21 +341,71 @@ class PullWorker(threading.Thread):
         return False
 
     def _claim(self, name):
-        """Take the oldest unclaimed command for this frame, by name."""
+        """Take the oldest unclaimed command for this SHUTTER RELEASE.
+
+        Keyed by the camera stem, not the filename. The field vector is
+        filetype=3 (RAW+JPEG, ~/rig/desired.json) and the body's own
+        RAW+J-PC-Save menu decides which halves reach the Pi's spool; when both
+        do, one release lands ILX01234.ARW and ILX01234.JPG. Keyed by filename
+        each half claimed its own command - sorted() puts .ARW first, so the
+        JPEG took shot k+1's command and shot k+1's fire_seq edge and was
+        written one shot period late, still labelled capture_source=gpio_edge
+        (audit 2026-08-23, R4). The stem is the release; siblings share its
+        claim.
+
+        A release that has ALREADY been written gets no new command, ever. The
+        two halves are only microseconds apart in the spool, but a ~320 KB
+        Small JPEG is listed while the ~32 MB LossLessL ARW of the same release
+        is still transferring, so at a 0.4 s poll they routinely land in
+        DIFFERENT listings. _release_claim pops the stem as soon as no other
+        file of it is in cmd_epoch, so the late half arrived to an empty
+        _stem_cmd and popped the NEXT shot's command - which it then destroyed
+        as a sibling (requeue=False), shifting every later frame by a shot
+        period and popping the wrong EXPOSURE edge on the way. RAW_SIBLING_
+        GRACE_S only defers a RAW listed in the SAME poll and cannot help here;
+        _stem_dest is the record that the release was written, so consult it
+        (audit 2026-08-24)."""
         with self._lock:
             if name in self.cmd_epoch:
                 return self.cmd_epoch[name]
-            if not self._cmds:
-                return None
-            rec = self._cmds.pop(0)
+            stem = _cam_stem(name)
+            rec = self._stem_cmd.get(stem)
+            if rec is None:
+                sib = self._stem_dest.get(stem)
+                if sib is not None \
+                        and time.time() - sib[1] <= self.RAW_SIBLING_WINDOW_S:
+                    return None          # a sibling: no new exposure, no command
+                if not self._cmds:
+                    return None
+                rec = self._cmds.pop(0)
+                self._stem_cmd[stem] = rec
             self.cmd_epoch[name] = rec
             return rec
 
-    def _release_claim(self, name, requeue):
-        """Give a claim back (requeue=True) or drop it (an orphaned fire)."""
+    def _release_claim(self, name, requeue, whole_stem=False):
+        """Give a claim back (requeue=True) or drop it (an orphaned fire).
+
+        The LAST file of a release releases its command: while the RAW half is
+        still in flight the claim is still owned, and requeueing it early would
+        hand this exposure's command to the next frame in line. `whole_stem` is
+        for the verdicts that are about the EXPOSURE rather than the file - an
+        orphaned fire, an unscheduled frame - where every file of the release
+        must let go together, or the sibling would keep handing the rejected
+        command straight back on the next _claim()."""
         with self._lock:
             rec = self.cmd_epoch.pop(name, None)
-            if rec is not None and requeue:
+            stem = _cam_stem(name)
+            if whole_stem:
+                rec = rec or self._stem_cmd.get(stem)
+                for n in [n for n in self.cmd_epoch if _cam_stem(n) == stem]:
+                    del self.cmd_epoch[n]
+            if rec is None:
+                return None
+            if not whole_stem \
+                    and any(_cam_stem(n) == stem for n in self.cmd_epoch):
+                return rec                     # a sibling still holds it
+            self._stem_cmd.pop(stem, None)
+            if requeue:
                 i = len(self._cmds)
                 while i > 0 and self._cmds[i - 1]["epoch"] > rec["epoch"]:
                     i -= 1
@@ -304,19 +439,63 @@ class PullWorker(threading.Thread):
     def stop(self):
         self._stopev.set()
 
-    def run(self):
-        os.makedirs(self.cam_dir, exist_ok=True)
-        path = os.path.join(self.cam_dir, "flight_log.csv")
-        new = not os.path.exists(path)
-        self._flight_fh = open(path, "a", newline="")
-        self._flight = csv.writer(self._flight_fh)
-        if new:
-            self._flight.writerow(FLIGHT_HEADER)
-            self._flight_fh.flush()
-        listing = {s["name"] for s in self.mon.shots()}
+    # A baseline listing is retried for this long before the worker gives up.
+    # ilxctl restarting under systemd, or a node still settling after a PoE
+    # power-cycle, answers within a couple of seconds; anything longer is a
+    # camera an operator has to look at, and guessing at its spool is the one
+    # thing that must not happen.
+    BASELINE_TRIES = 6
+    BASELINE_RETRY_S = 0.5
+    # ...and then it keeps trying, this far apart, for as long as the run is
+    # open. The worker used to RETURN here, and nothing ever removed its entry
+    # from RunManager.workers - so _adopt_loop's `m.name_ not in self.workers`
+    # guard could never rebuild it, while capture_once went on firing that
+    # camera every shot (its roster is the monitors, not the workers). Half the
+    # stereo line was lost with no recovery short of stop/restart, and the
+    # error's advice to "re-add the camera" names an operation rigd does not
+    # expose (audit 2026-08-24).
+    BASELINE_RETRY_WAIT_S = 5.0
+
+    def _baseline_listing(self):
+        """The set of frames already on this node, or None if it never listed.
+
+        NodeMonitor.shots() answers None when the call FAILED, which is not the
+        same as an empty spool and must never be flattened into one here."""
+        for i in range(self.BASELINE_TRIES):
+            if self._stopev.is_set():
+                return None
+            shots = self.mon.shots()
+            if shots is not None:
+                return {s["name"] for s in shots}
+            if i == 0 and self.provider.warn_once(
+                    "baseline:%s" % self.mon.name_, 30.0):
+                # Rate-limited: the worker now retries the baseline for as long
+                # as the run is open, and one warning every 5 s for a node an
+                # operator is already fixing buries the journal.
+                self.provider.events.emit(
+                    "warn", "pull",
+                    "%s did not answer its shot listing - retrying before "
+                    "baselining; an empty baseline would pull everything "
+                    "already on the node into the transect" % self.mon.name_,
+                    node=self.mon.name_)
+            if self._stopev.wait(self.BASELINE_RETRY_S):
+                return None
+        return None
+
+    def _baseline(self, late=False):
+        """Take the run-start baseline. True once this worker has one.
+
+        `late` says the first attempt already failed, so the node has been
+        firing unpulled for a while. Those frames must NOT be baselined away -
+        that is the adopted-worker problem exactly, so it takes the adopted
+        answer: anything rigd has never listed on this node was taken during
+        the outage and is survey data (audit 2026-08-24)."""
+        listing = self._baseline_listing()
+        if listing is None:
+            return False
         known = self.provider.known_frames(self.mon.name_)
         backlog = ()
-        if self.adopted and known is not None:
+        if (self.adopted or late) and known is not None:
             # This camera missed the start of the transect but rigd has watched
             # its save dir before, so anything in it we have never listed is a
             # frame it took DURING this run - while it was booting, or in the
@@ -330,12 +509,65 @@ class PullWorker(threading.Thread):
             # First sight of this camera in this session: its save dir is never
             # pruned, so everything in it predates us and is not survey data.
             self.seen |= listing
+            if late:
+                # A late baseline with nothing remembered cannot tell the two
+                # apart, and guessing at the spool is the one thing that must
+                # not happen - so everything present is treated as pre-existing
+                # and the operator is told what that costs.
+                self.provider.events.emit(
+                    "warn", "pull",
+                    "%s answered its shot listing at last, but rigd had never "
+                    "listed this node before: anything it shot while the "
+                    "listing was down is baselined out and is NOT in the "
+                    "transect (it is still on the node and on the card)"
+                    % self.mon.name_, node=self.mon.name_)
         self.provider.remember_frames(self.mon.name_, listing)
         self.provider.events.emit(
             "info", "pull", "worker up, baseline %d frames%s"
             % (len(self.seen),
                (", %d taken before adoption still to pull" % len(backlog))
                if backlog else ""), node=self.mon.name_)
+        return True
+
+    def run(self):
+        os.makedirs(self.cam_dir, exist_ok=True)
+        path = os.path.join(self.cam_dir, "flight_log.csv")
+        new = not os.path.exists(path)
+        self._flight_fh = open(path, "a", newline="")
+        self._flight = csv.writer(self._flight_fh)
+        if new:
+            self._flight.writerow(FLIGHT_HEADER)
+            self._flight_fh.flush()
+        late = False
+        while not (self._stopev.is_set() or self._baseline(late)):
+            # Never baseline off a listing that did not happen. An empty
+            # baseline says "the spool is empty", so every file already in the
+            # save dir - old bench frames, a calibration frame nobody dumped,
+            # the previous transect's leftovers - would be pulled into THIS
+            # transect and written to the flight_log as survey data. So the
+            # worker pulls NOTHING until it has a real listing - but it stays
+            # alive and keeps asking, because the camera goes on being fired
+            # either way and a dead worker can never be rebuilt.
+            if not late:
+                self.provider.events.emit(
+                    "error", "pull",
+                    "cannot list %s's save dir - this camera is NOT being "
+                    "pulled into the transect yet. Without a baseline every "
+                    "file already on the node would be logged as survey data. "
+                    "Check ilxctl on the node; the worker keeps retrying and "
+                    "starts pulling the moment it answers." % self.mon.name_,
+                    node=self.mon.name_)
+            late = True
+            # Nothing is coming from this worker yet, so release anything
+            # waiting on its first pass rather than making an adoption sit out
+            # the full 8 s timeout for a worker that has not baselined.
+            self.primed.set()
+            if self._stopev.wait(self.BASELINE_RETRY_WAIT_S):
+                try:
+                    self._flight_fh.close()
+                except OSError:
+                    pass
+                return
         while True:
             try:
                 self._poll_once()
@@ -355,6 +587,14 @@ class PullWorker(threading.Thread):
             return
         self._expire_commands()
         shots = self.mon.shots()
+        if shots is None:
+            # The listing failed. Nothing is marked seen and no claim is
+            # taken, so this poll is simply skipped; frames still pending keep
+            # their cached capture instant and their retry schedule, and the
+            # next poll picks up whatever this one could not see. Same shape
+            # as the OFFLINE gate above: a node we cannot ask about is a node
+            # whose frames wait, never a node with nothing on it.
+            return
         self.provider.remember_frames(self.mon.name_,
                                       [s["name"] for s in shots])
         # A calibration exposure is landing on this node right now and has not
@@ -369,15 +609,41 @@ class PullWorker(threading.Thread):
         # numbers frames sequentially. Claiming here rather than at write time
         # is what keeps a frame whose download is being retried from donating
         # its command to the frame behind it.
+        now = time.time()
         for s in (() if quiet else sorted(shots, key=lambda s: s["name"])):
             name = s["name"]
-            if name in self.seen or name in self._pending:
+            if name in self.seen:
                 continue
-            self._pending[name] = {"size": s.get("size", 0), "attempts": 0,
-                                   "next_try": 0.0}
+            p = self._pending.get(name)
+            if p is not None:
+                # Re-read the size from EVERY listing while the frame is still
+                # pending. It used to be frozen at first sight, so a frame
+                # listed while the SDK was still writing it carried a partial
+                # size forever: attempt 1 got the (now complete) bytes and
+                # failed `len(data) != size`, and so did all three retries -
+                # the frame was abandoned in exactly the case the retry horizon
+                # exists to ride out (audit 2026-08-23, R9).
+                p["size"] = s.get("size", p.get("size", 0))
+                continue
+            self._pending[name] = {
+                "size": s.get("size", 0), "attempts": 0,
+                # A RAW half is held back one listing so its JPEG sibling, if
+                # the body is delivering both, gets to be handled first and
+                # take the flight_log row. sorted() puts ".ARW" before ".JPG",
+                # so without this the row for a RAW+JPEG release would land on
+                # whichever half won the write race (R4).
+                "next_try": (now + self.RAW_SIBLING_GRACE_S
+                             if os.path.splitext(name)[1].lower()
+                             not in _ROW_EXTS else 0.0)}
             self._claim(name)
-        now = time.time()
-        for name in sorted(self._pending):
+        # Order: by release, and within a release the JPEG first. The first
+        # file of a release to be written defines the CamN_<instant> base name
+        # and takes the flight_log row; its siblings are archived beside it
+        # under the same stem with no second row (R4).
+        for name in sorted(self._pending,
+                           key=lambda n: (_cam_stem(n),
+                                          0 if os.path.splitext(n)[1].lower()
+                                          in _ROW_EXTS else 1, n)):
             p = self._pending.get(name)
             if p is None or p["next_try"] > now:
                 continue
@@ -409,8 +675,26 @@ class PullWorker(threading.Thread):
                     % (name, p["attempts"]), node=self.mon.name_, frame=name)
             else:
                 self.retries += 1
-                p["next_try"] = time.time() + self.BACKOFF_S[
-                    min(p["attempts"] - 1, len(self.BACKOFF_S) - 1)]
+                p["next_try"] = time.time() + self._retry_delay(p["attempts"])
+
+    def _retry_delay(self, attempts):
+        """Seconds before the next attempt at a frame that would not pull.
+
+        At least TWO monitor polls. A fast-failing download - ECONNREFUSED
+        while systemd restarts ilxctl - used to burn all four attempts in
+        ~1.1 s, well inside one 2 s NodeMonitor poll, so the OFFLINE gate at
+        the top of _poll_once (the thing that is supposed to protect in-flight
+        frames while a node reboots) never got the chance to engage and the
+        frame was abandoned for good (audit 2026-08-23, R9). Spacing the
+        retries past the poll means a node that has really gone away is seen
+        to have gone away, and its frames wait for it instead."""
+        base = self.BACKOFF_S[min(attempts - 1, len(self.BACKOFF_S) - 1)]
+        poll = getattr(self.mon, "poll", None)
+        try:
+            poll = float(poll)
+        except (TypeError, ValueError):
+            poll = 2.0
+        return max(base, 2.2 * max(0.1, poll))
 
     def _note_recent(self, name):
         with self._lock:
@@ -462,19 +746,58 @@ class PullWorker(threading.Thread):
         if ext in (".jpg", ".jpeg") and not (data[:2] == b"\xff\xd8"
                                              and data[-2:] == b"\xff\xd9"):
             return fail("error", "%s is not a complete JPEG (bad SOI/EOI)" % name)
-        # Best capture instant: (GPIO edge) > corrected EXIF > command epoch.
-        source, epoch, terr = self._capture_instant(name, data)
+        # One shutter release, one name. When the body delivers RAW+JPEG the
+        # second half is archived beside the first under the SAME stem instead
+        # of being renamed to its own (later) resolved instant, so the pair
+        # stays obviously a pair on disk and in the drain/ingest sidecars.
+        # Resolved BEFORE the capture instant, because a sibling must not
+        # resolve one at all: _capture_instant POPS a GPIO edge out of the
+        # monitor's buffer and can claim a command, and the sibling then
+        # discards both (row_frame is False below), which is how a late RAW
+        # half used to eat the next shot's edge (audit 2026-08-24).
+        stem = _cam_stem(name)
+        sib = self._stem_dest.get(stem)
+        base = sib[0] if (sib and time.time() - sib[1]
+                          <= self.RAW_SIBLING_WINDOW_S) else None
+        # Best capture instant: (GPIO edge) > corrected EXIF > command epoch,
+        # returned in the HOST clock domain (see _capture_instant), together
+        # with the fleet clock offset that conversion used. Cached on the
+        # pending record: resolving it POPS the frame's GPIO edge out of the
+        # monitor's buffer, so a write failure followed by a retry used to
+        # silently downgrade a gpio_edge/0 ms frame to exif or command - the
+        # harness-grade instant thrown away for a transient EIO (R9). Caching
+        # the OFFSET with it is what makes this frame's reverse conversions
+        # (match_rise, the strobe instant, the IMU window) exact rather than
+        # merely close: one number in, the same number out.
+        source = epoch = terr = clk_off = None
+        if base is None:
+            pend = self._pending.get(name)
+            cap = (pend or {}).get("cap")
+            if cap is None:
+                cap = self._capture_instant(name, data)
+                if pend is not None:
+                    pend["cap"] = cap
+            source, epoch, terr, clk_off = cap
         # The one place the GPS correction is applied: filename and datetime.
-        off, tsource = self.provider.time_base()
-        stamp = epoch + off
-        fname, dest = _uniq_dest(self.cam_dir,
-                                 _fmt_fname(self.cam_num, stamp, ext))
+        off, tsource = self._timebase
+        if base is not None:
+            fname, dest = _uniq_dest(self.cam_dir, base + ext)
+        else:
+            fname, dest = _uniq_dest(self.cam_dir,
+                                     _fmt_fname(self.cam_num, epoch + off, ext))
         try:
             with open(dest, "wb") as fh:
                 fh.write(data)
         except OSError as e:
             return fail("error", "write %s failed: %s" % (fname, e))
         self.pulled += 1
+        # The first file of a release owns the row; siblings only get the name.
+        row_frame = base is None
+        if row_frame:
+            self._stem_dest.pop(stem, None)          # keep insertion order
+            self._stem_dest[stem] = (os.path.splitext(fname)[0], time.time())
+            for k in list(self._stem_dest)[:-256]:
+                self._stem_dest.pop(k, None)
         # Dump the Pi's spool copy the instant the frame is verified on host
         # disk (size + JPEG SOI/EOI checked above): the survey delivers a
         # small JPEG per shot and, unpruned, the Pi's PC-save dir fills over a
@@ -491,13 +814,24 @@ class PullWorker(threading.Thread):
                 self.dump_fails += 1
         except Exception:  # noqa: BLE001
             self.dump_fails += 1
+        if not row_frame:
+            # A RAW sibling is not a second exposure: it must not add a
+            # flight_log row, a run.json index entry or a zero-length "shot
+            # interval" to the jitter figure. It is on disk beside its JPEG
+            # under the same stem, which is the whole record it needs (R4).
+            self.provider.events.emit(
+                "debug", "pull",
+                "%s archived as %s alongside its sibling - same exposure, no "
+                "second flight_log row" % (name, fname), node=self.mon.name_)
+            return True
         with self._lock:
             if self._last_cap is not None:
                 self.intervals.append(epoch - self._last_cap)
                 if len(self.intervals) > 500:
                     self.intervals.pop(0)
             self._last_cap = epoch
-        self._write_flight(fname, name, epoch, stamp, source, terr, tsource)
+        self._write_flight(fname, name, epoch, epoch + off, source, terr,
+                           tsource, clk_off)
         self.provider.on_frame(self.mon.name_, self.cam_num, fname, name, epoch)
         return True
 
@@ -511,49 +845,146 @@ class PullWorker(threading.Thread):
             "kept out of the transect" % name, node=self.mon.name_)
 
     def _capture_instant(self, name, data):
-        """(source, LOCAL epoch, error_s) for this frame.
+        """(source, HOST epoch, error_s) for this frame.
 
         Preference order is the contract's: GPIO EXPOSURE edge > corrected EXIF
-        > the command epoch. What changed is how the frame finds its command."""
-        cam_epoch = _exif_capture_epoch(data)
+        > the command epoch. What changed is how the frame finds its command.
+
+        CLOCK DOMAINS, and getting this wrong is a silent 19 cm position error.
+        Everything this method reasons WITH is on the NODE's clock: piagent
+        schedules fires against it, stamps every epoch_hw against it, and the
+        EXIF offset is calibrated against an edge that is on it. The host's
+        clock is a separate, undisciplined domain - the Mac measured 187 ms
+        behind the chrony-locked Pis and drifting ~60 ppm (2026-08-23) - and
+        nav's ring, the latched GPS offset and time.time() are all keyed to
+        THAT one. So the instant is converted on the way OUT, once, here: every
+        caller downstream (datetime, CamN_ filename, nav_snapshot, the
+        flight_log, run.json) is a host-domain caller. The offset's own
+        uncertainty is folded into time_err_ms rather than left implied - a
+        gpio_edge row is no longer allowed to claim 0.0 ms when the domain
+        conversion is worth more.
+
+        The offset is the FLEET's, never this node's own. A per-node estimate
+        would put (offset_cam1 - offset_cam2) straight into the inter-camera
+        spread the run browser computes from these very epochs - the difference
+        of two estimates worth ~RTT/2 each, against a 0.6 ms true skew and a
+        10 ms budget. See RunManager.fleet_clock_offset(). It is returned
+        alongside the instant so the row's own reverse conversions (match_rise,
+        the strobe instant, the IMU window) use the SAME number and round-trip
+        exactly."""
+        off = self.provider.fleet_clock_offset()        # fleet node - host
+        cerr = self.provider.fleet_clock_err()
+        cam_epoch, subsec = _exif_capture(data)
         corrected = self.provider.timesync.correct_exif(self.mon.name_, cam_epoch)
         cmd = self.cmd_epoch.get(name) or self._claim(name)
         # A claim this frame cannot own is worse than no claim: it hands the
         # frame the previous shot's edge, one shot period early, still labelled
         # capture_source=gpio_edge with time_err_ms=0. EXIF is coarse (whole
-        # seconds plus SubSec) but it is INDEPENDENT of the queue, so it can
-        # tell the two directions apart:
+        # seconds, unless the body wrote SubSec) but it is INDEPENDENT of the
+        # queue, so it can tell the two directions apart:
         #   command much OLDER than the frame  -> that fire's frame never landed
         #   command much NEWER than the frame  -> this frame was never scheduled
         #                                         (a body shutter press, the
         #                                         camera's own Interval REC)
+        edge = None
+        # One strike per FRAME, not per orphaned command. The budget is the
+        # "the cross-check itself is wrong" detector, and a frame that walks
+        # four commands off the queue in one call is ONE piece of evidence
+        # about the cross-check, not four: counting each pop burned the whole
+        # budget in two frames after a single ~3 s delivery gap (six unclaimed
+        # fires at 2 Hz), latched _plaus_off for the rest of the run and put
+        # every later frame back on the head-of-queue command it could not own
+        # (audit 2026-08-24).
+        struck = False
+        ed = None
         for _ in range(4):
-            if cmd is None or corrected is None or self._plaus_off:
+            if cmd is None or self._plaus_off:
                 break
-            tol = self._claim_tolerance()
-            delta = cmd["epoch"] - corrected
-            if delta > tol:
-                self._release_claim(name, requeue=True)
-                self.provider.events.emit(
-                    "debug", "capture",
-                    "%s exposed %.1fs before the oldest queued fire - treating "
-                    "it as an unscheduled frame" % (name, delta),
-                    node=self.mon.name_)
-                cmd = None
-                break
-            if delta < -tol:
-                if not self._orphan_claim(name, cmd, delta):
+            tol = self._claim_tolerance(subsec)
+            checkable = corrected is not None
+            if checkable:
+                delta = cmd["epoch"] - corrected
+                if delta > tol:
+                    self._release_claim(name, requeue=True, whole_stem=True)
+                    self.provider.events.emit(
+                        "debug", "capture",
+                        "%s exposed %.1fs before the oldest queued fire - "
+                        "treating it as an unscheduled frame" % (name, delta),
+                        node=self.mon.name_)
+                    cmd = None
                     break
-                cmd = self._claim(name)
-                continue
-            self._plaus_strikes = 0
-            break
-        if cmd is not None:
-            edge = self.provider.match_exposure_edge(
+                if delta < -tol:
+                    if not self._orphan_claim(name, cmd, delta,
+                                              strike=not struck):
+                        break
+                    struck = True
+                    cmd = self._claim(name)
+                    continue
+                self._plaus_strikes = 0
+            ed = self.provider.match_exposure_edge(
                 self.mon, expected=cmd["epoch"], fire_seq=cmd.get("fire_seq"),
                 after_seq=cmd.get("edge_seq"))
-            if edge is not None:
-                return "gpio_edge", edge, 0.0
+            edge = None if ed is None else ed["t"]
+            if edge is None or not checkable or abs(edge - corrected) <= tol:
+                break
+            # The edge piagent attributed to this command is not where the
+            # frame's own EXIF says it was exposed. fire_seq matching is
+            # identity between COMMAND and EDGE, never between FRAME and EDGE,
+            # so a command queue that is off by one produces a perfectly
+            # self-consistent lie: the wrong instant, labelled gpio_edge with
+            # time_err_ms 0. Put the edge back (it still belongs to whatever
+            # fire really produced it), orphan the claim and try the next
+            # command (audit 2026-08-23, R3).
+            edge_delta = edge - corrected
+            self.provider.events.emit(
+                "debug", "capture",
+                "%s: the EXPOSURE edge attributed to its claimed fire sits "
+                "%+.3fs from where the frame's own EXIF puts it (tolerance "
+                "%.2fs) - the command queue is off by one; re-claiming"
+                % (name, edge_delta, tol), node=self.mon.name_, frame=name)
+            self.provider.return_edge(self.mon, edge, cmd.get("fire_seq"),
+                                      err_s=ed.get("err_s", 0.0),
+                                      soft=ed.get("soft", False))
+            edge = ed = None
+            # Report the EDGE disagreement, not the (in-tolerance) command
+            # delta, so the orphan alert quotes the number that was wrong.
+            if not self._orphan_claim(name, cmd, -edge_delta,
+                                      strike=not struck):
+                break
+            struck = True
+            cmd = self._claim(name)
+        # The offset is the SHOT's, not the clock's. fleet_clock_offset() is
+        # latched on WALL TIME (FLEET_CLOCK_TTL_S), and the two halves of one
+        # stereo pair are pulled by two independent worker threads whose polls
+        # and downloads do not line up - so a fire boundary falling between
+        # them converted cam1 with L_k and cam2 with L_(k+1). That difference
+        # lands directly in the pair spread RunBrowser draws from these very
+        # epochs, and in the strobe window intersection. capture_once latches
+        # ONE number per shot and carries it on the command record, so both
+        # halves of a pair convert with the identical float by construction
+        # (audit 2026-08-24).
+        if cmd is not None and cmd.get("host_offset") is not None:
+            off = cmd["host_offset"]
+            if cmd.get("clock_err") is not None:
+                cerr = cmd["clock_err"]
+        if self._plaus_off and cmd is not None:
+            # The cross-check has been declared untrustworthy, so a claimed
+            # command is no longer evidence that this frame owns it. Matching
+            # by fire_seq here is identity between COMMAND and EDGE, never
+            # between FRAME and EDGE: it returned a real edge belonging to a
+            # different exposure and stamped the frame gpio_edge, time_err_ms
+            # 0, a whole shot period wrong, for the rest of the run. Match only
+            # against the frame's OWN evidence (audit 2026-08-24).
+            ed = (self.provider.match_exposure_edge(
+                      self.mon, expected=corrected, window=0.20)
+                  if corrected else None)
+            res = self._edge_result(ed, off, cerr, corrected)
+            if res is not None:
+                return res
+        elif cmd is not None:
+            res = self._edge_result(ed, off, cerr, corrected)
+            if res is not None:
+                return res
         else:
             # No fire command is queued for this frame, but the harness may still
             # have caught its EXPOSURE edge. That happens for every frame the
@@ -572,52 +1003,137 @@ class PullWorker(threading.Thread):
             # SubSec is good to ~10 ms, so a tight window costs nothing when the
             # camera gives sub-second precision, and when it does not the honest
             # answer is capture_source=exif rather than a confidently wrong edge.
-            edge = (self.provider.match_exposure_edge(
-                        self.mon, expected=corrected, window=0.20)
-                    if corrected else
-                    self.provider.match_exposure_edge(self.mon, expected=None))
-            if edge is not None:
-                return "gpio_edge", edge, 0.0
+            ed = (self.provider.match_exposure_edge(
+                      self.mon, expected=corrected, window=0.20)
+                  if corrected else
+                  self.provider.match_exposure_edge(self.mon, expected=None))
+            res = self._edge_result(ed, off, cerr, corrected)
+            if res is not None:
+                return res
         if corrected:
-            return "exif", corrected, self.provider.exif_err(self.mon.name_)
+            return "exif", corrected - off, \
+                (self.provider.exif_err(self.mon.name_) or 0.0) + cerr, off
         if cmd is not None:
             # The command instant itself. How far that can be from the true
             # exposure depends on how it was fired: a scheduled GPIO shot lands
             # within a few ms of its target (measured 0.59 ms mean skew, 1.8 ms
             # worst), a USB release anywhere in PROTOCOL.md's 0-200 ms.
-            return "command", cmd["epoch"], (0.2 if cmd["path"] == "usb"
-                                             else 0.025)
-        # Card-review pull: no command, no edge, no EXIF. RAW local time, so it
-        # stays in the same domain as every other epoch in this file.
-        return "command", time.time(), None
+            #
+            # Under _plaus_off the QUEUE ALIGNMENT is exactly what has been
+            # declared untrustworthy, so the dispatch bar understates the error
+            # by a whole shot period. Say so rather than publish 25 ms next to
+            # an instant that may belong to the shot before this one.
+            cerr_cmd = (0.2 if cmd["path"] == "usb" else 0.025) + cerr
+            if self._plaus_off:
+                cerr_cmd = max(cerr_cmd, self.provider.shot_period() or 0.0)
+            return "command", cmd["epoch"] - off, cerr_cmd, off
+        # Card-review pull: no command, no edge, no EXIF. Nothing on the node's
+        # clock was involved, so this one is already a host epoch and must NOT
+        # be converted. The offset travels as None, not 0.0: 0.0 is right for
+        # the reverse conversions _write_flight performs on values it received
+        # from the node (match_rise, the strobe instant - neither reached on
+        # this path), but the IMU leg converts a host epoch OUTWARD into the
+        # node domain to build its query, and 0.0 there asserts node == host
+        # and centres the +/-100 ms window a whole fleet offset (187 ms on this
+        # rig) into the node's past. None lets _write_flight supply the real
+        # offset for that leg (audit 2026-08-24).
+        return "command", time.time(), None, None
 
-    def _claim_tolerance(self):
+    def _edge_result(self, ed, off, cerr, corrected):
+        """One matched EXPOSURE edge -> a capture-instant tuple, or None.
+
+        None means "this edge is not the best answer for this frame"; the
+        caller falls through to its EXIF branch.
+
+        piagent publishes `hw_reject` for an edge it could not stamp in the
+        kernel, and the instant left over is the gpiomon pipe-read stamp: a
+        0.09-0.32 ms median with documented excursions into the hundreds of
+        ms, and nothing says which this one is. Two things follow.
+
+        The bar must be the excursion, not the clock error. Returning
+        gpio_edge with time_err_ms ~= the fleet clock error there is the
+        residual half of the epoch_hw blocker - the row asserts sub-ms
+        hardware timing it cannot support.
+
+        And it must not be called gpio_edge. That value is a promise other
+        code already reads as "measured": rigcore computes the strobe verdict
+        only when every member is gpio_edge (a ~13 ms window against a
+        possibly-250 ms error would be a guess wearing a measurement's
+        clothes) and rig_ui marks the pair spread as measured on the same
+        test. gpio_edge_soft keeps the instant - which is usually excellent -
+        while letting both of those keep being right for free.
+
+        EXIF is preferred only when it is genuinely TIGHTER: with
+        SubSecTimeOriginal it is worth ~10 ms and wins easily, but without it
+        DateTimeOriginal is quantised to a whole second and _claim_tolerance's
+        1.5 s would make the row WORSE than the soft edge. Compare the bars
+        rather than preferring one by rule (audit 2026-08-24, VERIFY)."""
+        if ed is None:
+            return None
+        t = ed["t"]
+        if not ed.get("soft"):
+            # The node's own bound on its kernel stamp (half the wall bracket
+            # it converted through). Sub-ms, so no visible change to a healthy
+            # row - but the bar stops being a pure clock number.
+            return "gpio_edge", t - off, cerr + ed.get("err_s", 0.0), off
+        soft_err = cerr + self.provider.EDGE_EPOCH_UNMEASURED_S
+        if corrected is not None:
+            # A MEASURED EXIF bar only. exif_err() is None until this body's
+            # clock has actually been calibrated, and the EXIF branch below
+            # reads that None as 0.0 - so comparing against it unmeasured
+            # would let a bar nobody has established beat a real edge every
+            # time. An unknown error is not a small one.
+            exif_err = self.provider.exif_err(self.mon.name_)
+            if exif_err is not None and exif_err + cerr < soft_err:
+                return None
+        return "gpio_edge_soft", t - off, soft_err, off
+
+    def _claim_tolerance(self, subsec=False):
         """How far a frame's EXIF may sit from its claimed fire command.
 
-        Wide enough to absorb the camera clock's own quantisation (whole-second
-        DateTimeOriginal when SubSec is absent) plus the ~25 ms EXIF-offset
-        calibration error, narrow enough to catch the one-shot-period shift that
-        a dropped frame causes."""
+        With SubSecTimeOriginal the camera clock is good to ~10 ms, so the
+        tolerance can be a fraction of the shot period and actually SEE a
+        one-period shift. Without it, DateTimeOriginal is quantised to a whole
+        second and nothing tighter than ~1.5 s can be asserted.
+
+        The old floor was 1.5 s for both cases. At the rig's 2 Hz survey rate
+        that is three shot periods, so one dropped frame shifted every later
+        frame by exactly one period - invisible to this check, and each frame
+        then took the previous shot's fire_seq-matched edge and was written as
+        capture_source=gpio_edge with time_err_ms 0 (audit 2026-08-23, R3)."""
         period = self.provider.shot_period()
+        if subsec:
+            return max(0.25, 0.45 * period)
         return max(1.5, 0.6 * period)
 
-    def _orphan_claim(self, name, cmd, delta):
-        """Discard a claimed command whose own frame never arrived."""
-        self._plaus_strikes += 1
+    def _orphan_claim(self, name, cmd, delta, strike=True):
+        """Discard a claimed command whose own frame never arrived.
+
+        `strike` is False for the second and later commands ONE frame walks
+        off the queue: the budget below counts frames that disagree with every
+        queued fire, which is the "the cross-check is wrong" signal, not the
+        commands a single recovering frame steps over."""
+        if strike:
+            self._plaus_strikes += 1
         if self._plaus_strikes > 5:
             self._plaus_off = True
-            # Five in a row means the cross-check itself is wrong - almost
-            # always an EXIF offset measured against the wrong frame - and
-            # eating the whole command queue on the strength of it would be
-            # worse than the off-by-one it defends against.
+            # Five frames in a row means the cross-check itself is wrong -
+            # almost always an EXIF offset measured against the wrong frame -
+            # and eating the whole command queue on the strength of it would be
+            # worse than the off-by-one it defends against. From here on a
+            # claim is not treated as proof of ownership either: see the
+            # _plaus_off branch in _capture_instant.
             self.provider.events.emit(
                 "error", "capture",
                 "EXIF disagrees with every queued fire on %s (last %+.1fs) - "
                 "the camera-clock offset is not trustworthy; command/frame "
-                "cross-checking is off for the rest of this run"
+                "cross-checking is off for the rest of this run. Later frames "
+                "on this camera are dated from their own EXIF (or an EXPOSURE "
+                "edge within 200 ms of it), never from a queued fire, so their "
+                "instants are honest but coarser"
                 % (self.mon.name_, delta), node=self.mon.name_)
             return False
-        self._release_claim(name, requeue=False)
+        self._release_claim(name, requeue=False, whole_stem=True)
         with self._lock:
             self.orphans += 1
             total = self.orphans
@@ -631,13 +1147,33 @@ class PullWorker(threading.Thread):
                 node=self.mon.name_, orphans=total)
         return True
 
-    def _write_flight(self, fname, orig, epoch, stamp, source, terr, tsource):
-        # nav and IMU are looked up with the RAW local epoch: both rings are
-        # keyed by local receive time, so handing them a GPS-corrected stamp
-        # blanks the columns as soon as the offset exceeds their staleness
-        # windows (3 s for nav, 100 ms for the IMU).
+    def _write_flight(self, fname, orig, epoch, stamp, source, terr, tsource,
+                      clk_off=None):
+        # `epoch` is an UNCORRECTED HOST epoch - _capture_instant has already
+        # taken the fleet clock offset out of it, and the GPS correction goes
+        # on only at the presentation boundary (`stamp`). nav's ring is keyed
+        # by host receive time, so it takes `epoch` as it stands; the IMU ring
+        # lives on the IMU NODE's clock, so imu_snapshot converts back for
+        # itself. Handing either a GPS-corrected stamp blanks the columns as
+        # soon as the offset exceeds their staleness windows (3 s for nav,
+        # 100 ms for the IMU).
+        #
+        # `clk_off` is the offset _capture_instant actually applied to THIS
+        # frame. Every reverse conversion below uses it rather than re-reading
+        # the fleet figure, so host->node->host is the identity for this row:
+        # with one number the IMU window lands exactly on the capture instant
+        # and [fall, rise] is exactly the measured shutter window. Re-reading
+        # would reintroduce, in miniature, the same estimate noise that using
+        # a per-node offset introduced wholesale.
+        # What was APPLIED to this instant, for the index. None on the
+        # card-review path, where the instant is already a host epoch and no
+        # conversion happened - recording an offset there would invite a
+        # post-processor to un-apply one that was never applied.
+        applied_off = clk_off
+        if clk_off is None:
+            clk_off = self.provider.fleet_clock_offset()
         nav = self.provider.nav_snapshot(epoch)
-        imu = self.provider.imu_snapshot(epoch)
+        imu = self.provider.imu_snapshot(epoch, off=clk_off)
         row = {k: "" for k in FLIGHT_HEADER}
         row.update({
             "filename": fname,
@@ -674,10 +1210,22 @@ class PullWorker(threading.Thread):
         # frame is strobe ∈ ⋂ over cameras of those windows
         # (docs/strobe-trigger.md §4.2). Both epoch_hw-derived.
         rise = None
+        # match_rise and piagent's strobe_epoch are both NODE-clock instants,
+        # and `epoch` is now a host one: convert with the SAME offset
+        # _capture_instant used, or [fall, rise] comes out shifted by the
+        # host-node offset and the strobe acceptance check - which intersects
+        # both cameras' windows against one strobe instant - judges the wrong
+        # window. One fleet offset for all of it, so the intersection is taken
+        # in a single consistent domain.
+        off_node = clk_off
         if source == "gpio_edge":
-            rise = self.provider.match_rise(self.mon, epoch,
+            rise = self.provider.match_rise(self.mon, epoch + off_node,
                                             (claim or {}).get("fire_seq"))
+            if rise is not None:
+                rise -= off_node
         strobe = (claim or {}).get("strobe_epoch")
+        if strobe:
+            strobe -= off_node
         if strobe and source == "gpio_edge" and rise \
                 and not (epoch <= strobe <= rise):
             self.provider.events.emit(
@@ -689,7 +1237,8 @@ class PullWorker(threading.Thread):
         self.provider.index_frame(self.cam_num, fname, orig, epoch, source,
                                   node=self.mon.name_,
                                   path=(claim or {}).get("path"),
-                                  rise=rise, strobe=strobe)
+                                  rise=rise, strobe=strobe,
+                                  clk_off=applied_off)
 
     def stats(self):
         with self._lock:
@@ -711,6 +1260,30 @@ def _r(v, n):
     return "" if v is None else round(v, n)
 
 
+def _applied_span(span):
+    """run.json's record of the offsets a run actually applied to its frames.
+
+    [first, last, min, max] as collected by index_frame, rendered as nulls
+    before any frame has landed. One live-read scalar could not describe it:
+    the applied number moves across a transect (this host free-runs ~60 ppm
+    and was seen to step 187 -> 69 ms), so a post-processor re-basing off a
+    single figure reintroduces the run's own drift (audit 2026-08-24)."""
+    span = list(span or [None, None, None, None])
+    return {"first": _r6(span[0]), "last": _r6(span[1]),
+            "min": _r6(span[2]), "max": _r6(span[3]),
+            "moved_ms": (None if span[2] is None or span[3] is None
+                         else _r6((span[3] - span[2]) * 1000.0, 2))}
+
+
+def _r6(v, n=6):
+    """round() for a JSON record: unknown stays null, never 0.000000.
+
+    _r's "" is a CSV blank. In run.json an unmeasured node rendered as 0.0
+    reads as "this node's clock agrees with the host exactly", which is a
+    measurement nobody made (audit 2026-08-24)."""
+    return None if v is None else round(v, n)
+
+
 class RunManager:
     def __init__(self, monitors, settings, timesync, events, nav, imu_node=None):
         self.monitors = monitors
@@ -729,6 +1302,11 @@ class RunManager:
         self.imu_node = imu_node
         self._imu_node_cache = None
         self._lock = threading.Lock()
+        # (offset, measured_at) for fleet_clock_offset(). Its own lock: the
+        # pull workers read it while holding nothing, and taking the run lock
+        # from a worker inverts the documented lock order.
+        self._fleet_clock = None
+        self._fleet_clock_lock = threading.Lock()
         self.draining = None       # node name while a card drain holds it
         self.active = None            # dict describing the current run
         self.workers = {}
@@ -755,6 +1333,8 @@ class RunManager:
         # instants as a net for the ones the listing raced.
         self._cal_names = {}
         self._cal_busy = {}
+        # node -> Lock. Only one calibration pass may hold a node at a time.
+        self._cal_locks = {}
         self._known_frames = {}
         # Sticky per-node GPIO capability and the rate limiters for the alerts
         # that would otherwise fire once per shot at 2 fps.
@@ -890,6 +1470,195 @@ class RunManager:
     def exif_err(self, node):
         return self.exif_uncertainty.get(node)
 
+    # ---- host <-> node clock ----------------------------------------------
+    # THE THIRD CLOCK. The two Pis are chrony-locked to each other (~0.6 ms)
+    # but nothing disciplines this host to them: measured 2026-08-23, the Mac
+    # was 187 ms behind NTP and drifting ~60 ppm. Every scheduled fire epoch,
+    # every GPIO edge epoch_hw and every piagent /health time.epoch is on the
+    # NODE clock; nav's ring, the GPS offset and time.time() are on the HOST
+    # clock. Treating them as one domain cost two separate defects on the live
+    # rig: the 0.30 s fire lead was overrun by the offset (both nodes reported
+    # late_ms ~33 ms on EVERY fire and skew degraded 0.59 -> 1.78 ms), and nav
+    # was looked up ~190 ms away from the true exposure - 19 cm at 1 m/s.
+    # NodeMonitor.clock_offset_s() is the filtered node-minus-host offset.
+    def _mon(self, node):
+        return node if hasattr(node, "name_") else \
+            next((x for x in self.monitors if x.name_ == node), None)
+
+    def _clock_offset_raw(self, node):
+        """That node's measured offset, or None when it has none.
+
+        Distinct from node_clock_offset()'s 0.0: "unmeasured" must not be
+        averaged into a fleet median as if the node agreed with this host,
+        which on a rig 187 ms off its Pis would drag the whole conversion
+        toward the wrong clock every time one node went quiet."""
+        fn = getattr(self._mon(node), "clock_offset_s", None)
+        if fn is None:
+            return None
+        try:
+            o = fn()
+        except Exception:  # noqa: BLE001
+            return None
+        return None if o is None else float(o)
+
+    def node_clock_offset(self, node):
+        """(node clock - host clock) in seconds for ONE node; 0.0 if unknown.
+
+        Diagnostics only - run.json's per-node clock record, and the fleet
+        median below. Nothing that stamps a capture instant may use it: see
+        fleet_clock_offset() for why a per-node estimate must never reach a
+        frame's epoch.
+
+        Unknown is deliberately 0.0 and not an exception: a node that has not
+        been polled yet, or an older rigcore without the filter, must degrade
+        to the previous behaviour rather than stop the survey."""
+        o = self._clock_offset_raw(node)
+        return 0.0 if o is None else o
+
+    def clock_err(self, node):
+        """Uncertainty of that node's offset, in seconds: half the best RTT in
+        the filter window. The offset is estimated from a request/response
+        midpoint, so an asymmetric path can bias it by up to RTT/2 - that is
+        the honest error bar to fold into a converted instant's time_err_ms."""
+        fn = getattr(self._mon(node), "clock_offset_info", None)
+        if fn is None:
+            return 0.0
+        try:
+            rtt = (fn() or {}).get("rtt_ms_best")
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return (float(rtt) / 2000.0) if rtt else 0.0
+
+    # A host clock this far from the nodes has already eaten the fire lead.
+    CLOCK_WARN_S = 0.1
+    # The correction is bounded. A wild offset is a broken clock, not a
+    # measurement: applying it would schedule fires minutes away (piagent
+    # refuses those anyway) or, negative and large, in the past.
+    CLOCK_CLAMP = (-1.0, 5.0)
+
+    def _median_clamped(self, offs):
+        offs = sorted(offs)
+        if not offs:
+            return 0.0
+        n = len(offs)
+        med = offs[n // 2] if n % 2 else (offs[n // 2 - 1] + offs[n // 2]) / 2.0
+        return max(self.CLOCK_CLAMP[0], min(self.CLOCK_CLAMP[1], med))
+
+    def common_clock_offset(self, mons):
+        """ONE node-minus-host offset for a shot, across its live members.
+
+        The median, never per-node. Firing each camera against its own offset
+        estimate would inject that estimate's noise straight into the
+        inter-camera skew - the single number this rig exists to keep under
+        10 ms - and the offsets are common-mode anyway (the Pis are chrony
+        peers; it is the host that has drifted). One shared value moves both
+        exposures together and cancels out of the skew entirely."""
+        return self._median_clamped(self.node_clock_offset(m) for m in mons)
+
+    # How long one fleet-offset latch is reused. The underlying figure is
+    # already an RTT-gated median over a 60 s window of node samples, so it
+    # cannot move meaningfully faster than this; the latch exists so every
+    # frame of ONE shot converts with the SAME number even though the two
+    # cameras' frames are pulled by two independent worker threads.
+    FLEET_CLOCK_TTL_S = 2.0
+
+    def _fleet_clock_members(self):
+        """The monitors the fleet offset is measured across.
+
+        This run's members while a run is open (that is the set the fire
+        schedule averages), the whole fleet otherwise - and in both cases only
+        the nodes that actually have a measurement, because an unmeasured node
+        reads 0.0 and would pull the median toward this host's own clock."""
+        run = self.active
+        names = set((run or {}).get("nodes") or ())
+        offs = [(m, self._clock_offset_raw(m)) for m in self.monitors]
+        mine = [o for m, o in offs
+                if o is not None and (not names or m.name_ in names)]
+        return mine or [o for _, o in offs if o is not None]
+
+    def fleet_clock_offset(self, mons=None):
+        """THE node-minus-host offset every host<->fleet conversion uses.
+
+        One number for the whole fleet, latched for FLEET_CLOCK_TTL_S, and the
+        same median the fire schedule targets with. Per-node offsets are the
+        trap: RunBrowser._pairs and the UI's jitter chip compute a pair's
+        inter-camera spread FROM the indexed capture epochs, so converting each
+        camera's frame with its OWN estimate makes the DISPLAYED skew carry
+        (offset_cam1 - offset_cam2) - the difference of two noisy estimates,
+        each worth about half that node's RTT (cam1 ~2.9 ms, cam2 ~10.3 ms) -
+        against a true skew of ~0.6 ms and a 10 ms budget. The docstring on
+        common_clock_offset() already made this argument for the fire schedule;
+        it holds with equal force for the instants those fires produce, and for
+        the strobe acceptance check, which intersects the two cameras'
+        [fall, rise] windows against one strobe instant. The offsets are
+        common-mode anyway - the Pis are chrony peers, it is the host that has
+        drifted - so one shared value cancels out of every inter-camera figure
+        exactly, and leaves only the (real, reported) host-domain shift.
+
+        Pass `mons` from the fire path to LATCH the shot's own value. That
+        latch is keyed on WALL TIME, which is not shot identity: capture_once
+        carries the latched number on each node's command record and
+        _capture_instant prefers it, so a scheduled frame converts with its own
+        shot's offset however late it is pulled. This TTL is the fallback for
+        frames that have no command at all - an unscheduled release, a card
+        review, a pre-adoption backlog."""
+        now = time.time()
+        if mons is None:
+            with self._fleet_clock_lock:
+                c = self._fleet_clock
+                if c is not None and now - c[1] < self.FLEET_CLOCK_TTL_S:
+                    return c[0]
+            offs = self._fleet_clock_members()
+        else:
+            offs = [o for o in (self._clock_offset_raw(m) for m in mons)
+                    if o is not None]
+            offs = offs or self._fleet_clock_members()
+        if not offs:
+            # Nothing measured anywhere - every node just dropped, or none has
+            # been polled yet. Hold the last latch rather than publishing 0.0:
+            # "no measurement" is not "the host agrees with the fleet", and
+            # latching 0.0 would step every instant of the next two seconds by
+            # the host's whole error (187 ms on this rig).
+            with self._fleet_clock_lock:
+                return self._fleet_clock[0] if self._fleet_clock else 0.0
+        off = self._median_clamped(offs)
+        with self._fleet_clock_lock:
+            self._fleet_clock = (off, now)
+        return off
+
+    def fleet_clock_err(self):
+        """The error bar on that ONE offset, in seconds.
+
+        The applied number is a median over the fleet, so it carries the
+        uncertainty of the worst contributor - reporting cam1's row as
+        +/-1.4 ms when the offset actually applied was pulled by cam2's
+        +/-5.2 ms estimate would be a smaller number than the truth. Both
+        halves of a pair get the same bar, which is what a shared conversion
+        means."""
+        run = self.active
+        names = set((run or {}).get("nodes") or ())
+        errs = [self.clock_err(m) for m in self.monitors
+                if (not names or m.name_ in names)
+                and self._clock_offset_raw(m) is not None]
+        return max(errs) if errs else 0.0
+
+    def _warn_host_clock(self, offset):
+        """Say once per run that this host's clock is eating the fire lead."""
+        if abs(offset) <= self.CLOCK_WARN_S:
+            return
+        run = self.active
+        key = "hostclock:%s" % ((run or {}).get("run_id") or "-")
+        if not self.warn_once(key, 0):
+            return
+        self.events.emit(
+            "warn", "host_clock",
+            "host clock is %.0f ms off the nodes - the fire schedule is being "
+            "corrected for it, but enable network time on this host (the Pis "
+            "are chrony-locked to each other and nothing disciplines the Mac). "
+            "Frame timestamps are converted to the host domain; nav and the "
+            "GPS offset stay comparable" % (offset * 1000.0),
+            offset_ms=round(offset * 1000.0, 1))
+
     # ---- what we have already seen on each camera --------------------------
     # Every frame name any worker has ever listed, per node, for the life of
     # this rigd. It is what lets an adopted worker tell "this was already on the
@@ -925,7 +1694,87 @@ class RunManager:
             return 0.0
 
     # ---- lifecycle --------------------------------------------------------
+    # A period this short guarantees a 409 on every other fire: piagent holds
+    # its fire lock from FOCUS_LEAD_MS before the target until the pulse ends,
+    # so two shots closer together than that overlap inside the node. Refused.
+    # Properties, not plain constants: SYNC_LEAD_S and FOCUS_LEAD_MS are
+    # declared further down the class body (with the measured skew curve that
+    # justifies them), so they do not exist yet at this point in it.
+    @property
+    def MIN_INTERVAL_S(self):
+        return self.FOCUS_LEAD_MS / 1000.0 + 0.08
+
+    # Below this there is no dispatch margin left - the request has to reach
+    # the node before (target - FOCUS lead - trigger latency) - so the grid
+    # runs on arrival time instead of on the schedule. Warned, not refused:
+    # bench work at 0.4 s is legitimate and the operator is told what it costs.
+    @property
+    def SAFE_INTERVAL_S(self):
+        return self.SYNC_LEAD_S + 0.2
+
+    MAX_INTERVAL_S = 3600.0
+    MAX_FRAMES = 100000
+
+    @staticmethod
+    def _clean_label(v):
+        """A label that can safely become a run_id, a directory and a CSV cell.
+
+        Control characters and newlines would break the events.log and the run
+        browser's own listing; _slug() then reduces whatever survives to
+        [A-Za-z0-9-_] for the directory name."""
+        lbl = "".join(c for c in str(v if v is not None else "")
+                      if c.isprintable()).strip()
+        return lbl[:60] or "transect"
+
+    def _validate_config(self, config):
+        """(normalised config, error). Refuse a run that cannot work.
+
+        start() used to store the client's dict verbatim: /api/run/start with
+        interval_s 0 spun the capture loop flat out with no sleep, spawning a
+        thread per iteration and flooding both piagents with fires that 409'd
+        each other, and a negative value did the same (audit 2026-08-23, R7).
+        The UI's own iv>0 check was the only guard anywhere."""
+        cfg = dict(config or {})
+        cfg["label"] = self._clean_label(cfg.get("label"))
+        warns = []
+        try:
+            frames = int(cfg.get("frames", 0) or 0)
+        except (TypeError, ValueError):
+            return None, "frames is not a number", warns
+        if not (0 <= frames <= self.MAX_FRAMES):
+            return None, ("frames %d is outside 0..%d (0 means 'until stopped')"
+                          % (frames, self.MAX_FRAMES)), warns
+        cfg["frames"] = frames
+        if cfg.get("auto_capture"):
+            try:
+                iv = float(cfg.get("interval_s", 2.0))
+            except (TypeError, ValueError):
+                return None, "interval_s is not a number", warns
+            if iv != iv or iv in (float("inf"), float("-inf")):
+                return None, "interval_s is not a finite number", warns
+            if iv < self.MIN_INTERVAL_S:
+                return None, ("interval_s %.3f is below the minimum %.2f s - "
+                              "the node holds its fire lock from %.0f ms before "
+                              "each target, so shots closer than that refuse "
+                              "each other" % (iv, self.MIN_INTERVAL_S,
+                                              self.FOCUS_LEAD_MS)), warns
+            if iv > self.MAX_INTERVAL_S:
+                return None, ("interval_s %.1f is above the maximum %.0f s"
+                              % (iv, self.MAX_INTERVAL_S)), warns
+            if iv < self.SAFE_INTERVAL_S:
+                warns.append(
+                    "interval_s %.2f is below the %.2f s that leaves the fire "
+                    "schedule its dispatch margin (SYNC_LEAD_S + 0.2); shots "
+                    "may run on arrival time rather than on the grid"
+                    % (iv, self.SAFE_INTERVAL_S))
+            cfg["interval_s"] = iv
+        return cfg, None, warns
+
     def start(self, config):
+        cfg, err, warns = self._validate_config(config)
+        if err:
+            return {"ok": False, "error": err}
+        config = cfg
         with self._lock:
             if self.active:
                 return {"ok": False, "error": "run already active",
@@ -979,14 +1828,35 @@ class RunManager:
             if self.nav:
                 self.nav.set_raw_hook(raw_hook)
             live = [m for m in self.monitors if m.is_connected()]
+            # run.json keeps only the LAST 2000 index entries, so a long
+            # transect loses its head - and ingest and stereo_check read that
+            # index to match card RAWs to frames. index.jsonl is the complete
+            # record: one JSON object per indexed frame, appended and flushed
+            # as the frame is written, so it survives a kill as well as a long
+            # line (audit 2026-08-23, contract C3).
+            try:
+                index_fh = open(os.path.join(root, "index.jsonl"), "a")
+            except OSError:
+                index_fh = None
+            self._cap_stop = threading.Event()
             run = {"run_id": rid, "root": root, "label": label,
                    "started": now, "config": config,
                    "time_off": time_off, "time_src": time_src,
                    "nodes": [m.name_ for m in live],
                    "events_fh": events_fh, "nmea_fh": nmea_fh,
+                   "index_fh": index_fh,
+                   # The capture loop's stop event, latched on the run it
+                   # belongs to: a calibration thread that finishes after this
+                   # run has been stopped must not arm the NEXT one (R5).
+                   "cap_stop": self._cap_stop,
                    "index": [], "alerts": [], "fired": {}, "orphans": {},
                    "skews_ms": [], "late_shots": 0, "failed_fires": 0,
-                   "unpaired_shots": 0, "fail_streak": {}, "paused_for": None}
+                   "unpaired_shots": 0, "fail_streak": {}, "paused_for": None,
+                   # [first, last, min, max] of the fleet clock offset actually
+                   # applied to a frame in this run. The applied number moves
+                   # (the host free-runs and can step), so run.json's single
+                   # scalar could not describe the transect it claimed to.
+                   "clk_applied": [None, None, None, None]}
             self.active = run
             self.workers = {}
             for m in live:
@@ -1017,19 +1887,23 @@ class RunManager:
             # re-baseline that used to follow marked whatever had landed in the
             # meantime as "already seen" - deleting real survey frames from the
             # transect. One ordered pass, then the loop.
-            self._cap_stop = threading.Event()
             self._calib_stop = threading.Event()
             self._calib_thread = threading.Thread(
-                target=self._calibrate_and_arm, args=(live, config), daemon=True)
+                target=self._calibrate_and_arm, args=(live, config, run),
+                daemon=True)
             self._calib_thread.start()
             # Keep watching for cameras that were not up at start.
             self._adopt_stop = threading.Event()
             self._adopt_thread = threading.Thread(target=self._adopt_loop,
                                                   daemon=True)
             self._adopt_thread.start()
+            for w in warns:
+                self.events.emit("warn", "run", w, run_id=rid)
             return {"ok": True, "run_id": rid, "nodes": run["nodes"],
                     "root": root, "time_source": time_src,
-                    "gps_offset_s": round(time_off, 3)}
+                    "gps_offset_s": round(time_off, 3),
+                    "warnings": warns,
+                    "host_offset_s": round(self.fleet_clock_offset(live), 6)}
 
     def _new_run_root(self, now, label):
         """A run_id whose directory does not already exist.
@@ -1112,7 +1986,11 @@ class RunManager:
         off, src = self._live_time_base()
         if src == run["time_src"] and abs(off - run["time_off"]) <= 0.05:
             return
-        if not self.warn_once("timebase", 0):
+        # Keyed by RUN, not by process. _warned_at is process-lifetime state
+        # and start() never cleared it, so only the FIRST transect of the day
+        # whose master clock moved mid-line got the alert; every later one was
+        # silently rate-limited out (audit 2026-08-23, R7).
+        if not self.warn_once("timebase:%s" % run["run_id"], 0):
             return
         self.events.emit(
             "warn", "timebase",
@@ -1251,6 +2129,8 @@ class RunManager:
             self.events.set_run_file(None)
             try:
                 run["events_fh"].close(); run["nmea_fh"].close()
+                if run.get("index_fh") is not None:
+                    run["index_fh"].close()
             except OSError:
                 pass
             self.active = None
@@ -1268,6 +2148,18 @@ class RunManager:
     SYNC_LEAD_S = 0.30
     # An EXPOSURE edge older than this cannot belong to a frame arriving now.
     EDGE_MAX_AGE_S = 30.0
+    # What an edge's `epoch` is worth when the node could NOT stamp it in
+    # hardware. piagent publishes epoch_hw (the kernel interrupt instant) and,
+    # when it has none, `hw_reject` saying why; the remaining `epoch` is
+    # Python's stamp after the gpiomon pipe read, whose latency is a measured
+    # 0.09 ms (cam1) / 0.32 ms (cam2) median WITH excursions into the hundreds
+    # of ms under load - and nothing measures which one this edge got. So the
+    # honest bar is the excursion scale, never the fleet clock error alone.
+    # Writing such an edge as capture_source=gpio_edge with time_err_ms ~= the
+    # clock error is the residual half of the 2026-08-24 epoch_hw blocker: the
+    # node stopped throwing good stamps away, but the host still dressed a
+    # software stamp as a hardware one (audit 2026-08-24, VERIFY).
+    EDGE_EPOCH_UNMEASURED_S = 0.25
     # A node reporting it fired further than this from its target is not merely
     # jittery: the whole point of handing every node one absolute instant is
     # that each busy-waits to it locally. Measured lateness is +0.1-0.3 ms mean.
@@ -1383,13 +2275,48 @@ class RunManager:
         The outcome of every fire is recorded and judged. `ok`, `late_ms` and
         `actual_epoch` used to be thrown away and this returned ok:True come
         what may, so a camera that stopped firing altogether raised nothing."""
+        run = self.active
+        members = list((run or {}).get("nodes") or ())
         live = [m for m in self.monitors if m.is_connected()]
-        if not live:
+        # EVERY run member is judged, not just the ones we can reach. A member
+        # that has dropped to not-connected (body off USB, ilxctl wedged, the
+        # Pi rebooted on the shared PoE feed) used to be silently absent from
+        # `live`: it produced no result, so it never accumulated a failed fire,
+        # fail_streak never reached 3, the pause never engaged, and the other
+        # camera shot the rest of the transect alone - 28 single-camera frames
+        # reported as unpaired_shots:1 (devrig, 2026-08-23). An unreachable
+        # member is a FAILED FIRE. It is not contacted: there is nothing to
+        # contact, and a doomed HTTP round trip per shot is what piled the
+        # backlog up in the first place.
+        offline = [n for n in members
+                   if n not in {m.name_ for m in live}]
+        if not live and not offline:
             return {"ok": False, "error": "no cameras connected"}
-        results = {}
+        results = {n: {"path": None, "ok": False, "error": "node offline"}
+                   for n in offline}
         threads = []
+        # The target is a NODE-clock instant. piagent busy-waits to it against
+        # the node's own clock, and this host's clock is not disciplined to
+        # theirs (187 ms behind, 2026-08-23), so a host-clock target arrived
+        # already 187 ms into its own 300 ms lead: both nodes reported
+        # late_ms ~33 ms on every fire and the realised skew degraded from
+        # 0.59 to 1.78 ms. One shared offset for the whole shot - never
+        # per-node - so it cancels out of the inter-camera skew.
+        # Latch this shot's fleet offset and CARRY IT ON THE COMMAND: the
+        # wall-time latch (FLEET_CLOCK_TTL_S) is not shot identity, and the two
+        # halves of one pair are converted by two independent worker threads
+        # whose polls and downloads do not line up - a fire boundary landing
+        # between them converted cam1 with this shot's number and cam2 with the
+        # next shot's, and that difference is exactly the pair spread the run
+        # browser displays. Carried on the record, both halves of a pair get
+        # the identical float by construction (audit 2026-08-24).
+        host_offset = self.fleet_clock_offset(live)
+        clock_err = self.fleet_clock_err()
+        self._warn_host_clock(host_offset)
         if target is None:
-            target = time.time() + self.SYNC_LEAD_S
+            target = time.time() + self.SYNC_LEAD_S + host_offset
+        else:
+            target = target + host_offset
 
         def _fire(m):
             w = self.workers.get(m.name_)
@@ -1407,7 +2334,9 @@ class RunManager:
                 # It is the EXPOSURE instant, not the trigger instant: each node
                 # is fired early by its own latency, so that is `target` for
                 # every camera - the whole point of the compensation.
-                rec = w.note_command(target, path="gpio") if w else None
+                rec = (w.note_command(target, path="gpio",
+                                      host_offset=host_offset,
+                                      clock_err=clock_err) if w else None)
                 body = {"at_epoch": target - lead, "pulse_ms": 5,
                         "focus_lead_ms": self.FOCUS_LEAD_MS}
                 strobe = self.get_strobe()
@@ -1459,9 +2388,14 @@ class RunManager:
                     "error": r.get("error")}
             else:
                 # No harness on this node: it cannot be scheduled, so it fires on
-                # arrival and its frames carry the usual USB uncertainty.
-                t = time.time()
-                rec = w.note_command(t, path="usb") if w else None
+                # arrival and its frames carry the usual USB uncertainty. The
+                # queued instant is still recorded on the NODE clock, like
+                # every other command epoch, so _capture_instant can compare it
+                # against edges and EXIF without mixing domains.
+                t = time.time() + host_offset
+                rec = (w.note_command(t, path="usb",
+                                      host_offset=host_offset,
+                                      clock_err=clock_err) if w else None)
                 r = m.shutter(af=af)
                 ok = r.get("ok", True) is not False
                 if not ok and w and rec is not None:
@@ -1488,13 +2422,31 @@ class RunManager:
                        if m.name_ == strobe.get("node")), None)
             fired_with_strobe = (sm is not None and sm in live
                                  and self._fire_path(sm) == "gpio")
+            # A strobe node that is fully OFFLINE (neither ilxctl nor piagent
+            # answering) has no flash to fire. Calling it anyway blocked every
+            # capture_once for the full timeout, piled shot threads past the
+            # backlog guard and defeated stop()'s 6 s barrier - the camera fire
+            # path was cut to a fail-fast timeout for exactly this reason and
+            # the strobe-only call kept a 10 s one (audit 2026-08-23, R10).
+            if sm is not None and not fired_with_strobe \
+                    and getattr(sm, "state", None) == rigcore.NodeMonitor.OFFLINE:
+                if self.warn_once("strobe_alone:%s" % sm.name_, 30):
+                    self.events.emit(
+                        "warn", "strobe_fail",
+                        "strobe node %s is offline - this shot is unlit; the "
+                        "flash is not being called" % sm.name_, node=sm.name_)
+                sm = None
             if sm is not None and not fired_with_strobe:
                 def _strobe_alone():
                     r = http_json("http://%s:8081/gpio/strobe" % sm.host,
                                   {"at_epoch":
                                    target + strobe["delta_ms"] / 1e3,
                                    "pulse_ms": strobe.get("pulse_ms", 5)},
-                                  timeout=10 + self.SYNC_LEAD_S)
+                                  # Same fail-fast budget as /gpio/fire: the
+                                  # pulse is scheduled, so anything past the
+                                  # lead plus the delta is a dead host.
+                                  timeout=max(2.0, self.SYNC_LEAD_S
+                                              + strobe["delta_ms"] / 1e3 + 1.5))
                     if not (isinstance(r, dict) and r.get("ok")):
                         if self.warn_once("strobe_alone:%s" % sm.name_, 30):
                             self.events.emit(
@@ -1514,13 +2466,23 @@ class RunManager:
                 th.start(); threads.append(th)
         for th in threads:
             th.join(timeout=35)
-        return self._judge_shot(target, results)
+        rep = self._judge_shot(target, results, roster=members)
+        # What was actually applied, so a transect can be re-based in post and
+        # an operator can see the correction rather than guess at it.
+        rep["host_offset_s"] = round(host_offset, 6)
+        return rep
 
-    def _judge_shot(self, target, results):
-        """Score one shot: who fired, how late, and how far apart they exposed."""
+    def _judge_shot(self, target, results, roster=None):
+        """Score one shot: who fired, how late, and how far apart they exposed.
+
+        `roster` is the run's full member list. A shot is judged against the
+        members the transect was started with, not against whoever happened to
+        answer: a member missing from `results` altogether is still a member
+        that did not expose, and the shot is still not a pair."""
         failed = {k: v.get("error") or "no response"
                   for k, v in results.items() if not v.get("ok")}
         fired = [k for k, v in results.items() if v.get("ok")]
+        expected = set(roster or ()) | set(results)
         # Only nodes that reported an exposure instant (the GPIO path) are
         # compared. A shot that mixes paths yields no skew figure rather than a
         # guessed one - the USB camera's degradation is reported as
@@ -1544,10 +2506,15 @@ class RunManager:
                         del run["skews_ms"][:-1000]
                 if failed:
                     run["failed_fires"] += len(failed)
-                    if fired:
-                        # Some members fired, some did not: this shot can
-                        # never be a pair. Count it so the summary says so.
-                        run["unpaired_shots"] += 1
+                if fired and len(fired) < len(expected):
+                    # Some members exposed and some did not: this shot can
+                    # never be a pair. Counted against the ROSTER, so a member
+                    # that produced no result at all (offline, never contacted)
+                    # is counted too - the old test needed a `failed` entry,
+                    # which a node that had dropped out of `live` never
+                    # produced, and 28 single-camera shots were reported as
+                    # unpaired_shots:1 (devrig, 2026-08-23).
+                    run["unpaired_shots"] += 1
                 for n in failed:
                     run["fail_streak"][n] = run["fail_streak"].get(n, 0) + 1
                 for n in fired:
@@ -1586,11 +2553,156 @@ class RunManager:
                 "target": round(target, 4), "fired": sorted(fired),
                 "failed": sorted(failed)}
 
-    def _start_capture_loop(self, config):
+    # Resume probing after a pause: 2 s, then doubling to a minute. A node
+    # that answers its health poll but refuses every fire must not be retried
+    # at shot rate - see _probe_fire.
+    RESUME_BACKOFF_S = (2.0, 60.0)
+
+    def _probe_fire(self, m):
+        """Fire ONE node on its own to prove it can still expose.
+
+        (ok, error). The resume test used to be "has /health answered since the
+        pause". A node whose piagent answers polls but refuses every fire - a
+        lost gpiod line, a stray /gpio/interval holding the fire lock, a body
+        that will not release - therefore resumed on EVERY poll, fired the
+        healthy camera three more times alone, hit the streak again and paused
+        again: a livelock that shot ~75% of the grid unpaired (audit
+        2026-08-23, R1). Health answering is necessary, not sufficient; the
+        streak is forgiven only by a fire that actually worked.
+
+        The probe fires the RETURNING node alone, never its partner, and its
+        frame is registered as a calibration exposure so this diagnostic can
+        never enter the transect as survey data."""
+        self.begin_calibration_fire(m.name_)
+        try:
+            before = self.spool_names(m)
+            if before is None:
+                # No baseline, so the frame this probe is about to produce
+                # could not be told apart from a survey frame that happens to
+                # land beside it. Refuse the probe rather than fire blind: the
+                # node simply stays paused and is probed again on the next
+                # backoff step.
+                self.events.emit(
+                    "warn", "capture_fail",
+                    "%s did not answer its shot listing - the resume probe is "
+                    "skipped: without a before-listing its own frame cannot be "
+                    "kept out of the transect" % m.name_, node=m.name_)
+                return False, "shot listing failed"
+            t_fire = time.time()
+            if self._fire_path(m) == "gpio":
+                r = http_json("http://%s:8081/gpio/fire" % m.host,
+                              {"at_epoch": time.time() + self.SYNC_LEAD_S
+                               + self.common_clock_offset([m]),
+                               "pulse_ms": 5,
+                               "focus_lead_ms": self.FOCUS_LEAD_MS},
+                              timeout=max(2.0, self.SYNC_LEAD_S
+                                          + self.FOCUS_LEAD_MS / 1000.0 + 1.5))
+                ok = bool(isinstance(r, dict) and r.get("ok"))
+            else:
+                # No harness on this node, so there is no /gpio/fire to probe
+                # with. Probe the path it would actually be fired on, or a
+                # USB-path camera could never clear its streak and the grid
+                # would stay paused for the rest of the line.
+                r = m.shutter(af=False)
+                ok = (r or {}).get("ok", True) is not False
+            # A fire whose ANSWER was lost may still have released the shutter.
+            # piagent's own comment names the case ("abandoned by the host's
+            # 2 s timeout"), and the whole quarantine used to hang off `ok`:
+            # the diagnostic exposure then landed after end_calibration_fire
+            # had already let the puller back on the node, was never named, and
+            # entered the transect as survey data with a real gpio_edge instant
+            # (audit 2026-08-24). Two things separate "may have fired" from
+            # "provably did not": the transport failed (an explicit refusal -
+            # 409 busy, "trigger line unavailable" - is piagent telling us it
+            # unclaimed the line), and enough time passed for the release,
+            # since the answer is only built after the pulse. ECONNREFUSED
+            # comes back in milliseconds and is left alone.
+            fired_maybe = (not ok and isinstance(r, dict)
+                           and bool(r.get("_unreachable"))
+                           and time.time() - t_fire >= self.SYNC_LEAD_S)
+            if ok or fired_maybe:
+                # Name the frame it produced before letting the puller back on
+                # the node, exactly as calibrate_trigger does.
+                named = self._name_probe_frame(m, before)
+                if fired_maybe:
+                    self.events.emit(
+                        "warn", "calibrate",
+                        "%s's resume probe was abandoned by its timeout (%s) "
+                        "but may still have released the shutter; %s is kept "
+                        "out of the transect as a probe exposure - it is still "
+                        "on the node and on the card"
+                        % (m.name_, (r or {}).get("error"),
+                           ", ".join(named) if named else "no new frame"),
+                        node=m.name_, frames=named)
+            return ok, (r or {}).get("error")
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+        finally:
+            self.end_calibration_fire(m.name_)
+
+    def _name_probe_frame(self, m, before):
+        """Wait for the probe's own frame and name it; returns those names.
+
+        The hold is REFRESHED on every unsuccessful pass, exactly as
+        _calibrate_trigger_node does. begin_calibration_fire stores an ABSOLUTE
+        expiry, and _probe_fire takes its hold before the before-listing and
+        the fire, both of which block - so the hold expired (listing + lead)
+        early, the puller went back on the node, claimed the probe frame first,
+        and note_calibration_frames could no longer name it (its recent_names
+        filter deliberately excludes anything the worker is already handling)
+        (audit 2026-08-24)."""
+        deadline = time.time() + self.CAL_QUIET_S
+        while time.time() < deadline:
+            time.sleep(0.05)
+            after = self.spool_names(m)
+            if after is not None:
+                named = self.note_calibration_frames(m.name_, before, after)
+                if named:
+                    return named
+            self.begin_calibration_fire(m.name_, hold_s=1.0)
+        after = self.spool_names(m)
+        if after is None:
+            self.events.emit(
+                "warn", "calibrate",
+                "%s stopped answering its shot listing during the resume probe "
+                "- the probe frame is unnamed and may enter the transect as "
+                "survey data" % m.name_, node=m.name_)
+            return []
+        named = self.note_calibration_frames(m.name_, before, after)
+        if not named:
+            # The listing worked and showed nothing new. Either the probe
+            # exposed nothing (the interesting diagnostic) or its frame was
+            # already claimed by the puller, in which case it is in the
+            # transect and nobody said so.
+            self.events.emit(
+                "warn", "calibrate",
+                "%s's resume probe produced no new frame within %.1fs - if it "
+                "did expose, that frame is unaccounted for and may be in the "
+                "transect as survey data" % (m.name_, self.CAL_QUIET_S),
+                node=m.name_)
+        return named
+
+    def _start_capture_loop(self, config, run_at_entry=None):
         period = float(config.get("interval_s", 2.0))
         count = int(config.get("frames", 0))
-        stopev = self._cap_stop
-        if stopev is None or stopev.is_set() or not self.active:
+        with self._lock:
+            run = self.active
+            # A calibration thread reaches its finally block long after the run
+            # that started it may have been stopped - and possibly after the
+            # NEXT run has started. Arming that run with THIS run's interval,
+            # frame budget and a stop event it does not own launched a second
+            # capture loop on somebody else's transect (audit 2026-08-23, R5).
+            # The loop is armed for the run it was calibrated for, or not at
+            # all.
+            if run_at_entry is not None and run is not run_at_entry:
+                self.events.emit(
+                    "info", "capture",
+                    "calibration finished after its run was stopped - not "
+                    "arming a capture loop (run %s is no longer active)"
+                    % (run_at_entry or {}).get("run_id"))
+                return
+            stopev = (run or {}).get("cap_stop") or self._cap_stop
+        if stopev is None or stopev.is_set() or not run:
             return                       # the run was stopped during calibration
 
         def _loop():
@@ -1608,34 +2720,65 @@ class RunManager:
                 # answers its health poll again.
                 dead = self._dead_fire_node()
                 if dead:
-                    # Resume test: a piagent health answer NEWER than the
-                    # pause means the node is back; forgive the streak and
-                    # let the next fire prove it.
                     m = next((x for x in self.monitors if x.name_ == dead), None)
                     with self._lock:
                         run = self.active
-                        pf = run and run["paused_for"]
-                        if pf and m is not None:
-                            snap = m.snapshot()
-                            seen = snap.get("last_seen") or 0
-                            if snap.get("health") and seen > pf["since"]:
-                                run["fail_streak"][dead] = 0
-                                dead = None
-                    if dead is None:
-                        continue
-                    with self._lock:
-                        run = self.active
-                        first = run and run["paused_for"]
-                        if run and not first:
-                            run["paused_for"] = {"node": dead,
-                                                 "since": time.time(),
-                                                 "after_shot": k}
-                    if not first:
+                        if not run:
+                            break
+                        pf = run["paused_for"]
+                        fresh = not pf or pf.get("node") != dead
+                        if fresh:
+                            pf = run["paused_for"] = {
+                                "node": dead, "since": time.time(),
+                                "after_shot": k,
+                                "backoff_s": self.RESUME_BACKOFF_S[0],
+                                "next_probe": (time.time()
+                                               + self.RESUME_BACKOFF_S[0])}
+                    if fresh:
                         self.events.emit(
                             "error", "capture_paused",
                             "%s stopped answering fires - capture paused "
                             "until it is back (other camera NOT fired alone)"
                             % dead, node=dead)
+                    # Resume needs TWO things, not one. A health answer newer
+                    # than the pause says the node is reachable; only a fire
+                    # that returns ok:true says it can still expose. Probing
+                    # on reachability alone livelocked (see _probe_fire).
+                    snap = m.snapshot() if m is not None else {}
+                    seen = snap.get("last_seen") or 0
+                    back = bool(snap.get("health")) and seen > pf["since"]
+                    if back and time.time() >= pf["next_probe"]:
+                        ok, err = self._probe_fire(m)
+                        if ok:
+                            with self._lock:
+                                run = self.active
+                                if run:
+                                    run["fail_streak"][dead] = 0
+                                    run["paused_for"] = None
+                            self.events.emit(
+                                "info", "capture_resumed",
+                                "%s answered a probe fire - capture resumed"
+                                % dead, node=dead)
+                            start = time.time() + 1.0   # re-anchor the grid
+                            g = 0
+                            continue
+                        with self._lock:
+                            run = self.active
+                            cur = run and run["paused_for"]
+                            wait_s = min(pf["backoff_s"] * 2,
+                                         self.RESUME_BACKOFF_S[1])
+                            if cur and cur.get("node") == dead:
+                                cur["backoff_s"] = wait_s
+                                cur["next_probe"] = time.time() + wait_s
+                        if self.warn_once("probe:%s" % dead, 30.0):
+                            self.events.emit(
+                                "warn", "capture_paused",
+                                "%s answers its health poll but refused a probe "
+                                "fire (%s) - staying paused; next probe in "
+                                "%.0f s. The camera is reachable and cannot "
+                                "expose: check the GPIO harness and the body"
+                                % (dead, err or "no response", wait_s),
+                                node=dead)
                     stopev.wait(min(period, 1.0))
                     start = time.time() + 1.0     # re-anchor the grid
                     g = 0
@@ -1694,8 +2837,9 @@ class RunManager:
         also notice (its poll can lag 10 s behind a node that just died) let
         a whole 8-shot budget fire into one camera before the pause engaged
         (validation-2, 2026-08-23). Resuming is where the health poll
-        belongs - see the loop: a health answer newer than the pause clears
-        the streak."""
+        belongs - see the loop: a health answer newer than the pause makes the
+        node eligible for a PROBE FIRE, and only a probe that returns ok:true
+        clears the streak (R1)."""
         with self._lock:
             run = self.active
             if not run:
@@ -1714,8 +2858,11 @@ class RunManager:
         A frame can be pulled seconds after the shutter fired, so stamping it
         with the current position would put the boat where it has since moved
         to. fix_at() reaches back to the sample nearest that instant and has
-        already computed UTM and the staleness/validity flags. `epoch` is a RAW
-        local epoch: nav's ring is keyed by local receive time."""
+        already computed UTM and the staleness/validity flags. `epoch` is an
+        uncorrected HOST epoch: nav's ring is keyed by host receive time, and
+        _capture_instant has already taken the node-clock offset out. Handing
+        it a node epoch matched every frame to a fix ~190 ms away from the true
+        exposure - 19 cm of boat travel at 1 m/s (audit 2026-08-23, R2)."""
         if not self.nav:
             return None
         try:
@@ -1760,24 +2907,44 @@ class RunManager:
         self._imu_node_cache = None
         return None
 
-    def imu_snapshot(self, epoch):
-        """Attitude at a RAW local capture instant. The IMU ring is stamped on
-        the node against the same chrony-disciplined clock, so a GPS-corrected
-        epoch here would fall outside every window and blank the columns."""
+    def imu_snapshot(self, epoch, off=None):
+        """Attitude at a HOST capture instant.
+
+        The IMU ring is stamped by piagent on the IMU NODE's clock, and the
+        capture instant arrives here in the host domain (_capture_instant
+        converts on the way out), so it is converted BACK for the query and
+        the returned sample is converted forward again. Skipping that put the
+        whole 200 ms window on the wrong side of the host-node offset - which
+        on this rig is 187 ms, i.e. the entire +/-100 ms window - and blanked
+        every attitude column while reporting an IMU stall (R2).
+
+        ONE offset for both legs, and `off` is the caller's own so a row's
+        round trip is exact. With the IMU node's PRIVATE estimate the two legs
+        were two different numbers whenever the estimate moved between them -
+        the window was centred a little off the instant it was supposed to be
+        centred on, and the sample came back stamped at an instant that is not
+        where it was looked for. The fleet median is also the RIGHT number
+        here: the IMU node is chrony-locked to the camera nodes, so its ring
+        and their edges are one domain, and it is the host that has drifted
+        away from all of them."""
         imu_mon = self.imu_monitor()
         if not imu_mon:
             return None
+        if off is None:
+            off = self.fleet_clock_offset()            # fleet node - host
+        at = epoch + off
         r = http_json("http://%s:8081/imu/window?t0=%.3f&t1=%.3f"
-                      % (imu_mon.host, epoch - self.IMU_MAX_AGE_S,
-                         epoch + self.IMU_MAX_AGE_S), timeout=4)
+                      % (imu_mon.host, at - self.IMU_MAX_AGE_S,
+                         at + self.IMU_MAX_AGE_S), timeout=4)
         samples = r.get("samples") if isinstance(r, dict) else None
         if samples:
             # nearest sample to the capture instant
-            best = min(samples,
-                       key=lambda s: abs(s.get("epoch", epoch) - epoch))
-            age = abs((best.get("epoch") or epoch) - epoch)
+            best = min(samples, key=lambda s: abs(s.get("epoch", at) - at))
+            age = abs((best.get("epoch") or at) - at)
             if age <= self.IMU_MAX_AGE_S:
                 best = dict(best)
+                if best.get("epoch") is not None:
+                    best["epoch"] = best["epoch"] - off      # host domain
                 best["_age_s"] = age
                 best["_node"] = imu_mon.name_
                 return best
@@ -1795,6 +2962,34 @@ class RunManager:
                              node=imu_mon.name_, frames=self._imu_gap)
         return None
 
+    @staticmethod
+    def _edge_stamp(e, hw_meta):
+        """(instant, err_s, soft) for one piagent EXPOSURE event, or None.
+
+        `soft` says the node could NOT stamp this edge in hardware, so the
+        instant is the gpiomon pipe-read stamp carrying an UNMEASURED latency
+        - the thing a capture instant must never silently be.
+
+        The three states are deliberately distinguished, because two of them
+        used to be indistinguishable here and needed opposite treatment:
+          * hw_meta absent          - an older piagent that never published the
+                                      hw fields. `epoch` is all there is and
+                                      always was; keep the previous behaviour.
+          * hw_meta, epoch_hw set   - the kernel instant, plus the node's own
+                                      error bar on it (hw_err_ms, sub-ms).
+          * hw_meta, epoch_hw null  - REFUSED (hw_reject names why). Soft.
+        """
+        t = e.get("epoch_hw")
+        if t is not None:
+            err = e.get("hw_err_ms")
+            return (t, (err / 1000.0) if isinstance(err, (int, float)) else 0.0,
+                    False)
+        t = e.get("epoch")
+        if t is None:
+            return None
+        # No epoch_hw. On an hw_meta node that is a refusal, not an old build.
+        return (t, 0.0, bool(hw_meta))
+
     def match_exposure_edge(self, mon, expected=None, window=0.20,
                             fire_seq=None, after_seq=None):
         """The GPIO EXPOSURE fall-edge epoch belonging to one frame, or None.
@@ -1808,7 +3003,12 @@ class RunManager:
             older piagent, and for frames the Jetson never scheduled.
         Draining the whole cursor and returning the LAST edge - as this once did
         - gives frame 1 frame 3's timestamp whenever more than one frame arrives
-        in a poll, and leaves frames 2 and 3 falling back to EXIF."""
+        in a poll, and leaves frames 2 and 3 falling back to EXIF.
+
+        Returns the whole buffer entry - {t, err_s, soft, ...} - not a bare
+        float: an edge the node could not stamp in hardware is worth a quarter
+        of a second, not the fleet clock error, and the caller cannot tell the
+        two apart from the instant alone (audit 2026-08-24, VERIFY)."""
         buf = getattr(mon, "_edge_buf", None)
         if buf is None:
             buf = mon._edge_buf = []
@@ -1816,20 +3016,24 @@ class RunManager:
                       % (mon.host, getattr(mon, "_edge_cursor", 0)), timeout=3)
         if isinstance(r, dict):
             mon._edge_cursor = r.get("next", getattr(mon, "_edge_cursor", 0))
+            # The version marker. Absent => a node running an older piagent,
+            # where `epoch` is the only stamp there has ever been and a null
+            # epoch_hw says nothing; present => this node refused THIS stamp
+            # and said why. Both look like "no epoch_hw" without it.
+            hw_meta = bool(r.get("hw_meta"))
             for e in r.get("events", []):
                 if e.get("edge") == "rise":
                     # End-of-exposure edges, kept separately: together with the
                     # fall they bound the shutter-open window the strobe
                     # acceptance check needs (strobe ∈ ⋂ [fall_i, rise_i]).
-                    t = e.get("epoch_hw")
-                    if t is None:
-                        t = e.get("epoch")
-                    if t is not None:
+                    st = self._edge_stamp(e, hw_meta)
+                    if st is not None:
                         rbuf = getattr(mon, "_rise_buf", None)
                         if rbuf is None:
                             rbuf = mon._rise_buf = []
-                        rbuf.append({"t": t, "i": e.get("i"),
-                                     "fire_seq": e.get("fire_seq")})
+                        rbuf.append({"t": st[0], "i": e.get("i"),
+                                     "fire_seq": e.get("fire_seq"),
+                                     "err_s": st[1], "soft": st[2]})
                         if len(rbuf) > 64:
                             del rbuf[:-64]
                     continue
@@ -1842,13 +3046,14 @@ class RunManager:
                 # load). That latency is uncorrelated between the two Pis, so it
                 # lands directly in the stereo pair's apparent skew and in the
                 # capture instant written to flight_log. Prefer the hardware
-                # stamp; fall back for a node still running an older piagent.
-                t = e.get("epoch_hw")
-                if t is None:
-                    t = e.get("epoch")
-                if t is not None:
-                    buf.append({"t": t, "i": e.get("i"),
-                                "fire_seq": e.get("fire_seq")})
+                # stamp; fall back to `epoch` for a node still running an older
+                # piagent - and, on a node that DOES publish hw_meta, mark that
+                # fallback `soft` so no caller can mistake it for a measurement.
+                st = self._edge_stamp(e, hw_meta)
+                if st is not None:
+                    buf.append({"t": st[0], "i": e.get("i"),
+                                "fire_seq": e.get("fire_seq"),
+                                "err_s": st[1], "soft": st[2]})
         # piagent's ring holds an hour of edges. Anything older than this frame
         # could plausibly be is not ours - it belongs to a bench test or an
         # earlier run - and pairing a frame with a minutes-old edge silently
@@ -1865,7 +3070,7 @@ class RunManager:
         if fire_seq is not None:
             for k, e in enumerate(buf):
                 if e.get("fire_seq") == fire_seq:
-                    return buf.pop(k)["t"]
+                    return buf.pop(k)
             # Its edge has not been read yet; do not fall back to a neighbour's.
             if after_seq is not None:
                 return None
@@ -1875,7 +3080,7 @@ class RunManager:
         if not cand:
             return None
         if expected is None:
-            return buf.pop(cand[0])["t"]
+            return buf.pop(cand[0])
         # Nearest edge to the instant this frame was scheduled to expose. The
         # window is far wider than the ~1 ms sync we achieve and far narrower
         # than the 500 ms between frames at 2 fps, so it cannot pick a
@@ -1883,7 +3088,34 @@ class RunManager:
         i = min(cand, key=lambda k: abs(buf[k]["t"] - expected))
         if abs(buf[i]["t"] - expected) > window:
             return None
-        return buf.pop(i)["t"]
+        return buf.pop(i)
+
+    def return_edge(self, mon, t, fire_seq=None, err_s=0.0, soft=False):
+        """Put a matched EXPOSURE edge back in the buffer, in time order.
+
+        match_exposure_edge POPS what it hands out, which is right: an edge
+        belongs to exactly one frame. But a fire_seq match is identity between
+        the COMMAND and the EDGE, never between the FRAME and the edge, so a
+        frame holding the wrong command takes a real edge that belongs to a
+        different frame. When the EXIF cross-check catches that, the edge has
+        to go back - dropping it would leave the frame that really produced it
+        with no edge at all (audit 2026-08-23, R3).
+
+        err_s/soft travel back with it. An edge that returns stripped of them
+        is re-handed to the next frame as a hardware-grade instant, which is
+        the very claim it failed to support (audit 2026-08-24, VERIFY)."""
+        buf = getattr(mon, "_edge_buf", None)
+        if buf is None:
+            buf = mon._edge_buf = []
+        i = len(buf)
+        while i > 0 and buf[i - 1]["t"] > t:
+            i -= 1
+        # i=None so after_seq bounding treats it as always-eligible: the index
+        # it came back with has already been consumed from the cursor.
+        buf.insert(i, {"t": t, "i": None, "fire_seq": fire_seq,
+                       "err_s": err_s, "soft": soft})
+        if len(buf) > 64:
+            del buf[:-64]
 
     def match_rise(self, mon, fall_t, fire_seq=None):
         """The end-of-exposure edge belonging to a frame whose fall edge is
@@ -1903,7 +3135,15 @@ class RunManager:
         limit = max(0.2, 3.0 * self._shutter_s(mon) + 0.05)
 
         def take(k):
-            t = buf.pop(k)["t"]
+            e = buf.pop(k)
+            t = e["t"]
+            # A rise the node could not stamp in hardware cannot close an
+            # exposure window: the window is ~13 ms and this stamp's error is
+            # unmeasured up to hundreds of ms, so the strobe acceptance check
+            # built on it would be a guess wearing a measurement's clothes.
+            # Leave the window unmeasured instead (audit 2026-08-24, VERIFY).
+            if e.get("soft"):
+                return None
             if 0 < t - fall_t <= limit:
                 return t
             if self.warn_once("rise_lost:%s" % mon.name_, 60):
@@ -1918,7 +3158,8 @@ class RunManager:
             for k, e in enumerate(buf):
                 if e.get("fire_seq") == fire_seq:
                     return take(k)
-        cand = [k for k, e in enumerate(buf) if 0 < e["t"] - fall_t <= limit]
+        cand = [k for k, e in enumerate(buf)
+                if 0 < e["t"] - fall_t <= limit and not e.get("soft")]
         if not cand:
             return None
         k = min(cand, key=lambda k: buf[k]["t"] - fall_t)
@@ -1949,6 +3190,23 @@ class RunManager:
     # and with PC-save off on the body no frame ever arrives at all.
     CAL_FRAME_WAIT_S = 12.0
 
+    def node_calibration_lock(self, node):
+        """One calibration at a time per node.
+
+        _cal_busy is a single per-node TIMESTAMP, not a counter, so two passes
+        overlapping on one node cancel each other: rigd's startup
+        calibrate_trigger and a run start's _calibrate_exif each call
+        begin/end_calibration_fire, and pass 1's end released the puller while
+        pass 2's frame was still landing - that frame then entered the transect
+        as survey data (audit 2026-08-23, R6). Serialising the passes removes
+        the nesting entirely, which is simpler than making the flag re-entrant
+        and also stops two passes fighting over the same body."""
+        with self._lock:
+            lk = self._cal_locks.get(node)
+            if lk is None:
+                lk = self._cal_locks[node] = threading.Lock()
+            return lk
+
     def begin_calibration_fire(self, node, hold_s=None):
         """A calibration exposure is about to happen (or is still landing)."""
         with self._lock:
@@ -1968,6 +3226,22 @@ class RunManager:
             if name not in names:
                 names.append(name)
             del names[:-128]
+
+    @staticmethod
+    def spool_names(m):
+        """The names in one node's save dir, or None if the listing failed.
+
+        Every calibration path below reasons by DIFFERENCE between two of
+        these. A failed listing flattened to an empty set is the dangerous
+        direction in BOTH of them: an empty `before` makes every frame already
+        on the node look like the one this fire just produced, and
+        note_calibration_frames() then hands those names to the puller as
+        calibration exposures - which DELETES real survey frames from the
+        transect, the outcome this file calls the one worse than a calibration
+        frame surviving in it. So the difference is only ever taken between
+        two listings that actually happened."""
+        shots = m.shots()
+        return None if shots is None else {s["name"] for s in shots}
 
     def note_calibration_frames(self, node, before, after):
         """Name the frames one calibration fire produced, and only those.
@@ -2017,7 +3291,7 @@ class RunManager:
             return True
         return run_at_entry is not None and self.active is not run_at_entry
 
-    def _calibrate_and_arm(self, live, config):
+    def _calibrate_and_arm(self, live, config, run_at_entry=None):
         """Run-start calibration, then release the survey capture loop.
 
         Ordered, not concurrent: the EXIF clock offset needs a frame it can
@@ -2026,7 +3300,8 @@ class RunManager:
         to) let the EXIF pass measure the camera clock against somebody else's
         exposure. Overlapping either with auto-capture was worse still."""
         stopev = self._calib_stop
-        run_at_entry = self.active
+        if run_at_entry is None:
+            run_at_entry = self.active
         try:
             ths = []
             for m in live:
@@ -2049,7 +3324,10 @@ class RunManager:
             self.events.emit("warn", "calibrate", "calibration failed: %s" % e)
         finally:
             if config.get("auto_capture"):
-                self._start_capture_loop(config)
+                # Tagged with the run this pass was started for: this thread
+                # can reach here seconds after the operator stopped that run
+                # and started another one (R5).
+                self._start_capture_loop(config, run_at_entry)
 
     def _adopt_calibrate(self, m):
         """Calibrate a camera that joined mid-transect, as far as is safe."""
@@ -2063,20 +3341,40 @@ class RunManager:
             w.primed.wait(timeout=8.0)
         if self._calib_over(self._calib_stop, run_at_entry):
             return
-        self._calibrate_exif(m)
-        if m.name_ in self.trig_latency:
-            return
         cap = self._cap_stop
-        if cap is not None and not cap.is_set() and self.shot_period():
-            # Trigger calibration fires five frames and holds FOCUS while it
-            # does - which AE-locks the body. Doing that in the middle of a
-            # running survey line corrupts the exposures around it, so say what
-            # the cost is instead and let the fleet median carry the node.
+        grid_live = (cap is not None and not cap.is_set()
+                     and bool(self.shot_period()))
+        if grid_live:
+            # CALIBRATE WITHOUT FIRING while the grid is running. _calibrate_exif
+            # takes a `before` listing, presses the USB shutter and names
+            # whatever is new - but with auto-capture live, a scheduled GPIO
+            # fire lands inside that same window on ~50% of shots at a 2 s
+            # period and on nearly every shot at 0.5 s. It sorts first by
+            # camera filename, so named[0] is the SURVEY frame: it is recorded
+            # as a calibration exposure and the puller then DELETES it from
+            # the transect, and the real calibration frame inherits its command
+            # and its GPIO edge (audit 2026-08-23, R5). A frame lost from the
+            # survey is worse than an unmeasured camera clock, and the cost of
+            # not measuring is bounded and sayable: frames without an EXPOSURE
+            # edge fall back to the command epoch. Trigger latency can still be
+            # adopted from the persisted per-body figure, which fires nothing.
+            reused = self._reuse_trig_latency(m)
             self.events.emit(
                 "error", "calibration_missing",
-                "%s joined mid-transect with no trigger-latency measurement of "
-                "its own; it will fire on the fleet median. Stop and restart "
-                "the line to calibrate it properly" % m.name_, node=m.name_)
+                "%s joined mid-transect while the capture grid is running: its "
+                "camera-clock (EXIF) offset is NOT being measured, because the "
+                "calibration shutter cannot be told apart from a survey fire "
+                "and would cost a real frame. Frames of its without an EXPOSURE "
+                "edge fall back to the command epoch (0-200 ms). %s Stop and "
+                "restart the line to calibrate it properly"
+                % (m.name_,
+                   "Trigger latency reused from this body's saved measurement."
+                   if reused else
+                   "It also has no trigger latency of its own and will fire on "
+                   "the fleet median."), node=m.name_)
+            return
+        self._calibrate_exif(m)
+        if m.name_ in self.trig_latency:
             return
         self.calibrate_trigger(nodes=[m])
 
@@ -2162,82 +3460,22 @@ class RunManager:
         for m in live:
             if self._calib_over(stopev, run_at_entry):
                 break
-            if hold_focus:
-                http_json("http://%s:8081/gpio/focus" % m.host, {"hold": True},
-                          timeout=8)
-            time.sleep(0.3)
-            lat = []
-            for _ in range(samples):
-                if self._calib_over(stopev, run_at_entry):
-                    break
-                r0 = http_json("http://%s:8081/gpio/exposure/events" % m.host,
-                               timeout=4)
-                cur = r0.get("next", 0) if isinstance(r0, dict) else 0
-                # Quiet the puller BEFORE the shutter, not after: on the live
-                # rig a frame is listed ~0.5 s after the release and the worker
-                # polls every 0.4 s, so "after" is already too late. Snapshot
-                # the save dir inside that quiet, immediately before the pulse.
-                self.begin_calibration_fire(m.name_)
-                named = []
-                try:
-                    before = {s["name"] for s in m.shots()}
-                    t_fire = time.time()
-                    r = http_json("http://%s:8081/gpio/fire" % m.host,
-                                  {"at_epoch": 0, "pulse_ms": 5}, timeout=10)
-                    if not r.get("ok"):
-                        self.events.emit("warn", "capture_fail",
-                                         "calibration fire on %s refused: %s"
-                                         % (m.name_, r.get("error")),
-                                         node=m.name_)
-                        continue
-                    # Watch for THIS fire's frame and name it the moment it
-                    # appears, rather than waiting out a flat second: the puller
-                    # is held off the node until it is named, and every extra
-                    # 100 ms of that is 100 ms a real frame taken during
-                    # calibration waits to be pulled.
-                    while time.time() < t_fire + 1.2:
-                        time.sleep(0.05)
-                        named = self.note_calibration_frames(
-                            m.name_, before, [s["name"] for s in m.shots()])
-                        if named:
-                            self.end_calibration_fire(m.name_)
-                            break
-                    # The exposure edge lands ~22 ms after the pulse and gpiomon
-                    # rings it within a millisecond, but give piagent a full
-                    # second from the fire before reading: this measurement is
-                    # the thing that aligns the two bodies.
-                    time.sleep(max(0.0, t_fire + 1.0 - time.time()))
-                    ev = http_json("http://%s:8081/gpio/exposure/events?since=%d"
-                                   % (m.host, cur), timeout=4)
-                    # piagent attributes each fall edge to the fire that caused
-                    # it, so use that identity when the node offers it rather
-                    # than assuming the first edge back is ours.
-                    falls = [e for e in (ev.get("events") or [])
-                             if e.get("edge") == "fall"
-                             and (r.get("fire_seq") is None
-                                  or e.get("fire_seq") is None
-                                  or e.get("fire_seq") == r.get("fire_seq"))]
-                    if falls and r.get("actual_epoch"):
-                        e0 = falls[0]
-                        lat.append((e0.get("epoch_hw") or e0.get("epoch"))
-                                   - r["actual_epoch"])
-                    if not named:
-                        # Slow body: still nothing. Name whatever has landed
-                        # while the node is STILL quiet - a second pass after
-                        # the puller is let back on would adopt a real survey
-                        # frame that arrived in the meantime and delete it from
-                        # the transect.
-                        self.note_calibration_frames(
-                            m.name_, before, [s["name"] for s in m.shots()])
-                finally:
-                    self.end_calibration_fire(m.name_)
-                time.sleep(0.2)
-            if hold_focus:
-                http_json("http://%s:8081/gpio/focus" % m.host, {"hold": False},
-                          timeout=8)
-            if lat:
-                lat.sort()
-                out[m.name_] = lat[len(lat) // 2]        # median, outlier-proof
+            # One calibration pass per node at a time: rigd's startup pass and
+            # a run start's pass used to overlap on the same body and cancel
+            # each other's puller quiet (R6).
+            lk = self.node_calibration_lock(m.name_)
+            if not lk.acquire(timeout=self.CAL_FRAME_WAIT_S):
+                self.events.emit(
+                    "warn", "calibrate",
+                    "another calibration is still running on %s - skipping the "
+                    "trigger-latency pass rather than interleaving two sets of "
+                    "calibration frames on one body" % m.name_, node=m.name_)
+                continue
+            try:
+                self._calibrate_trigger_node(m, samples, hold_focus, stopev,
+                                             run_at_entry, out)
+            finally:
+                lk.release()
         if out:
             now = time.time()
             self.trig_latency.update(out)
@@ -2268,6 +3506,133 @@ class RunManager:
                 nodes=missed)
         return out
 
+    def _calibrate_trigger_node(self, m, samples, hold_focus, stopev,
+                                run_at_entry, out):
+        """One node's TRIGGER->EXPOSURE latency pass. Caller holds its lock."""
+        if hold_focus:
+            http_json("http://%s:8081/gpio/focus" % m.host, {"hold": True},
+                      timeout=8)
+        time.sleep(0.3)
+        lat = []
+        try:
+            for _ in range(samples):
+                if self._calib_over(stopev, run_at_entry):
+                    break
+                r0 = http_json("http://%s:8081/gpio/exposure/events" % m.host,
+                               timeout=4)
+                cur = r0.get("next", 0) if isinstance(r0, dict) else 0
+                # Quiet the puller BEFORE the shutter, not after: on the live
+                # rig a frame is listed ~0.5 s after the release and the worker
+                # polls every 0.4 s, so "after" is already too late. Snapshot
+                # the save dir inside that quiet, immediately before the pulse.
+                self.begin_calibration_fire(m.name_)
+                named = []
+                try:
+                    before = self.spool_names(m)
+                    if before is None:
+                        # No before-listing, no way to tell this fire's frame
+                        # from a survey frame. Skip the sample rather than fire
+                        # a frame that cannot be kept out of the transect.
+                        self.events.emit(
+                            "warn", "calibrate",
+                            "%s did not answer its shot listing - skipping a "
+                            "trigger-latency sample rather than firing a frame "
+                            "that cannot be identified" % m.name_, node=m.name_)
+                        continue
+                    t_fire = time.time()
+                    r = http_json("http://%s:8081/gpio/fire" % m.host,
+                                  {"at_epoch": 0, "pulse_ms": 5}, timeout=10)
+                    if not r.get("ok"):
+                        self.events.emit("warn", "capture_fail",
+                                         "calibration fire on %s refused: %s"
+                                         % (m.name_, r.get("error")),
+                                         node=m.name_)
+                        continue
+                    # Watch for THIS fire's frame and name it the moment it
+                    # appears, rather than waiting out a flat second: the puller
+                    # is held off the node until it is named, and every extra
+                    # 100 ms of that is 100 ms a real frame taken during
+                    # calibration waits to be pulled.
+                    #
+                    # The deadline is CAL_QUIET_S, not the 1.2 s it used to be.
+                    # 1.2 s covers the Small JPEGs the rig ships with (~0.5 s
+                    # to list) but NOT the Original-size frames HANDOFF §3
+                    # names as the target: 14 MB over a Pi 4's USB lists at
+                    # ~1.5-2 s, so the quiet ended, the puller went back on the
+                    # node and pulled the calibration frame into the transect
+                    # as survey data - all five per node, with skipped_cal
+                    # still reading 0 (audit 2026-08-23, R6). Keep the node
+                    # quiet until the frame is SEEN or the bound expires.
+                    while time.time() < t_fire + self.CAL_QUIET_S:
+                        time.sleep(0.05)
+                        after = self.spool_names(m)
+                        named = ([] if after is None else
+                                 self.note_calibration_frames(
+                                     m.name_, before, after))
+                        if named:
+                            self.end_calibration_fire(m.name_)
+                            break
+                        # Keep refreshing the hold: begin_calibration_fire sets
+                        # an absolute expiry, and this loop can outlive the one
+                        # taken before the shutter.
+                        self.begin_calibration_fire(m.name_, hold_s=1.0)
+                    # The exposure edge lands ~22 ms after the pulse and gpiomon
+                    # rings it within a millisecond, but give piagent a full
+                    # second from the fire before reading: this measurement is
+                    # the thing that aligns the two bodies.
+                    time.sleep(max(0.0, t_fire + 1.0 - time.time()))
+                    ev = http_json("http://%s:8081/gpio/exposure/events?since=%d"
+                                   % (m.host, cur), timeout=4)
+                    # piagent attributes each fall edge to the fire that caused
+                    # it, so use that identity when the node offers it rather
+                    # than assuming the first edge back is ours.
+                    # A soft edge (no epoch_hw on a node that publishes the
+                    # hw fields) carries the gpiomon pipe-read latency, and
+                    # this median BECOMES each node's fire compensation - so
+                    # folding an unmeasured, per-node read latency in here
+                    # shifts one camera against the other for the whole run.
+                    # Skip the sample rather than bias the alignment; the
+                    # median is over five fires and tolerates losing some.
+                    hw_meta = bool(ev.get("hw_meta"))
+                    falls = [e for e in (ev.get("events") or [])
+                             if e.get("edge") == "fall"
+                             and not (hw_meta and e.get("epoch_hw") is None)
+                             and (r.get("fire_seq") is None
+                                  or e.get("fire_seq") is None
+                                  or e.get("fire_seq") == r.get("fire_seq"))]
+                    if falls and r.get("actual_epoch"):
+                        e0 = falls[0]
+                        lat.append((e0.get("epoch_hw") or e0.get("epoch"))
+                                   - r["actual_epoch"])
+                    if not named:
+                        # Slow body: still nothing. Name whatever has landed
+                        # while the node is STILL quiet - a second pass after
+                        # the puller is let back on would adopt a real survey
+                        # frame that arrived in the meantime and delete it from
+                        # the transect.
+                        after = self.spool_names(m)
+                        if after is not None:
+                            self.note_calibration_frames(m.name_, before, after)
+                        else:
+                            self.events.emit(
+                                "warn", "calibrate",
+                                "%s stopped answering its shot listing during "
+                                "trigger calibration - its calibration frame is "
+                                "unnamed and may enter the transect"
+                                % m.name_, node=m.name_)
+                finally:
+                    self.end_calibration_fire(m.name_)
+                time.sleep(0.2)
+        finally:
+            if hold_focus:
+                # Released in a finally: an exception here used to leave the
+                # body half-pressed (AE-locked) for the rest of the session.
+                http_json("http://%s:8081/gpio/focus" % m.host, {"hold": False},
+                          timeout=8)
+        if lat:
+            lat.sort()
+            out[m.name_] = lat[len(lat) // 2]        # median, outlier-proof
+
     def reset_edge_cursors(self):
         """Start each node's edge stream at 'now'.
 
@@ -2289,6 +3654,18 @@ class RunManager:
         node and therefore differentially between the two cameras."""
         stopev = self._calib_stop
         run_at_entry = self.active
+        # One calibration pass per node (R6): rigd's startup calibrate_trigger
+        # and this pass used to run concurrently on the same body, and pass 1's
+        # end_calibration_fire released the puller while pass 2's frame was
+        # still landing.
+        lk = self.node_calibration_lock(m.name_)
+        if not lk.acquire(timeout=self.CAL_FRAME_WAIT_S):
+            self.events.emit(
+                "warn", "calibrate",
+                "another calibration is still running on %s - the camera-clock "
+                "offset is not being measured this pass" % m.name_,
+                node=m.name_)
+            return
         r0 = http_json("http://%s:8081/gpio/exposure/events" % m.host, timeout=3)
         cur = r0.get("next", 0) if isinstance(r0, dict) else 0
         self.begin_calibration_fire(m.name_)
@@ -2297,7 +3674,20 @@ class RunManager:
             # held off and immediately before the release - so the window in
             # which an unrelated frame can land and be mistaken for ours is one
             # HTTP round trip rather than several.
-            before = {s["name"] for s in m.shots()}
+            before = self.spool_names(m)
+            if before is None:
+                # Without a before-listing this calibration frame could not be
+                # told apart from a survey frame, and naming a survey frame as
+                # calibration DELETES it from the transect. No measurement is
+                # worth that: leave the camera-clock offset unmeasured (frames
+                # then fall back to the command epoch, which is honest) and say
+                # so.
+                self.events.emit(
+                    "warn", "calibrate",
+                    "%s did not answer its shot listing - the EXIF calibration "
+                    "shutter is NOT fired; its camera-clock offset stays "
+                    "unmeasured" % m.name_, node=m.name_)
+                return
             t_cmd = time.time()
             rs = m.shutter(af=False)
             t_done = time.time()
@@ -2320,8 +3710,9 @@ class RunManager:
                 if time.time() < t_cmd + self.CAL_QUIET_S:
                     self.begin_calibration_fire(m.name_, hold_s=1.0)
                 time.sleep(0.05)
-                after = [s["name"] for s in m.shots()]
-                named = self.note_calibration_frames(m.name_, before, after)
+                after = self.spool_names(m)
+                named = ([] if after is None else
+                         self.note_calibration_frames(m.name_, before, after))
                 if not named:
                     continue
                 name = named[0]
@@ -2332,7 +3723,7 @@ class RunManager:
                                      "EXIF calibration frame unreadable on %s: %s"
                                      % (m.name_, err), node=m.name_)
                     return
-                cam = _exif_capture_epoch(data)
+                cam = _exif_capture(data)[0]
                 if not cam:
                     self.events.emit("warn", "calibrate",
                                      "no EXIF timestamp in %s's calibration "
@@ -2351,6 +3742,7 @@ class RunManager:
                 % (m.name_, self.CAL_FRAME_WAIT_S), node=m.name_)
         finally:
             self.end_calibration_fire(m.name_)
+            lk.release()
 
     def _true_exposure(self, m, cursor, t_cmd, t_done):
         """(true capture epoch, uncertainty_s) for the calibration frame.
@@ -2361,16 +3753,39 @@ class RunManager:
         cursor so this never consumes an edge a survey frame is waiting for."""
         ev = http_json("http://%s:8081/gpio/exposure/events?since=%d"
                        % (m.host, cursor), timeout=4)
+        # Hardware-stamped falls only. This value becomes the body's EXIF
+        # clock offset, which then dates every capture_source=exif frame of
+        # the run, so an unmeasured pipe-read latency folded in here is a
+        # standing per-node bias - not a one-frame error. When the node cannot
+        # stamp, take the command-epoch fallback below, which at least
+        # PUBLISHES its own error bar (audit 2026-08-24, VERIFY).
+        hw_meta = bool(ev.get("hw_meta"))
         falls = [(e.get("epoch_hw") or e.get("epoch"))
-                 for e in (ev.get("events") or []) if e.get("edge") == "fall"]
-        falls = [f for f in falls if f and f >= t_cmd - 0.05]
+                 for e in (ev.get("events") or []) if e.get("edge") == "fall"
+                 and not (hw_meta and e.get("epoch_hw") is None)]
+        # The FLEET offset, like every other host<->node conversion in this
+        # file. What comes out of here becomes the camera-clock offset that
+        # _capture_instant later compares node-domain edges and commands
+        # against; measuring it against a different (per-node) conversion than
+        # the one those comparisons use makes the EXIF tier disagree with the
+        # edge tier by the difference of two estimates.
+        off = self.fleet_clock_offset()                  # fleet node - host
+        falls = [f for f in falls if f and f >= t_cmd + off - 0.05]
         if falls:
-            return min(falls), 0.002
+            return min(falls), 0.002 + self.fleet_clock_err()
         # No harness (or no edge): PROTOCOL.md's fallback, command epoch + the
         # 20 ms hardware release lag + half the 4.5 ms curtain transit. The
         # dispatch itself is the error bar, so record it rather than imply this
         # is as good as an edge.
-        return t_cmd + 0.024, max(0.05, t_done - t_cmd)
+        #
+        # Returned on the NODE clock, like the edge branch above. This value
+        # becomes the EXIF offset (camera clock - true clock), and everything
+        # _capture_instant compares a corrected EXIF instant against - queued
+        # command epochs, EXPOSURE edges - is node-domain. Leaving the fallback
+        # on the host clock made the offset silently mean two different things
+        # depending on whether the harness happened to catch that one edge.
+        return t_cmd + off + 0.024, \
+            max(0.05, t_done - t_cmd) + self.fleet_clock_err()
 
     # ---- run.json / index -------------------------------------------------
     def note_orphan(self, node, n=1):
@@ -2383,7 +3798,7 @@ class RunManager:
         self.events.emit("debug", "frame", "%s <- %s" % (fname, orig), node=node)
 
     def index_frame(self, cam_num, fname, orig, epoch, source, node=None,
-                    path=None, rise=None, strobe=None):
+                    path=None, rise=None, strobe=None, clk_off=None):
         with self._lock:
             if self.active:
                 # Microseconds, not milliseconds: the capture instant is a
@@ -2406,7 +3821,42 @@ class RunManager:
                     # node's frame; the pair-level verdict joins it against
                     # every member's window when the run is browsed.
                     rec["strobe"] = round(strobe, 6)
+                if clk_off is not None:
+                    # The fleet clock offset THIS frame was converted with.
+                    # run.json's clock block used to carry one live-read scalar
+                    # and assert applied:true, but the applied number moves
+                    # across a transect - the host free-runs ~60 ppm and was
+                    # seen to STEP 187 -> 69 ms mid-session - so re-basing the
+                    # whole run with that scalar reintroduces up to the run's
+                    # own drift, undetectably. Six bytes a row makes the
+                    # re-base exact and a mid-run step visible by inspection
+                    # (audit 2026-08-24).
+                    rec["clk_off"] = round(clk_off, 6)
+                    span = self.active.setdefault("clk_applied",
+                                                  [None, None, None, None])
+                    if span[0] is None:
+                        span[0] = span[2] = span[3] = clk_off
+                    span[1] = clk_off
+                    span[2] = min(span[2], clk_off)
+                    span[3] = max(span[3], clk_off)
                 self.active["index"].append(rec)
+                # The complete, append-only index. run.json's "index" is
+                # capped at the last 2000 entries and is rewritten whole every
+                # ten frames; this one is one line per frame, flushed as it is
+                # written, so a 4000-shot transect and a run that is killed
+                # both keep every entry (contract C3). Readers prefer it and
+                # fall back to run.json's index when it is absent.
+                fh = self.active.get("index_fh")
+                if fh is not None:
+                    try:
+                        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                        fh.flush()
+                    except (OSError, ValueError, TypeError) as e:
+                        self.active["index_fh"] = None
+                        self.events.emit(
+                            "error", "run",
+                            "index.jsonl is no longer being written (%s) - "
+                            "run.json still holds the last 2000 frames" % e)
                 if len(self.active["index"]) % 10 == 0:
                     self._write_run_json()
 
@@ -2435,11 +3885,40 @@ class RunManager:
                         "failed_fires": run["failed_fires"],
                         "unpaired_shots": run.get("unpaired_shots", 0),
                         "paused_for": run.get("paused_for"),
+                        "host_offset_s": round(self.fleet_clock_offset(), 6),
                         "fired": dict(run["fired"]),
                         "orphan_fires": dict(run["orphans"]),
                         "trigger_latency_ms": {k: round(v * 1000, 2) for k, v
                                                in self.trig_latency.items()}},
-               "frames": len(run["index"]), "index": run["index"][-2000:],
+               # Which node-clock correction was applied to every capture
+               # instant in this run, so a transect recorded against a
+               # mis-set host clock can be understood (and re-based) in post
+               # rather than silently believed (audit 2026-08-23, R2).
+               # node_offsets_s is DIAGNOSTIC - what each node's own estimate
+               # said, and null (never 0.0) for a node with no measurement:
+               # node_clock_offset() flattens unknown to 0.0 so an unpolled
+               # node cannot stop a survey, but published beside a measured
+               # +0.187 that reads as "this node's clock agrees with the host
+               # exactly" - a phantom 187 ms inter-camera skew in the one
+               # record a post-processor re-bases from (audit 2026-08-24).
+               #
+               # host_offset_s is the offset in force as this document was
+               # written; applied_offset_s is the span actually applied across
+               # the run, because the host free-runs (~60 ppm here) and can
+               # step, so ONE scalar cannot describe a whole transect. The
+               # exact number each frame used is on the frame, in index.jsonl's
+               # "clk_off" - that is what makes a re-base exact.
+               "clock": {"node_offsets_s":
+                         {m.name_: _r6(self._clock_offset_raw(m))
+                          for m in self.monitors if m.name_ in run["nodes"]},
+                         "host_offset_s": round(self.fleet_clock_offset(), 6),
+                         "applied_offset_s": _applied_span(
+                             run.get("clk_applied")),
+                         "err_ms": round(self.fleet_clock_err() * 1000, 2),
+                         "applied": True},
+               "frames": len(run["index"]),
+               "index_jsonl": "index.jsonl",
+               "index": run["index"][-2000:],
                "stats": {n: w.stats() for n, w in self.workers.items()},
                "final": final, "written": time.time()}
         try:
@@ -2469,10 +3948,21 @@ class RunManager:
                              "failed_fires": run["failed_fires"],
                              "unpaired_shots": run.get("unpaired_shots", 0),
                              "paused_for": run.get("paused_for"),
+                             # The node-minus-host correction being applied to
+                             # this run's fire schedule and capture instants.
+                             "host_offset_s": round(
+                                 self.fleet_clock_offset(), 6),
                              "orphan_fires": dict(run["orphans"])},
                     "stats": {n: w.stats() for n, w in self.workers.items()}}
 
 
 def _slug(s):
-    return "".join(c if c.isalnum() or c in "-_" else "-"
-                   for c in str(s))[:40] or "run"
+    """The run-id alphabet. Delegates to rigcore.run_id_slug — one sanitiser.
+
+    This used to be a second copy of the logic, and the two disagreed on
+    exactly the labels that matter: str.isalnum() is True for 'é' and for
+    'サ', so the WRITER produced ids like "260815_1930_Récif-Nord" that the
+    READERS' _RUN_ID_RE refused — the transect could not be listed, opened or
+    finalised. Readers were widened to keep such runs browsable; the writer
+    stops producing them (audit 2026-08-23)."""
+    return rigcore.run_id_slug(s)

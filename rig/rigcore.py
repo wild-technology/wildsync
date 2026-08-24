@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from collections import deque
@@ -109,16 +110,24 @@ class EventLog:
     # survives while the disk cannot be consumed.
     MAX_BYTES = 16 * 1024 * 1024
 
-    def __init__(self, path=RIGD_LOG, ring=5000, max_bytes=MAX_BYTES):
-        self.path = path
+    def __init__(self, path=None, ring=5000, max_bytes=MAX_BYTES):
+        # path=None resolves the module global at CONSTRUCTION time. The old
+        # default (path=RIGD_LOG) was evaluated once, at class definition, so a
+        # harness that rebinds rigcore.RIGD_LOG to a temp home (devrig does)
+        # still appended its fake-fleet events to the operator's production
+        # ~/rig/rigd.jsonl — fake OFFLINE->CAM_CONNECTED transitions were found
+        # interleaved with real survey history in the live journal.
+        self.path = path or RIGD_LOG
         self.max_bytes = max_bytes
         self._ring = deque(maxlen=ring)
         self._seq = 0
         self._lock = threading.Lock()
         self._run_fh = None            # optional per-run events.log
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # self.path, NOT the argument: `path` is None on the default (resolve
+        # RIGD_LOG at construction) path and os.path.dirname(None) raises.
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         try:
-            self._bytes = os.path.getsize(path)
+            self._bytes = os.path.getsize(self.path)
         except OSError:
             self._bytes = 0
 
@@ -263,6 +272,38 @@ def free_mb(path):
         return int(st.f_bavail * st.f_frsize // (1024 * 1024))
 
 
+# ilxctl bounds /api/status: when it cannot take the SDK mutex within ~4.5 s it
+# answers {"connected":..,"busy":true,"model":"","id":"","log":[..]} and nothing
+# else, so a busy node still ANSWERS the monitor's 6 s poll instead of being
+# declared unreachable (camera.cpp X2). That body carries no property block -
+# no controlMode, no isoValue, no writable map - and every question the host
+# asks of a status reads a MISSING key as a No:
+#   * "is this body stuck in transfer mode?" - controlMode is absent, so no;
+#     but `connected` in that body is isConnected(), which is TRUE for a body
+#     wedged in RemoteTransfer, so it was promoted to CAM_CONNECTED, joined the
+#     run roster and was fired at while recording nothing.
+#   * "is filetype still RAW+JPEG?" - the key is absent, so every managed field
+#     reads as diverged and the whole vector is re-pushed into a body that is
+#     by definition too busy to take it (and into a transfer session the
+#     reconcile is contractually required to leave alone, PROTOCOL.md §"a body
+#     in transfer mode is left alone").
+# A status with no property block is not evidence about the camera, it is the
+# absence of evidence. Named here so both callers refuse to reason from it
+# (audit 2026-08-24).
+def _status_degraded(status):
+    """True when ilxctl answered without its property block (busy fallback)."""
+    if not isinstance(status, dict) or not status.get("busy"):
+        return False
+    # Keyed on isoValue, not on controlMode: isoValue is emitted
+    # unconditionally inside statusJson's `if (isConnected())` block (as 0 when
+    # the property read itself failed), so its absence is the durable marker of
+    # "no property block at all". Keyed this way the check still does the right
+    # thing if a later ilxctl adds controlMode to the degraded body - the
+    # transfer recovery then fires on it, and this stays true for everything
+    # else the body did not say.
+    return "isoValue" not in status
+
+
 # ---------------------------------------------------------------------------
 # Per-node monitor: OFFLINE -> REACHABLE -> CAM_CONNECTED, with auto-reconnect.
 # ---------------------------------------------------------------------------
@@ -277,6 +318,23 @@ class NodeMonitor(threading.Thread):
     # status kept reporting connected:true so the UI kept requesting live
     # view — observed live on cam2, 2026-08-23, after a live-view storm.
     ILX_DOWN = "ILX_DOWN"
+
+    # Clock-offset filter (contract C1). Eight samples at the 2 s poll is a
+    # ~16 s window - long enough to median out a single network hiccup, short
+    # enough to follow the host's ~60 ppm drift (0.06 ms/s: under 1 ms across
+    # the window). Older than a minute is not an offset any more, it is a
+    # memory of one, and the fire scheduler must not lean on it.
+    CLOCK_HIST_N = 8
+    CLOCK_MAX_AGE_S = 60.0
+
+    # How long a body may keep answering /api/status with no property block
+    # (see _status_degraded) before it stops counting as CAM_CONNECTED. Long
+    # enough to sit out an ordinary SDK stall - a card index build, the ~6 s
+    # SetDeviceProperty stall measured 2026-08-23 - which must NOT drop a
+    # healthy body out of a live run's roster; short enough that a body whose
+    # property table is locked by a stuck card write (slotStatus keeps reading
+    # OK) is not fired at for a whole transect. Ten polls at the 2 s cadence.
+    BUSY_HOLD_S = 20.0
 
     def __init__(self, node, events, poll=2.0):
         super().__init__(daemon=True)
@@ -293,11 +351,20 @@ class NodeMonitor(threading.Thread):
         self.status = {}             # last ilxctl /api/status
         self.health = {}             # last piagent /health
         self.clock = None            # {"offset_s","rtt_ms","at"} vs our clock
+        # Raw offset samples for clock_offset_s(). One sample is polluted by
+        # whatever the network did during that poll (rtt spikes land 1:1 in
+        # the midpoint estimate), so consumers get an RTT-gated median of the
+        # recent window, never the last raw point.
+        self._clock_hist = deque(maxlen=self.CLOCK_HIST_N)
         self.suspend_control = False # True while a card drain owns this node
+        self._suspended_prev = False # suspend_control as of the previous tick
         self._uptime = None          # piagent uptime_s from the last health
         self.rebooted_at = None      # epoch the node was last seen to restart
         self._connect_after = 0.0    # backoff gate
         self._backoff = 5.0
+        # Epoch of the first of the current streak of degraded (no property
+        # block) statuses, or None. See the BUSY_HOLD_S comment above.
+        self._busy_since = None
         self.last_seen = 0.0
         self.convergence = {"synced": None, "diverged": [], "last_check": 0}
 
@@ -321,7 +388,7 @@ class NodeMonitor(threading.Thread):
                              "node_transition",
                              "%s -> %s" % (self.state, new),
                              node=self.name_, **ctx)
-            if new == self.CONNECTED:
+            if new == self.CONNECTED and not self.suspend_control:
                 # Forget what we believe we pushed to this body. Fields with no
                 # readback key (filetype, imagesize, transsize, expcomp) are
                 # converged optimistically against this cache, so a body that
@@ -332,6 +399,15 @@ class NodeMonitor(threading.Thread):
                 # shoots the wrong file type for the whole survey. Clearing here
                 # is what makes PROTOCOL.md's "settings re-push + verify after
                 # every reconnect" actually true.
+                #
+                # NOT while suspend_control is held: a card drain flips the SDK
+                # session to RemoteTransfer and back, which reads here as a
+                # disconnect/reconnect although the body never lost power or
+                # reset — arming the forced exposure pass on that transition
+                # made every post-run auto-drain wipe a deliberate per-camera
+                # exposure split. A body that genuinely power-cycled during a
+                # drain is still caught afterwards by the in-pass reverted tell
+                # (its readable fields come back at factory values).
                 self._pushed = {}
                 # A body that went away may have reset. Exposure is normally
                 # exempt from the continuous reconcile (per-camera between
@@ -355,6 +431,7 @@ class NodeMonitor(threading.Thread):
         status = http_json(self.ilx + "/api/status", timeout=6)
         reachable = not status.get("_unreachable")
         pia_ok = not health.get("_unreachable")
+        degraded = reachable and _status_degraded(status)
         # The node's clock offset against ours, bounded by the poll's RTT.
         # Every scheduled fire and every epoch_hw edge lives on the NODE's
         # clock, so two nodes disagreeing with each other lands 1:1 in
@@ -363,8 +440,29 @@ class NodeMonitor(threading.Thread):
         clock = None
         if pia_ok and isinstance(health.get("time"), dict) \
                 and health["time"].get("epoch") is not None:
+            # piagent stamps time.epoch on ENTRY to /health and only then does
+            # its work (GPIO, IMU, statvfs, a listdir of the spool), publishing
+            # that duration as work_ms. It is carried here as a DIAGNOSTIC and
+            # deliberately NOT folded into offset_s. Writing the poll out as
+            #   t0 -> [SYN, SYN-ACK, request] -> A -> stamp -> work -> t1
+            # (http_json opens a fresh connection every poll, so the TCP
+            # handshake and piagent's accept + thread spawn + header parse, A,
+            # are both INSIDE the bracket), the midpoint estimator's bias is
+            # L + A/2 - work/2, not -work/2: three terms of the same order,
+            # only one of which we can measure. Correcting that one alone does
+            # not shrink the sum - on cam1 (2.9 ms poll RTT, sub-ms work) it
+            # turns a ~-0.4 ms error into a ~+0.6 ms one - and subtracting work
+            # from rtt_ms would shrink both the honest error bar run.py
+            # publishes as time_err_ms (rtt/2, which DOES bound the bias while
+            # work is inside it, and stops doing so once it is removed) and
+            # rigd's node_clock_skew noise floor, inviting false skew alarms on
+            # a 2.9 / 10.3 ms link pair. So: publish it, do not apply it
+            # (audit 2026-08-24; see clock_offset_info's work_ms/link_ms).
+            w = health["time"].get("work_ms")
             clock = {"offset_s": health["time"]["epoch"] - (t0 + t1) / 2.0,
-                     "rtt_ms": (t1 - t0) * 1000.0, "at": t1}
+                     "rtt_ms": (t1 - t0) * 1000.0, "at": t1,
+                     "work_ms": float(w) if isinstance(w, (int, float))
+                     and not isinstance(w, bool) else None}
         # A node that restarts announces nothing; its piagent uptime going
         # backwards is the only tell. On this rig that means a POWER loss
         # (PoE budget collapse under synchronized fires took cam1's Pi 5 down
@@ -389,8 +487,14 @@ class NodeMonitor(threading.Thread):
             self.health = {} if health.get("_unreachable") else health
             if clock is not None:
                 self.clock = clock
+                self._clock_hist.append(clock)
             if rebooted:
                 self.rebooted_at = time.time()
+            # How long ilxctl has been answering without a property block; any
+            # real answer (or a node that stops answering at all) ends the
+            # streak.
+            self._busy_since = (self._busy_since or time.time()) \
+                if degraded else None
             if reachable:
                 self.status = status
                 self.last_seen = time.time()
@@ -419,7 +523,21 @@ class NodeMonitor(threading.Thread):
         # RemoteTransfer mode (not shooting); the monitor must NOT try to
         # (re)claim it in remote mode - that races the drain on the SDK mutex
         # and thrashes both (observed 2026-08-23). Report state, do nothing.
-        if getattr(self, "suspend_control", False):
+        held = bool(getattr(self, "suspend_control", False))
+        if self._suspended_prev and not held:
+            # The drain has let go. It did NOT change any capture setting, so
+            # exposure stays per-camera (arming _exposure_force here is what
+            # made every post-run auto-drain wipe a deliberate split) - but the
+            # SDK session was torn down and rebuilt, so what we believe we
+            # pushed to the fields with no readback is no longer evidence.
+            # Drop the blind cache and let the next pass re-push and verify.
+            self._pushed = {}
+        self._suspended_prev = held
+        if held:
+            # A drain holds the SDK mutex for minutes at a time, so a degraded
+            # status is EXPECTED while it owns the body: that time must not
+            # count towards the busy hold below.
+            self._busy_since = None
             self._set_state(self.CONNECTED if bool(status.get("connected"))
                             else self.REACHABLE)
             return
@@ -441,6 +559,32 @@ class NodeMonitor(threading.Thread):
                 self._backoff = min(self._backoff * 1.6, 60.0)
                 self._connect_after = now + self._backoff
             return
+        # ...and the same body wedged in transfer mode answers the recovery
+        # above with NO controlMode at all when ilxctl is too busy to read its
+        # property table (see _status_degraded): the key is merely absent,
+        # which reads exactly like "not in transfer", while `connected` stays
+        # true because it is isConnected(). Promoting off that flag is how a
+        # camera that CANNOT shoot got into the run roster (audit 2026-08-24).
+        # A status with no property block can therefore never make a body
+        # CAM_CONNECTED. It HOLDS an existing CAM_CONNECTED for up to
+        # BUSY_HOLD_S - an ordinary SDK stall must not flap a healthy body out
+        # of a live run's roster - and anything else is REACHABLE: the daemon
+        # answered, the camera's state is unknown.
+        if degraded:
+            busy_s = time.time() - (self._busy_since or time.time())
+            if self.state == self.CONNECTED and busy_s < self.BUSY_HOLD_S:
+                return
+            if self.state != self.REACHABLE:
+                self.events.emit(
+                    "warn", "ilx_busy",
+                    "%s: ilxctl is answering /api/status with no property "
+                    "block - the SDK mutex is held (a stuck card write, an "
+                    "abandoned transfer session, a card index build). The "
+                    "camera's state is unknown, so it stays out of the fleet "
+                    "until ilxctl reports again" % self.name_,
+                    node=self.name_, busy_s=round(busy_s, 1))
+            self._set_state(self.REACHABLE)
+            return
         connected = bool(status.get("connected"))
         if connected:
             self._set_state(self.CONNECTED)
@@ -456,11 +600,32 @@ class NodeMonitor(threading.Thread):
                 r = http_json(self.ilx + "/api/connect", body={}, timeout=30)
                 if r.get("ok") is False or r.get("_unreachable"):
                     err = str(r.get("error") or "")
-                    # "already connected" after a USB drop means ilxctl kept a
-                    # dead handle (OnDisconnected leaves m_handle set, so
-                    # Camera::connect refuses). No retry can ever succeed;
-                    # back off to the ceiling and say what actually fixes it.
+                    # "already connected" is usually NOT a dead handle: ilxctl
+                    # runs with CrReconnecting_ON, so after a USB blip the
+                    # SDK's own auto-reconnect races our POST and wins — the
+                    # live journal carried 300 false "restart ilxctl" warnings
+                    # (with a 60 s backoff each) for what was a healthy body.
+                    # Re-read status once: if the body is claimed (or claiming)
+                    # this poll simply raced the SDK; say so quietly and keep
+                    # the normal cadence. Only a body that STAYS unclaimed
+                    # after answering "already connected" earns the dead-handle
+                    # diagnosis below.
                     if "already connected" in err.lower():
+                        st2 = http_json(self.ilx + "/api/status", timeout=6)
+                        if st2.get("connected") or st2.get("connecting"):
+                            self._backoff = 5.0
+                            self._connect_after = now + self._backoff
+                            self.events.emit(
+                                "info", "reconnect",
+                                "connect raced the SDK's own auto-reconnect - "
+                                "body already claimed, nothing to do",
+                                node=self.name_)
+                            return
+                        # Unclaimed and refusing to connect: ilxctl kept a
+                        # dead handle (OnDisconnected leaves m_handle set, so
+                        # Camera::connect refuses). No retry can ever succeed;
+                        # back off to the ceiling and say what actually fixes
+                        # it.
                         self._backoff = 60.0
                     else:
                         self._backoff = min(self._backoff * 1.6, 60.0)
@@ -483,6 +648,61 @@ class NodeMonitor(threading.Thread):
                     self._backoff = min(self._backoff * 1.6, 60.0)
                     self._connect_after = now + self._backoff
 
+    # ---- clock offset (contract C1) ---------------------------------------
+    # The Mac host's clock is NOT disciplined (measured 187 ms behind NTP,
+    # drifting ~60 ppm, 2026-08-23) while the nodes are chrony-locked to each
+    # other, so "node epoch minus host epoch" is a real, load-bearing quantity:
+    # the fire scheduler and nav lookups need it. A single raw sample rides
+    # whatever the network did during that poll, so the published figure is the
+    # median of the recent window with high-RTT samples gated out.
+    def clock_offset_s(self):
+        """Filtered node-minus-host clock offset in seconds, or None.
+
+        Median of the last up-to-8 samples that are younger than 60 s and whose
+        rtt_ms is within 2x the best rtt of that window; None when no usable
+        sample exists (node down, or nothing sampled for over a minute)."""
+        return self.clock_offset_info()["offset_s"]
+
+    def clock_offset_info(self):
+        """{offset_s, n, rtt_ms_best, age_s, work_ms, link_ms} — clock_offset_s
+        plus diagnostics: how many samples survived the gate, the best RTT in
+        the window, the age of the newest usable sample, and how much of that
+        best RTT was the node's own /health handler (work_ms) rather than the
+        link (link_ms). offset_s is NOT corrected with work_ms — see _tick."""
+        now = time.time()
+        with self._lock:
+            window = [s for s in self._clock_hist
+                      if isinstance(s.get("rtt_ms"), (int, float))
+                      and s.get("at") is not None
+                      and now - s["at"] <= self.CLOCK_MAX_AGE_S]
+        if not window:
+            return {"offset_s": None, "n": 0, "rtt_ms_best": None,
+                    "age_s": None, "work_ms": None, "link_ms": None}
+        best = min(s["rtt_ms"] for s in window)
+        # A loopback poll can measure 0.0 ms, and `rtt <= 2*0.0` would then
+        # admit only the other zero-RTT samples and call a one-sample median a
+        # filtered figure. Floor the gate so the comparison stays meaningful.
+        gate = max(2.0 * best, best + 0.5)
+        usable = [s for s in window if s["rtt_ms"] <= gate]
+        offs = sorted(s["offset_s"] for s in usable)
+        n = len(offs)
+        med = offs[n // 2] if n % 2 \
+            else (offs[n // 2 - 1] + offs[n // 2]) / 2.0
+        # How much of that best RTT was piagent's own /health handler (work_ms,
+        # stamped by the node) rather than the link. Diagnostic only: rtt_ms
+        # stays the measured round trip, because it is what run.py publishes as
+        # the instant's error bar (rtt/2) and what rigd's node_clock_skew uses
+        # as its noise floor. Without this split CLOCK_RTT_LIMIT_MS charges a
+        # slow HANDLER to the link and sends the operator to check the switch
+        # port, cable and PoE load for a fault that is on the Pi.
+        bw = next((s.get("work_ms") for s in window if s["rtt_ms"] == best),
+                  None)
+        return {"offset_s": med, "n": n, "rtt_ms_best": round(best, 3),
+                "age_s": round(now - max(s["at"] for s in usable), 3),
+                "work_ms": None if bw is None else round(bw, 3),
+                "link_ms": None if bw is None
+                else round(max(0.0, best - bw), 3)}
+
     # ---- convenience node calls ------------------------------------------
     def is_connected(self):
         with self._lock:
@@ -499,8 +719,22 @@ class NodeMonitor(threading.Thread):
         return http_json(self.ilx + "/api/store", {"dest": dest}, timeout=12)
 
     def shots(self):
+        """The node's PC-save listing, or None when the listing FAILED.
+
+        None is not a nicety. Returning [] for a failed call makes "the spool
+        is empty" indistinguishable from "I could not ask", and every caller
+        here reasons by DIFFERENCE against a previous listing: PullWorker's
+        run-start baseline (everything already on the node is not survey data)
+        and note_calibration_frames' before/after snapshot (what this fire just
+        produced). Fed an empty baseline, a worker treats every file already in
+        the save dir - old bench frames, never-dumped calibration frames, the
+        previous transect's leftovers - as NEW and pulls them into this
+        transect as survey data. Fed an empty `before`, a calibration fire
+        adopts every frame on the node and the puller DELETES them from the
+        survey. Callers must handle None; there is no safe default here, which
+        is exactly why the signal has to survive (audit 2026-08-24)."""
         r = http_json(self.ilx + "/api/shots", timeout=10)
-        return r if isinstance(r, list) else []
+        return r if isinstance(r, list) else None
 
     def shutter(self, af=False):
         return http_json(self.ilx + "/api/shutter", {"af": af}, timeout=30)
@@ -517,13 +751,17 @@ CONVERGE_FIELDS = {
     "shutter": ("shutter", "shutterValue"),
     "iso": ("iso", "isoValue"),
     "drive": ("drive", "driveValue"),
-    "filetype": ("filetype", None),
-    "imagesize": ("imagesize", None),
-    "transsize": ("transsize", None),
+    # The capture-format fields are readable on ilxctl builds that emit the
+    # <name>Value keys (contract C2, 2026-08-23) and BLIND on older builds. A
+    # blind field is converged optimistically against the last-pushed cache, so
+    # a body that silently declined filetype was reported "synced" while the
+    # transect recorded no RAW — with a readback we verify after every push and
+    # diverge honestly. See OPTIONAL_READBACK_FIELDS below for the gate.
+    "filetype": ("filetype", "filetypeValue"),
+    "imagesize": ("imagesize", "imagesizeValue"),
+    "transsize": ("transsize", "transsizeValue"),
     # RAW compression on the card (CrRAWFileCompressionType: 5 = LossLessL).
-    # Blind (no readback), converged from the last-pushed cache like the other
-    # format fields so both bodies write the same RAW and it survives a reboot.
-    "rawtype": ("rawtype", None),
+    "rawtype": ("rawtype", "rawtypeValue"),
     "store_dest": (None, "storeDest"),   # set via /api/store, read on storeDest
     # Focus MODE is fleet state (the rig is always MF - never AF, on any path),
     # so it converges like any other field: set via /api/focus/mode, read back on
@@ -546,9 +784,47 @@ CONVERGE_FIELDS = {
     "colortemp": ("colortemp", "colorTemp"),
 }
 
+# OPT-IN fields: same shape as CONVERGE_FIELDS, but deliberately NOT part of
+# the fleet's default vector. They are absent from DEFAULT_DESIRED, so they are
+# unmanaged (want.get(f) is None -> the reconcile skips them) until the
+# operator pins one through POST /api/settings; from then on they converge and
+# verify like any other field. Kept out of CONVERGE_FIELDS itself because that
+# table IS "what every camera always agrees on", and everything in it must have
+# a default.
+#   quality  CrJpegQuality (the JPEG half of RAW+JPEG)
+#   pcsave   RAW_J_PC_Save_Image - DisplayOnly (body-menu-only) on these
+#            bodies, so pinning it reports honestly as settings_unsettable
+#            rather than pretending to converge.
+OPTIONAL_CONVERGE_FIELDS = {
+    "quality": ("quality", "qualityValue"),
+    "pcsave": ("pcsave", "pcsaveValue"),
+}
+# Every field the reconcile pass walks. CONVERGE_FIELDS stays the fleet vector.
+ALL_CONVERGE_FIELDS = dict(CONVERGE_FIELDS, **OPTIONAL_CONVERGE_FIELDS)
+
 # Fields that older ilxctl builds do not know: absent readback key = node
 # predates the field, skip silently (see CONVERGE_FIELDS note).
 BUILD_GATED_FIELDS = ("wb_mode", "colortemp")
+
+# Fields whose readback key exists only on ilxctl builds from 2026-08-23 on
+# (contract C2: filetypeValue, imagesizeValue, transsizeValue, rawtypeValue,
+# qualityValue, pcsaveValue, expcompValue). Unlike BUILD_GATED_FIELDS these
+# ARE still converged on older builds — the key being absent falls back to the
+# blind last-pushed-cache behaviour instead of skipping the field, because an
+# un-upgraded node still has to end up shooting the survey's file type. The
+# new builds omit the key when the body did not answer the property read, so
+# a present key is always a real value, never a 0/-1 sentinel.
+OPTIONAL_READBACK_FIELDS = ("filetype", "imagesize", "transsize", "rawtype",
+                            "quality", "pcsave", "expcomp")
+
+
+def _readback_key(field, key, status):
+    """The /api/status key to trust for `field` on this body, or None (blind)."""
+    if not key:
+        return None
+    if field in OPTIONAL_READBACK_FIELDS and key not in status:
+        return None            # older ilxctl: no readback, blind-cache path
+    return key
 
 # Exposure is PER-CAMERA between explicit applies. The operator tunes one body
 # live (POST /api/exposure with a node key) and either pushes that exposure to
@@ -571,6 +847,12 @@ WRITABLE_KEY = {"store_dest": "storeDest", "focus_mode": "focusMode",
 # settable over USB. `storeDest` and `pcsave` report this on these bodies.
 ENABLE_DISPLAY_ONLY = 2
 
+# The built-in fallback IS pushed to every camera when desired.json is missing,
+# so it must be the survey-ready vector docs/FIELD-RUN.md documents (F8, 1/200,
+# ISO 400, MF, RAW+JPEG, imagesize S, transsize Small, rawtype LossLessL,
+# 5600 K, card+PC). It used to say filetype=1 (JPEG only) / imagesize=1 (L):
+# a lost desired.json silently converged the fleet to a configuration that
+# records NO RAW — the exact thing the field guide calls not-survey-grade.
 DEFAULT_DESIRED = {
     "aperture": 800,                 # f/8.0  (f x100)
     "shutter": shutter_encode(1, 200),
@@ -578,8 +860,8 @@ DEFAULT_DESIRED = {
     "expcomp": 0,
     "drive": DRIVE_SINGLE,
     "focus_mode": 1,                 # MF for a fixed survey rig
-    "filetype": 1,                   # JPEG
-    "imagesize": 1,                  # L
+    "filetype": 3,                   # RAW+JPEG (FIELD-RUN §4: full RAW on card)
+    "imagesize": 3,                  # S — the JPEG is a review proxy, RAW is data
     # transsize=1 (Small) delivers 1616x1080 = 1.7 MP / ~320 KB to the host;
     # transsize=0 (Original) delivers 9504x6336 = 60.2 MP / 14.1 MB (both
     # measured 2026-08-16). Small is a review thumbnail, NOT survey-grade
@@ -619,8 +901,26 @@ SETTING_BOUNDS = {
     "imagesize": (1, 3),             # L/M/S
     "transsize": (0, 1),             # Original/Small
     "store_dest": (1, 3),            # PC/card/both
+    # focus_mode carries a stronger rule than a range: see _validate_field —
+    # the rig is ALWAYS manual focus, so 1 (MF) is the only value that passes.
     "focus_mode": (1, 0xFFFF),
+    "quality": (1, 0xFFFF),          # CrJpegQuality — body choice list rules
+    "pcsave": (0, 0xFFFF),           # RAW_J_PC_Save_Image (body-menu-only)
 }
+# Desired-vector fields that are legal WITHOUT a DEFAULT_DESIRED entry.
+# quality/pcsave are optional (None/absent = unmanaged) so the fleet does not
+# start converging a property nobody asked to pin.
+OPTIONAL_DESIRED_FIELDS = ("expcomp", "focus_mode", "quality", "pcsave")
+
+# Readback keys the C++ side initialises to 0 / -1 and publishes even when the
+# body never answered the property read (camera.cpp statusJson defaults; a
+# transfer-mode or table-locked body reports driveValue:0, storeDest:0,
+# focusMode:0, whiteBalance:-1). A readback at or below the field's sentinel is
+# "not reported", never evidence that the body reverted — treating it as a
+# revert turned every such poll into a forced pass that wiped per-camera
+# exposure splits and re-armed the blind-field write storm.
+_REVERT_SENTINEL = {"drive": 0, "store_dest": 0, "focus_mode": 0,
+                    "wb_mode": -1, "colortemp": 0}
 # Where the body publishes its own legal values for a field, when it does.
 CHOICE_KEY = {"aperture": "apertureChoices", "shutter": "shutterChoices",
               "iso": "isoChoices", "drive": "driveChoices",
@@ -652,6 +952,8 @@ class SettingsManager:
         self.events = events
         self._lock = threading.Lock()
         self._load_note = None       # set by _load() when it fell back
+        self._load_bad = False       # True when the file existed but was junk
+        self._load_dropped = {}      # field -> why a loaded value was refused
         self.desired = self._load()
         self._auto = False           # exposure servo off by default (manual)
         # Staged preview state. Deliberately NOT persisted and NOT written to
@@ -660,12 +962,26 @@ class SettingsManager:
         # always an unpinned process.
         self._pending = {}           # field -> staged value, cam1 only
         self._pin = None             # {"node","since","until"} while previewing
+        if self._load_dropped:
+            self.events.emit(
+                "warn", "settings",
+                "desired.json values refused on load, built-in defaults kept "
+                "for: %s" % "; ".join("%s (%s)" % kv
+                                      for kv in self._load_dropped.items()),
+                rejected=dict(self._load_dropped))
         if self._load_note:
-            self.events.emit("warn", "settings", self._load_note,
+            self.events.emit("error" if self._load_bad else "warn",
+                             "settings", self._load_note,
                              desired=dict(self.desired))
-            # Write the fallback out immediately, so the next restart is at
-            # least reproducible rather than silently defaulting again.
-            self._save()
+            if not self._load_bad:
+                # No file at all: write the fallback out immediately, so the
+                # next restart is at least reproducible rather than silently
+                # defaulting again.
+                self._save()
+            # A file that EXISTED but would not parse is different: writing
+            # defaults over it destroyed the operator's only copy of the
+            # survey vector (K8). It has been renamed aside as .bad-<ts>; run
+            # on defaults in memory only until the operator saves settings.
 
     def _load(self):
         """Read the saved desired vector, falling back to the built-in defaults.
@@ -683,15 +999,46 @@ class SettingsManager:
         try:
             with open(DESIRED_PATH) as fh:
                 d = json.load(fh)
-            merged = dict(DEFAULT_DESIRED)
-            merged.update({k: v for k, v in d.items() if k in DEFAULT_DESIRED
-                           or k in ("expcomp", "focus_mode")})
-            return merged
+            if not isinstance(d, dict):
+                raise ValueError("not a JSON object")
         except Exception as e:  # noqa: BLE001
-            self._load_note = ("could not read %s (%s) - falling back to "
-                               "built-in defaults, which WILL be pushed to "
-                               "every camera" % (DESIRED_PATH, e))
+            # The file exists but cannot be used. The old code fell back AND
+            # immediately _save()d the defaults over it, destroying the
+            # operator's only copy of the survey vector for a trailing comma.
+            # Keep the evidence: rename it aside, run on built-in defaults in
+            # MEMORY ONLY, and let the operator's next explicit save (or a
+            # repaired file + restart) resolve it.
+            self._load_bad = True
+            bad = "%s.bad-%d" % (DESIRED_PATH, int(time.time()))
+            try:
+                os.replace(DESIRED_PATH, bad)
+                kept = "the unreadable file is kept at %s" % bad
+            except OSError as re_err:
+                kept = "the unreadable file could not be moved aside (%s)" \
+                    % re_err
+            self._load_note = ("could not read %s (%s) - running on built-in "
+                               "defaults IN MEMORY ONLY (they WILL be pushed "
+                               "to every camera); %s"
+                               % (DESIRED_PATH, e, kept))
             return dict(DEFAULT_DESIRED)
+        # Validate every loaded value the same way a POST would (no choice
+        # list: no camera may be connected yet). desired.json predates
+        # validation and has carried ISO 0 and hand-edits before; merging them
+        # verbatim re-pushed an illegal value to both bodies every 3 s and the
+        # readable-field mismatch turned every pass into a forced one.
+        merged = dict(DEFAULT_DESIRED)
+        for k, v in d.items():
+            if k not in DEFAULT_DESIRED and k not in OPTIONAL_DESIRED_FIELDS:
+                continue
+            clean, why = self._validate_field(k, v)
+            if why:
+                # The field falls back to its built-in default (focus_mode != 1
+                # is corrected to MF here - the operator rule outranks the
+                # saved file). Reported once via __init__'s warn event.
+                self._load_dropped[k] = why
+                continue
+            merged[k] = clean
+        return merged
 
     def _save(self):
         try:
@@ -757,6 +1104,16 @@ class SettingsManager:
             v = int(value)
         except (TypeError, ValueError):
             return None, "not a number: %r" % (value,)
+        if field == "focus_mode" and v != 1:
+            # Operator rule, not a preference: the rig is ALWAYS manual focus
+            # — AF on any path re-focuses the bodies independently and changes
+            # the stereo pair's interior orientation mid-survey. Verified live
+            # 2026-08-23: POST /api/focus/mode 2 put the whole fleet in AF-S
+            # and the lens positions moved on the excursion.
+            return None, ("focus_mode %d refused: the rig is always manual "
+                          "focus (MF, mode 1) - AF is never allowed on any "
+                          "path (operator rule; it silently changes the "
+                          "stereo geometry)" % v)
         if field == "shutter":
             num, den = shutter_decode(v)
             if num < 1 or den < 1:
@@ -788,7 +1145,7 @@ class SettingsManager:
         applied, rejected = {}, {}
         prim, status = self._primary_status()
         for k, v in (changes or {}).items():
-            if k not in DEFAULT_DESIRED and k not in ("expcomp", "focus_mode"):
+            if k not in DEFAULT_DESIRED and k not in OPTIONAL_DESIRED_FIELDS:
                 rejected[k] = "not a settings field"
                 continue
             clean, why = self._validate_field(k, v, prim, status)
@@ -813,22 +1170,67 @@ class SettingsManager:
             # A preview is a proposal about the vector that just changed
             # underneath it. Holding the pin here would leave cam1 on an
             # exposure nobody asked for while the fleet moved to a new one.
+            released = None
             if not _staged:
-                self._release_pin("desired changed while a preview was pinned",
-                                  reconcile=False)
-            self.reconcile_all(force=True)
+                released = self._release_pin(
+                    "desired changed while a preview was pinned",
+                    reconcile=False)
+            # Exposure is only forced onto the fleet for the exposure fields
+            # the caller actually applied. `force` used to be one boolean that
+            # both cleared the blind cache and re-forced ALL of exposure, so a
+            # format/WB/focus-mode apply (the UI's format panel sends e.g. just
+            # {"colortemp": 5000}) silently overwrote a deliberate per-camera
+            # exposure split on every body with nothing in the log to say so.
+            exp = sorted(set(applied) & set(EXPOSURE_FIELDS))
+            self.reconcile_all(force=True, exposure=exp or False)
+            if released:
+                # Dropping the pin above is not enough: the pass we just ran
+                # writes ONLY the exposure fields this apply touched, so a
+                # format/WB/focus-mode apply (exp == []) wrote no exposure to
+                # anyone and left the previewed body sitting on the preview's
+                # ISO forever - with the pin, the preview badge, the
+                # preview_pinned anomaly and rigd's run-start discard all gone
+                # in the same instant, so nothing pulled it back and nothing
+                # said so. Even a partial exposure apply leaves the staged
+                # fields it did not name. Re-converge the released camera, and
+                # only it, exactly as _release_pin's own reconcile path does:
+                # scoped to one node, so a deliberate split on the OTHER body
+                # is still safe (K2) (audit 2026-08-24).
+                self.reconcile_all(force=True, exposure=True,
+                                   nodes=(released,))
         return {"applied": applied, "rejected": rejected}
 
     def bump_ev(self, steps):
         """EV compensation nudge during a survey: ±1/3-stop steps."""
+        # bump_ev used to write desired directly, bypassing the ±5000 mEV
+        # bound update() enforces for the same field: 16 presses of +1/3 put a
+        # persisted, illegal 6660 mEV on disk that every force pass then sent
+        # to the bodies (ilxctl truncates it to UInt16 on the wire). Validate
+        # the RESULT like any other apply, clamping to the legal range so the
+        # 16th press pins at +5 EV instead of poisoning desired.json.
+        try:
+            steps = max(-30, min(30, int(steps)))
+        except (TypeError, ValueError):
+            steps = 0
+        lo, hi = SETTING_BOUNDS["expcomp"]
+        clamped = False
         with self._lock:
-            self.desired["expcomp"] = int(self.desired.get("expcomp", 0)
-                                          + steps * 333)
-            cur = self.desired["expcomp"]
+            want = int(self.desired.get("expcomp", 0) + steps * 333)
+            clean, why = self._validate_field("expcomp", want)
+            if why:
+                clean = max(lo, min(hi, want))
+                clamped = True
+            self.desired["expcomp"] = clean
+            cur = clean
             self._save()
-        self.events.emit("info", "settings", "EV bump %+d/3 -> %+d mEV"
-                         % (steps, cur))
-        self.reconcile_all(force=True)
+        self.events.emit("info", "settings", "EV bump %+d/3 -> %+d mEV%s"
+                         % (steps, cur,
+                            " (clamped to the ±%d mEV limit)" % hi
+                            if clamped else ""))
+        # Only expcomp was asked for: forcing the whole exposure vector here
+        # wiped a deliberate per-camera aperture/shutter/ISO split on every
+        # EV nudge (K2).
+        self.reconcile_all(force=False, exposure=("expcomp",))
         return cur
 
     # ---- staged preview: try it on cam1, then deploy to the fleet ----------
@@ -846,6 +1248,10 @@ class SettingsManager:
     # starts, it is dropped when `desired` changes underneath it, and it exists
     # only in memory so a rigd restart clears it. A forgotten preview can
     # therefore cost at most one TTL of mismatched pairs, never a whole survey.
+    # Every one of those releases must also RE-CONVERGE the camera that was
+    # pinned - dropping the pin alone just deletes the evidence that the pair
+    # is split and leaves the body on the preview's exposure indefinitely (see
+    # update(), audit 2026-08-24).
     def _pick_preview_node(self, node=None):
         """The camera a preview lands on: the requested one, else the primary.
 
@@ -917,7 +1323,11 @@ class SettingsManager:
         if reconcile:
             # Snap the previewed camera back now rather than up to 3 s later:
             # the operator is watching its live view and has just asked for it.
-            self.reconcile_all(force=True)
+            # ONLY that camera, and only its exposure: a bare force=True here
+            # re-pushed `desired`'s exposure to the OTHER body too, so
+            # discarding (or merely forgetting, via the TTL) a preview on cam1
+            # wiped a deliberate exposure split on cam2 (K2).
+            self.reconcile_all(force=True, exposure=True, nodes=(node,))
         return node
 
     def preview(self, changes, node=None):
@@ -976,6 +1386,16 @@ class SettingsManager:
             self.events.emit("info", "settings_preview",
                              "preview moved to %s; %s goes back to the fleet "
                              "vector" % (m.name_, moved), node=moved)
+            # ...and make that sentence true. Moving the pin drops the old
+            # camera's staged values, but exposure is exempt from the
+            # continuous reconcile, so nothing else was ever going to pull
+            # that body off the exposure it was previewing - it would have sat
+            # there, unpinned and unbadged, until the next explicit apply.
+            # Scoped to the camera that lost the pin, exactly as _release_pin
+            # does, so a deliberate split elsewhere is untouched (K2).
+            # (Found while fixing the same hole in update(), audit 2026-08-24;
+            # this one predates the audit-fix pass.)
+            self.reconcile_all(force=True, exposure=True, nodes=(moved,))
         # Show the pin on the node immediately; the operator should not have to
         # wait out a reconcile tick to see that the pair is intentionally split.
         self._mark_pinned(m, state["pending"])
@@ -1026,25 +1446,81 @@ class SettingsManager:
                              "last_check": time.time()}
         m._diverge_strikes = 0
 
-    def reconcile_all(self, force=False):
+    @staticmethod
+    def _exposure_write_set(force, exposure):
+        """Which EXPOSURE_FIELDS a pass is allowed to write.
+
+        `force` used to be ONE boolean that both dropped the blind-field cache
+        and re-pushed the whole exposure vector, so applying a format or white
+        balance change - the UI's format panel POSTs just {"colortemp":5000} -
+        silently overwrote a deliberate per-camera exposure split on every
+        body, with nothing in the journal to say so. The two decisions are now
+        separate: see reconcile_all's docstring for the `exposure` values."""
+        if exposure is None:
+            exposure = bool(force)      # a bare force=True IS an explicit apply
+        if exposure is True:
+            return set(EXPOSURE_FIELDS)
+        if not exposure:
+            return set()
+        return set(exposure) & set(EXPOSURE_FIELDS)
+
+    def reconcile_all(self, force=False, exposure=None, nodes=None):
+        """Converge every connected camera on the desired vector.
+
+        force     re-push even a field that already reads back correct, and
+                  drop the blind-field cache (the body may have reset).
+        exposure  WHICH exposure fields this pass may write - exposure is
+                  PER-CAMERA between explicit applies:
+                    None      follow `force` (a bare force=True is an explicit
+                              "apply this to the fleet"),
+                    False     none - the caller applied format/WB/focus state
+                              and must leave a per-camera split alone,
+                    True      all of EXPOSURE_FIELDS,
+                    iterable  only those (bump_ev sends ("expcomp",)).
+        nodes     restrict the pass to these node names; releasing a preview
+                  pin re-converges the camera that WAS pinned and only it.
+        """
         self._expire_pin(reconcile=False)
         pinned = self.pinned_node()
         with self._lock:
             pending = dict(self._pending)
+        only = None if nodes is None else set(nodes)
         for m in self.monitors:
+            if only is not None and m.name_ not in only:
+                continue
             if not m.is_connected():
+                continue
+            # A card drain owns this body: it is in the SDK's RemoteTransfer
+            # mode, where a SetDeviceProperty races the drain on the SDK mutex
+            # or is simply refused - and the transfer-mode status then reads
+            # back as a divergence. suspend_control was honoured by the monitor
+            # but not here, so every post-run auto-drain pushed the whole
+            # vector into the transfer session and raised settings_divergent
+            # (live journal, 2026-08-23). Leave the badge as it stands and come
+            # back when the drain lets go.
+            # ...and a body whose last status came back DEGRADED (busy, no
+            # property block) is the same case wearing a disguise: controlMode
+            # is absent rather than "transfer", so this guard passed, and then
+            # every managed field read back as None != target and the whole
+            # vector was pushed into a body too busy to take it - possibly
+            # still the transfer session (audit 2026-08-24). You cannot
+            # converge against a status that reports nothing.
+            st = m.snapshot()["status"] or {}
+            if getattr(m, "suspend_control", False) \
+                    or st.get("controlMode") == "transfer" \
+                    or _status_degraded(st):
                 continue
             if pinned == m.name_:
                 # The whole point of the pin: do not fight the preview.
                 self._mark_pinned(m, pending)
                 continue
             try:
-                self._reconcile_node(m, force)
+                self._reconcile_node(m, force, exposure)
             except Exception as e:  # noqa: BLE001
                 self.events.emit("error", "settings",
                                  "reconcile error: %s" % e, node=m.name_)
 
-    def _reconcile_node(self, m, force):
+    def _reconcile_node(self, m, force, exposure=None):
         with self._lock:
             want = dict(self.desired)
         status = m.snapshot()["status"]
@@ -1060,31 +1536,71 @@ class SettingsManager:
         pushed = getattr(m, "_pushed", None)
         if pushed is None or force:
             pushed = m._pushed = {}
-        # A body that reset does not announce it. Clearing the blind-field cache
-        # on the OFFLINE->CAM_CONNECTED transition is necessary but NOT
-        # sufficient: a camera can power-cycle entirely between two 2 s polls, so
-        # the monitor never observes a transition at all and the cache survives a
-        # reboot it should not have. The reliable tell is the readable fields -
-        # if aperture/shutter/ISO/drive/store have reverted underneath us, the
-        # body has been reset or hand-nudged, and whatever we believe we pushed
-        # to the fields with NO readback (filetype, imagesize, transsize,
-        # expcomp) is no longer credible either. Sony's factory default is
-        # RAW+JPEG, so the specific consequence of trusting the stale cache is a
-        # whole transect silently shot in the wrong file type while the UI
-        # reports "synced".
-        # Whether exposure fields are written this pass. A deliberate exposure
-        # split must not read as "the body reset", so the in-pass reboot tell
-        # below counts NON-exposure readable fields only.
-        exp_force = bool(force) or bool(getattr(m, "_exposure_force", False))
+        # WHICH exposure fields this pass may write. Exposure is per-camera
+        # between explicit applies, so the set is empty unless the caller asked
+        # for one - or the body itself told us it may have reset.
+        exp_write = self._exposure_write_set(force, exposure)
+        if getattr(m, "_exposure_force", False):
+            # A reconnect/reboot tell: this body may have come back at factory
+            # values, so it gets one full forced exposure pass to rejoin the
+            # fleet vector. That, and the in-pass tell below, are the ONLY
+            # implicit exposure writes left.
+            exp_write = set(EXPOSURE_FIELDS)
         if not force:
-            reverted = [f for f, (w, k) in CONVERGE_FIELDS.items()
-                        if k and f not in EXPOSURE_FIELDS
-                        and want.get(f) is not None
-                        and status.get(k) is not None
-                        and status.get(k) != want[f]]
+            # A body that reset does not announce it. Clearing the blind-field
+            # cache on the OFFLINE->CAM_CONNECTED transition is necessary but
+            # NOT sufficient: a camera can power-cycle entirely between two 2 s
+            # polls, so the monitor never observes a transition at all and the
+            # cache survives a reboot it should not have. The reliable tell is
+            # the readable NON-exposure fields (a deliberate exposure split
+            # must never read as "the body reset"): if drive/store/focus/WB
+            # have reverted underneath us the body has been reset or
+            # hand-nudged, and whatever we believe we pushed to the fields with
+            # NO readback is no longer credible either. Sony's factory default
+            # is RAW+JPEG, so the consequence of trusting the stale cache is a
+            # whole transect silently shot in the wrong file type while the UI
+            # reports "synced".
+            #
+            # Three things are deliberately NOT evidence of a reset, and
+            # treating them as one turned EVERY idle reconcile into a forced
+            # pass - per-camera exposure overwritten every 3 s, plus the
+            # blind-field write storm the cache exists to prevent:
+            #   * a field with no readback on this build (_readback_key -> None)
+            #   * ilxctl's "I never read that property" sentinels: camera.cpp's
+            #     statusJson initialises driveValue/storeDest/focusMode to 0 and
+            #     whiteBalance to -1 and publishes them even when the property
+            #     read failed, so a body with a busy or locked property table
+            #     reports them forever (live: "settings will not converge:
+            #     drive,store_dest")
+            #   * a field the body reports DisplayOnly (storeDest is
+            #     body-menu-only on these bodies) or that was ALREADY diverged
+            #     last pass. A standing mismatch is a standing divergence; a
+            #     reset is a CHANGE, and only a change is a tell.
+            with m._lock:
+                prev_bad = set(m.convergence.get("diverged") or []) \
+                    | set(m.convergence.get("unsettable") or [])
+            writable_now = status.get("writable") or {}
+            reverted = []
+            for f, (w, k) in ALL_CONVERGE_FIELDS.items():
+                if f in EXPOSURE_FIELDS or f in prev_bad:
+                    continue
+                k = _readback_key(f, k, status)
+                if not k or want.get(f) is None:
+                    continue
+                have = status.get(k)
+                if have is None or have == want[f]:
+                    continue
+                sent = _REVERT_SENTINEL.get(f)
+                if sent is not None and isinstance(have, (int, float)) \
+                        and have <= sent:
+                    continue
+                if writable_now.get(WRITABLE_KEY.get(f, w or f)) \
+                        == ENABLE_DISPLAY_ONLY:
+                    continue
+                reverted.append(f)
             if reverted:
                 pushed = m._pushed = {}
-                exp_force = True
+                exp_write = set(EXPOSURE_FIELDS)
         # A push result, judged once, in one place. Three outcomes matter and
         # they used to be conflated:
         #   * unreachable  - the POST never got there. Recording it in the
@@ -1106,14 +1622,21 @@ class SettingsManager:
                 return
             if not key:
                 pushed[field] = value
-        for field, (which, key) in CONVERGE_FIELDS.items():
+        for field, (which, key) in ALL_CONVERGE_FIELDS.items():
             target = want.get(field)
             if target is None:
-                continue
-            if field in EXPOSURE_FIELDS and not exp_force:
+                continue          # unmanaged (quality/pcsave are opt-in)
+            if field in EXPOSURE_FIELDS and field not in exp_write:
                 continue          # per-camera between applies; still read below
             if field in BUILD_GATED_FIELDS and key not in status:
                 continue    # node's ilxctl predates this field: skip quietly
+            # filetype/imagesize/transsize/rawtype/quality/pcsave are READABLE
+            # on ilxctl builds that emit <name>Value (contract C2) and blind on
+            # older ones. Resolve per body, per pass: a body that answers gets
+            # verified (a silently declined filetype used to publish "synced"
+            # while the transect recorded no RAW), an un-upgraded one keeps the
+            # blind last-pushed-cache path rather than being skipped.
+            key = _readback_key(field, key, status)
             have = status.get(key) if key else None
             if key and have == target and not force:
                 continue
@@ -1131,11 +1654,18 @@ class SettingsManager:
                 continue
             if which:
                 note(field, m.set_exposure(which, target), key, target)
-        # expcomp has no readback key either, so it gets the same treatment
-        # rather than an unconditional write on every reconcile. It is an
-        # exposure field, so it also honours the per-camera exemption.
-        want_ev = want.get("expcomp", 0)
-        if exp_force and (pushed.get("expcomp") != want_ev or force):
+        # expcomp lives outside CONVERGE_FIELDS (it is written by hand here),
+        # but it follows the same two rules: it is an exposure field, so it
+        # honours the per-camera exemption, and it is READ BACK on builds that
+        # emit expcompValue (contract C2) instead of being trusted blind.
+        want_ev = want.get("expcomp")
+        want_ev = 0 if want_ev is None else want_ev
+        ev_key = _readback_key("expcomp", "expcompValue", status)
+        # Fields this pass must not judge in the verification read below.
+        skip_verify = set()
+        need_ev = bool(force) or (status.get(ev_key) != want_ev if ev_key
+                                  else pushed.get("expcomp") != want_ev)
+        if "expcomp" in exp_write and need_ev:
             r = m.set_exposure("expcomp", want_ev)
             err = str(r.get("error", ""))
             if r.get("ok") is False and ("InvalidCalled" in err
@@ -1144,11 +1674,13 @@ class SettingsManager:
                 # This body does not expose EV compensation in its current
                 # exposure mode — on the ILX-LR1, full Manual (program=M)
                 # makes expcomp enableFlag=DisplayOnly, and the live fleet
-                # answered exactly that. Cache it so we stop writing; it is
-                # not a divergence the operator can act on.
+                # answered exactly that. Cache it so we stop writing, and do
+                # not let the new expcompValue readback turn a property the
+                # operator cannot reach into a permanent "not synced" badge.
                 pushed["expcomp"] = want_ev
+                skip_verify.add("expcomp")
             else:
-                note("expcomp", r, None, want_ev)
+                note("expcomp", r, ev_key, want_ev)
         # Verify the readable ones settled. Read the CAMERA, not m.snapshot():
         # that returns the cached status dict the diff was computed from, which
         # only refreshes on the 2 s poll. Confirming against it means every user
@@ -1162,18 +1694,31 @@ class SettingsManager:
         # and re-read; an unreachable node above keeps it for the next pass.
         m._exposure_force = False
         still, exp_split = [], []
-        for field, (which, key) in CONVERGE_FIELDS.items():
+        for field, (which, key) in ALL_CONVERGE_FIELDS.items():
+            if field in skip_verify:
+                continue
             if field in BUILD_GATED_FIELDS and key not in after:
                 continue    # node's ilxctl predates this field: not divergence
+            key = _readback_key(field, key, after)
             if key and want.get(field) is not None \
                     and after.get(key) != want[field]:
                 # An exposure field left alone this pass is a deliberate
                 # per-camera split: report it as information. One that was
                 # PUSHED and still disagrees is a real divergence.
-                if field in EXPOSURE_FIELDS and not exp_force:
+                if field in EXPOSURE_FIELDS and field not in exp_write:
                     exp_split.append(field)
                 else:
                     still.append(field)
+        # Same for expcomp, which is not in CONVERGE_FIELDS: verify it against
+        # expcompValue when the build reports it (contract C2) rather than
+        # believing the blind cache.
+        ev_after = _readback_key("expcomp", "expcompValue", after)
+        if "expcomp" not in skip_verify and ev_after \
+                and after.get(ev_after) != want_ev:
+            if "expcomp" in exp_write:
+                still.append("expcomp")
+            else:
+                exp_split.append("expcomp")
         # Fold in the fields that have NO readback key and were refused. They
         # are invisible to the check above by construction - "have == target"
         # can never be true for them - so a body that rejects filetype /
@@ -1196,7 +1741,7 @@ class SettingsManager:
         # every divergence alarm for the node, once per 3 s, forever.
         unsettable = [f for f in still
                       if writable.get(WRITABLE_KEY.get(
-                          f, CONVERGE_FIELDS.get(f, (None,))[0] or f))
+                          f, ALL_CONVERGE_FIELDS.get(f, (None,))[0] or f))
                       == ENABLE_DISPLAY_ONLY]
         synced = not still
         with m._lock:
@@ -1309,9 +1854,44 @@ FRAME_MAX_BYTES = 64 << 20
 # there is no GPIO edge, and those are coarser - so the window has to tolerate
 # the fallback tiers without swallowing the next shot at a 2 s interval.
 PAIR_TOL_S = 0.75
-_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# A run id is a directory name that arrives back from a browser, so the class
+# stays narrow: word characters only (no separator can appear in \w on any
+# platform, and a leading dot - so "." and ".." - is excluded by the first
+# atom), and \Z rather than $ so a trailing newline cannot smuggle a name past
+# the check. \w is UNICODE here on purpose: run.py has been writing ids built
+# from accented labels (str.isalnum() is True for "é") for as long as the free
+# text Label box has existed, and the ASCII-only class made those transects
+# invisible to the Runs tab AND to rigd's startup recovery, which iterates
+# list_runs - so an interrupted Récif-Nord transect kept final:false forever
+# while every ASCII-labelled one was repaired. New ids are sanitised by
+# run_id_slug() below; the widened class is what lets the ones already on the
+# card be browsed and finalised.
+_RUN_ID_RE = re.compile(r"^\w[\w.\-]{0,79}\Z", re.UNICODE)
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 FRAME_EXTS = (".jpg", ".jpeg", ".arw", ".heif", ".hif")
+# One frame index entry per line, appended and flushed as each frame is
+# indexed (contract C3). run.json's "index" is capped at the last 2000 entries,
+# so on a long transect everything before the last ~1000 shots is missing from
+# it; readers prefer this file and fall back to run.json.
+INDEX_JSONL = "index.jsonl"
+INDEX_JSONL_MAX_BYTES = 64 << 20
+
+
+def run_id_slug(label, limit=40):
+    """A free-text run label -> the run-id alphabet. THE one sanitiser.
+
+    run.py builds the run directory name as <YYMMDD_hhmm>_<slug>, and the
+    browser, rigd's path guard and rigd's startup recovery all validate that
+    name with _RUN_ID_RE. Nothing forced the writer to produce ids the readers
+    accept, so a label like "Récif-Nord" or "サンゴ礁" produced a transect that
+    could not be opened, listed or finalised. Fold to ASCII (NFKD drops the
+    accent, not the letter) and map everything else to '-', so the id is
+    readable, stable, and inside the class every reader checks."""
+    folded = unicodedata.normalize("NFKD", str(label if label is not None
+                                               else ""))
+    folded = folded.encode("ascii", "ignore").decode("ascii")
+    out = "".join(c if (c.isalnum() or c in "-_") else "-" for c in folded)
+    return out[:limit] or "run"
 
 
 def _flight_dt_epoch(s):
@@ -1403,6 +1983,38 @@ class RunBrowser:
             return None
 
     @staticmethod
+    def _read_index(root, doc):
+        """The run's per-frame index: (entries, source).
+
+        index.jsonl is preferred whenever it exists (contract C3): run.json's
+        "index" is truncated to the LAST 2000 entries, so on a transect longer
+        than ~1000 shots every earlier frame is missing from it and the pair
+        view silently falls back to the centisecond flight_log timestamps for
+        exactly the part of the line nobody can re-shoot. A torn final line (a
+        live run appends and flushes per frame) is skipped, not guessed at."""
+        path = os.path.join(root, INDEX_JSONL)
+        try:
+            if os.path.getsize(path) <= INDEX_JSONL_MAX_BYTES:
+                rows = []
+                with open(path) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue          # torn/partial line: skip it
+                        if isinstance(r, dict):
+                            rows.append(r)
+                if rows:
+                    return rows, "index.jsonl"
+        except OSError:
+            pass
+        return [r for r in ((doc or {}).get("index") or [])
+                if isinstance(r, dict)], "run.json"
+
+    @staticmethod
     def _cam_dirs(root):
         try:
             return sorted(d for d in os.listdir(root)
@@ -1476,8 +2088,9 @@ class RunBrowser:
         # every few seconds during a live transect re-parses only when the run
         # has actually grown.
         sig = []
-        for rel in ["run.json"] + [os.path.join(c, "flight_log.csv")
-                                   for c in self._cam_dirs(root)]:
+        for rel in ["run.json", INDEX_JSONL] \
+                + [os.path.join(c, "flight_log.csv")
+                   for c in self._cam_dirs(root)]:
             try:
                 st = os.stat(os.path.join(root, rel))
                 sig.append((rel, st.st_mtime_ns, st.st_size))
@@ -1489,6 +2102,7 @@ class RunBrowser:
         if hit and hit[0] == sig:
             return hit[1]
         doc = self._read_json(os.path.join(root, "run.json")) or {}
+        index, index_src = self._read_index(root, doc)
         cams = self._cam_dirs(root)
         percam, frames = {}, []
         for cam in cams:
@@ -1526,11 +2140,16 @@ class RunBrowser:
             "time": doc.get("time") or {},
             "sync": doc.get("sync") or {},
             "stats": doc.get("stats") or {},
-            "frames_indexed": doc.get("frames"),
+            # doc["frames"] is the full count even when doc["index"] is capped
+            # at 2000; index.jsonl is the fallback when run.json is missing or
+            # corrupt, which is exactly the run a browser most needs to open.
+            "frames_indexed": doc.get("frames")
+            if doc.get("frames") is not None else (len(index) or None),
+            "index_source": index_src,
             "per_camera": percam,
             "has_run_json": bool(doc),
         }
-        pairs, shots_full = self._pairs(frames, cams, doc)
+        pairs, shots_full = self._pairs(frames, cams, doc, index)
         detail["pairs"] = pairs
         detail["strobe"] = doc.get("strobe")
         with self._lock:
@@ -1560,7 +2179,7 @@ class RunBrowser:
                 "shots": full[offset:offset + limit]}
 
     @staticmethod
-    def _pairs(frames, cams, doc):
+    def _pairs(frames, cams, doc, index=None):
         """Group frames into shots; return (summary, full_shot_list).
 
         This is the whole point of the view: a shot that only one camera
@@ -1585,8 +2204,9 @@ class RunBrowser:
             interval = 0.0
         tol = PAIR_TOL_S if interval <= 0 \
             else max(0.05, min(PAIR_TOL_S, interval / 2.0))
-        idx_by_file = {r.get("file"): r for r in (doc.get("index") or [])
-                       if isinstance(r, dict) and r.get("file")}
+        if index is None:                 # direct callers / older tests
+            index = [r for r in (doc.get("index") or []) if isinstance(r, dict)]
+        idx_by_file = {r.get("file"): r for r in index if r.get("file")}
         frames.sort(key=lambda f: f[0])
         shots = []
         for ep, cam, fname, src in frames:
@@ -1601,15 +2221,24 @@ class RunBrowser:
             idx_eps = {c: r["epoch"] for c, r in members.items()
                        if r and r.get("epoch") is not None}
             srcs = {c: r.get("src") for c, r in members.items() if r}
-            if len(idx_eps) == len(s["have"]) and len(idx_eps) >= 1:
-                spread = (max(idx_eps.values()) - min(idx_eps.values())) * 1000
+            if len(s["have"]) < 2:
+                # ONE camera recorded this shot. max()-min() over a single
+                # epoch is 0.0, and publishing that as spread_ms made the
+                # review strip show a measured, green "0.00 ms" jitter for the
+                # shots where the pair is BROKEN - the most misleading number
+                # the view can print. There is no inter-camera spread here;
+                # say so instead of inventing one.
+                spread, spread_src = None, "single"
+            elif len(idx_eps) == len(s["have"]):
+                spread = round((max(idx_eps.values())
+                                - min(idx_eps.values())) * 1000, 2)
                 spread_src = "index"
             else:
-                spread = (s["t1"] - s["t0"]) * 1000
+                spread = round((s["t1"] - s["t0"]) * 1000, 2)
                 spread_src = "flight_log"
             out = {"epoch": round(s["t0"], 3), "files": dict(s["have"]),
                    "missing": [c for c in cams if c not in s["have"]],
-                   "spread_ms": round(spread, 2), "spread_src": spread_src,
+                   "spread_ms": spread, "spread_src": spread_src,
                    "srcs": srcs}
             strobe_ep = next((r["strobe"] for r in members.values()
                               if r and r.get("strobe") is not None), None)

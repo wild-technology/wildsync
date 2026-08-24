@@ -55,10 +55,159 @@ SLOT_WRITING_CRITICAL_S = 120.0
 
 
 # ---------------------------------------------------------------------------
+# Request validation.
+#
+# What failed: the HTTP surface trusted whatever JSON arrived. POST
+# /api/run/start with a MALFORMED body started a real transect on the built-in
+# defaults, because _read_body answered {} for "cannot parse" exactly as it did
+# for "no body at all" (fuzz 2026-08-23, verified on the live rig). Downstream
+# of that, every handler did b.get(...) on a value it never checked:
+# {"on":"maybe"} enabled the exposure servo (bool("maybe") is True),
+# {"value":"abc"} on /api/exposure travelled to ilxctl and stalled the SDK ~6 s
+# inside SetDeviceProperty until cam1 flapped to "no connected camera", and
+# ?since=abc / steps="x" came back as 500s carrying a Python exception string.
+#
+# Why it is shaped this way: one exception type, raised by small coercers, and
+# ONE catch in each of do_GET/do_POST. Returning error tuples relies on every
+# handler remembering to look at them - which is the bug being fixed. A
+# BadRequest is always a clean 400 naming the field; nothing else changes.
+# ---------------------------------------------------------------------------
+class BadRequest(ValueError):
+    """Client input this daemon refuses to act on. Answered 400, never 500."""
+
+
+def want_bool(v, what):
+    """A REAL bool: JSON true/false, or the integers 0/1. Nothing else.
+
+    A truthy STRING is not consent - {"on":"maybe"} armed the auto-exposure
+    servo on the live rig."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    raise BadRequest("%s must be true or false (got %r)" % (what, v))
+
+
+def want_int(v, what, lo=None, hi=None):
+    """A whole number. JSON number or a clean decimal string; bools, fractions
+    and anything non-numeric are refused HERE, before a node is contacted."""
+    n = None
+    if isinstance(v, bool):
+        n = None
+    elif isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        # json.loads accepts the non-standard literals Infinity/-Infinity/NaN
+        # by default, and int() raises OverflowError / ValueError on them - so
+        # {"steps": Infinity} left want_int by EXCEPTION and became a 500
+        # carrying a Python exception string plus an "error"/"http" line in
+        # rigd.jsonl, which is the exact outcome BadRequest exists to prevent
+        # (audit 2026-08-24). want_float below already refused them.
+        n = int(v) if (v == v and v not in (float("inf"), float("-inf"))
+                       and v == int(v)) else None
+    elif isinstance(v, str):
+        try:
+            n = int(v.strip(), 10)
+        except ValueError:
+            n = None
+    if n is None:
+        raise BadRequest("%s must be a whole number (got %r)" % (what, v))
+    _bounds(n, what, lo, hi)
+    return n
+
+
+def _bounds(n, what, lo, hi):
+    """One-sided or two-sided range message: "between 0 and None" told the
+    operator nothing about which end they were on."""
+    if lo is not None and hi is not None and not (lo <= n <= hi):
+        raise BadRequest("%s must be between %s and %s (got %s)"
+                         % (what, lo, hi, n))
+    if lo is not None and n < lo:
+        raise BadRequest("%s must be %s or more (got %s)" % (what, lo, n))
+    if hi is not None and n > hi:
+        raise BadRequest("%s must be %s or less (got %s)" % (what, hi, n))
+
+
+def want_float(v, what, lo=None, hi=None):
+    """A finite number. NaN/inf are refused too: they poison every comparison
+    downstream (an IMU window at t0=nan matches no sample and raises nothing)."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        raise BadRequest("%s must be a number (got %r)" % (what, v)) from None
+    if n != n or n in (float("inf"), float("-inf")):
+        raise BadRequest("%s must be a finite number (got %r)" % (what, v))
+    _bounds(n, what, lo, hi)
+    return n
+
+
+def qint(q, key, default, lo=None, hi=None):
+    """One integer query parameter, or `default` when it is absent/empty."""
+    vals = q.get(key)
+    if not vals or vals[0] == "":
+        return default
+    return want_int(vals[0], "?%s" % key, lo, hi)
+
+
+def qfloat(q, key, default, lo=None, hi=None):
+    vals = q.get(key)
+    if not vals or vals[0] == "":
+        return default
+    return want_float(vals[0], "?%s" % key, lo, hi)
+
+
+# The `which` names ilxctl's /api/exposure actually dispatches (src/camera.cpp
+# Camera::setExposure). Anything outside this set is a typo, and a typo used to
+# reach the body: it is refused at the door instead.
+EXPOSURE_WHICH = ("iso", "shutter", "aperture", "program", "drive",
+                  "filetype", "imagesize", "quality", "transsize",
+                  "pcsave", "rawtype", "expcomp", "wb_mode", "colortemp")
+
+# Lens endpoints: path -> (the body field ilxctl reads, the /api/status range
+# key that bounds it, or None where the body publishes no range). Position and
+# speed are per-camera and never fleet-converged, so the body's own published
+# range is the only guard available - out-of-range values used to be forwarded
+# and silently dropped, answering ok:true with empty results.
+LENS_FIELD = {"/api/focus/drive": ("step", None),
+              "/api/focus/position": ("value", "focusPosRange"),
+              "/api/zoom/drive": ("speed", "zoomSpeedRange"),
+              "/api/zoom/position": ("value", "zoomPosRange"),
+              "/api/zoom/setting": ("value", None)}
+
+
+def _clamp_to_range(v, rng):
+    """(clamped, was_clamped) against an ilxctl {min,max,step} range triple."""
+    if not isinstance(rng, dict):
+        return v, False
+    lo, hi = rng.get("min"), rng.get("max")
+    out = v
+    if isinstance(lo, (int, float)) and out < lo:
+        out = int(lo)
+    if isinstance(hi, (int, float)) and out > hi:
+        out = int(hi)
+    return out, out != v
+
+
+# ---------------------------------------------------------------------------
 # Anomaly detectors — cheap checks over current fleet state, each with the
 # evidence and a suggested action an operator (or agent) can act on.
 # ---------------------------------------------------------------------------
 STATIC_FIX_PATH = os.path.expanduser("~/rig/static_fix.json")
+# Host-vs-node clock offset that starts costing sync. The whole stereo budget
+# is 10 ms; the fire schedule's lead is SYNC_LEAD_S 0.30 s minus the focus lead
+# and the trigger latency, so an undisciplined host eats it outright. Measured
+# on the Mac 2026-08-23: 187 ms behind NTP, drifting ~60 ppm - every fire late
+# by ~33 ms on both nodes and the pair skew degraded 0.59 -> 1.78 ms.
+HOST_CLOCK_WARN_S = 0.1
+HOST_CLOCK_BAD_S = 0.5
+# An offset measured over a link this slow is not a clock reading, it is the
+# network. Say so instead of dropping the node out of the comparison silently.
+CLOCK_RTT_LIMIT_MS = 20.0
+# A node_clock_skew alarm must survive this many consecutive scans. The live
+# journal carried single-sample "82.9 ms" skew alarms while chronyc showed the
+# two Pis 20 us apart: one host-clock step landing between the two nodes' polls
+# is enough to invent one.
+CLOCK_SKEW_SCANS = 3
 
 
 class LiveTap:
@@ -118,25 +267,72 @@ class LiveTap:
 LIVETAP = LiveTap()
 
 
+# "this wrapper has no way to ask whether a run is recording" - distinct from
+# "no run is recording", because the two want opposite answers: unknown must
+# not let a Start re-decide a live run's latch, and must not turn the idle
+# static fix off either.
+UNKNOWN_RUN = object()
+
+
 class StaticFixNav:
-    """Delegating wrapper around NavReader: when there is NO valid live fix,
-    fix_at()/snapshot() fall back to the operator-provided static position in
-    ~/rig/static_fix.json ({lat, lon, label, ...}).
+    """Delegating wrapper around NavReader: when the gateway is DEAD and there
+    is no live fix, fix_at()/snapshot() fall back to the operator-provided
+    static position in ~/rig/static_fix.json ({lat, lon, label, ...}).
 
     Field case: no NMEA aboard, but the site position is known — e.g. the
     last live fix from a previous day. Honesty rules: a live fix ALWAYS wins;
     the static row carries only position/UTM (never depth, heading, or speed,
     which we do not know); `nav_epoch` is the original fix's capture epoch so
-    `age_s` says exactly how old the position is; and health()/snapshot()
-    name the static source so the UI preflight can say so out loud. The file
-    is re-read on mtime change, so it can be edited without a restart."""
+    `age_s` says exactly how old the position is; `valid` stays False and
+    `fix_kind` says "static"; and health()/snapshot() name the static source so
+    the UI preflight can say so out loud. The file is re-read on mtime change,
+    so it can be edited without a restart.
 
-    def __init__(self, reader, navmod, events):
+    ARMING (audit 2026-08-23, nav finding #1). The stand-in used to apply to
+    ANY row without a live fix, which meant a transect that started on good GPS
+    and lost the bus for 40 s mid-line had those frames stamped with the static
+    position instead of an empty one. Photogrammetrically that is worse than no
+    position: the flight_log looks complete and nothing says those rows are a
+    constant. PROTOCOL.md's rule is that a missing fix writes EMPTY cells, and
+    the static fix is an armed FALLBACK, not a gap filler. So the stand-in is
+    decided once, at run start, from whether the gateway was online then:
+      * gateway offline at run start -> armed for the whole run (the no-NMEA
+        deployment: every frame carries the operator's position, labelled);
+      * gateway online at run start  -> NOT armed; a mid-run gap writes empty
+        lat/long and raises nav_no_fix, exactly as the contract says.
+    Outside a run the current gateway state decides, so the UI and a one-off
+    /api/capture still show the armed position when there is genuinely no bus.
+    The decision BELONGS TO THAT RUN (see begin_run): only the run that took it
+    can release it, and while a run is recording with no decision latched at
+    all the stand-in is refused rather than guessed."""
+
+    # A start that took the latch and never bound a run to it (the handler
+    # died between begin_run and bind_run) must not hold it for ever. It has
+    # to be comfortably longer than a slow RunManager.start - which live-probes
+    # every monitor with a 5 s timeout, outside its own lock, before the run
+    # becomes visible - and short enough that a leaked latch self-heals.
+    START_GRACE_S = 60.0
+
+    def __init__(self, reader, navmod, events, run_active=None):
         self._r = reader
         self._nm = navmod
         self._ev = events
         self._sf = None
         self._sf_mtime = None
+        # The latch AND ITS OWNER. _run_armed None = no latch; True/False = the
+        # decision taken at run start. _run_id names the run that owns it once
+        # the run exists, _run_gen is the start that took it, _pending_since
+        # marks a start still in flight. The four move together under the lock.
+        self._run_armed = None
+        self._run_id = None
+        self._run_gen = 0
+        self._pending_since = None
+        self._run_lock = threading.RLock()
+        # Callable -> the run_id recording RIGHT NOW, or None. MUST NOT take
+        # the run manager's lock: armed() runs on the pull workers' threads,
+        # once per frame, and that lock is not reentrant. None (no hint wired)
+        # reads as "unknown", which is the conservative answer everywhere.
+        self._run_active = run_active
         self._load()
 
     def _load(self):
@@ -148,58 +344,213 @@ class StaticFixNav:
             return
         if mt == self._sf_mtime:
             return
+        # Stamp the mtime BEFORE parsing, so a malformed file is parsed once
+        # and warned about once. It used to be stamped only on success: every
+        # snapshot(), fix_at() and health() call re-read the broken file and
+        # re-emitted the warning, which at the UI's poll rate buried the event
+        # journal under one line per 200 ms.
+        self._sf_mtime = mt
         try:
             with open(STATIC_FIX_PATH) as fh:
                 sf = json.load(fh)
+            if not isinstance(sf, dict):
+                raise ValueError("not a JSON object")
             lat, lon = float(sf["lat"]), float(sf["lon"])
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                raise ValueError("lat/lon out of range")
             e, n, zone = self._nm.latlon_to_utm(lat, lon)
             sf.update({"lat": lat, "lon": lon,
                        "xutm": e, "yutm": n, "utm_zone": zone})
             self._sf = sf
-            self._sf_mtime = mt
         except Exception as exc:  # noqa: BLE001
             self._sf = None
             self._ev.emit("warn", "nav",
-                          "static_fix.json unreadable: %s" % exc)
+                          "static_fix.json unreadable (%s): no static fallback "
+                          "is armed - frames with no live fix will carry EMPTY "
+                          "positions" % exc)
+
+    # -- arming -------------------------------------------------------------
+    # OWNERSHIP (audit 2026-08-24, review blocker). The latch used to be a bare
+    # process-global tri-state with no run identity, and two call sites cleared
+    # it unconditionally:
+    #   * the 5 s _nav_time_loop tick, which cannot tell "the run ended" from
+    #     "the run has not started yet" - RunManager.start live-probes every
+    #     monitor with a 5 s timeout BEFORE self.active is assigned, so with one
+    #     node unreachable status() reports active:False for seconds and the
+    #     tick is guaranteed to land inside that window;
+    #   * the /api/run/start error path, which fired on "run already active" -
+    #     i.e. a duplicate Start (a double tap, a UI retry) dropped the latch of
+    #     the transect that WAS recording.
+    # Either way the run then ran with no latch, armed() fell back to live
+    # gateway state, and a bus drop 20 minutes later wrote the armed static
+    # LAUNCH-POINT position into every remaining flight_log row of a moving
+    # survey - fabricated position data presented as real, which is exactly
+    # what the arming rule exists to prevent. So the latch now names its owner,
+    # and only its owner may release it.
+    def begin_run(self, gateway_online):
+        """Latch the fallback decision for one transect.
+
+        Returns (armed, token). `token` is this caller's proof that IT took the
+        latch; it is None when the latch is already spoken for - by a recording
+        run or by another start still in flight - and then the caller must
+        neither re-decide nor release it."""
+        with self._run_lock:
+            rec = self._recording()
+            if self._run_id is not None and (rec is UNKNOWN_RUN
+                                             or rec == self._run_id):
+                # A transect that is still recording owns the decision.
+                return self._run_armed, None
+            if self._run_id is None and self._pending():
+                # Another start is in flight and its run needs its decision.
+                return self._run_armed, None
+            # Either nothing is latched, or the run that latched it is over
+            # (its Stop and this Start raced, and the tick has not caught up).
+            # A new transect gets a NEW decision - inheriting the last one
+            # would arm this line from a gateway state sampled during another.
+            self._run_gen += 1
+            self._run_armed = not gateway_online
+            self._run_id = None
+            self._pending_since = time.monotonic()
+            return self._run_armed, self._run_gen
+
+    def _pending(self):
+        """A start took the latch and has not bound a run to it yet. Callers
+        hold _run_lock."""
+        return (self._pending_since is not None
+                and time.monotonic() - self._pending_since < self.START_GRACE_S)
+
+    def _recording(self):
+        """The run_id recording right now, None when none is, or UNKNOWN when
+        this wrapper was built without the hint."""
+        if self._run_active is None:
+            return UNKNOWN_RUN
+        try:
+            return self._run_active()
+        except Exception:  # noqa: BLE001
+            return UNKNOWN_RUN
+
+    def bind_run(self, run_id, token=None):
+        """Name the run that owns the latch. Idempotent, and the nav tick calls
+        it too, so a start that answered its client but never reached this
+        still ends up with an owned latch."""
+        with self._run_lock:
+            if not run_id or self._run_armed is None:
+                return False
+            if token is not None and token != self._run_gen:
+                return False            # a later start holds the latch now
+            if self._run_id is not None and self._run_id != run_id:
+                return False            # another run already owns it
+            self._run_id = run_id
+            self._pending_since = None
+            return True
+
+    def end_run(self, run_id=None, token=None):
+        """Release the latch, but only for a caller that owns it. Returns True
+        if it was actually released."""
+        with self._run_lock:
+            if self._run_armed is None:
+                return False
+            if token is not None:
+                # A start that was refused: only the start that took the latch
+                # may drop it, and only while no run has claimed it since.
+                if token != self._run_gen or self._run_id is not None:
+                    return False
+            elif self._run_id is not None:
+                # Owned by a run. run_id=None is the housekeeping tick, which
+                # has just seen that no run is active, so it may release.
+                if run_id is not None and run_id != self._run_id:
+                    return False
+            elif self._pending():
+                # A start is IN FLIGHT and the run it is about to create still
+                # needs this decision. This is the clear that used to strip a
+                # starting transect's latch during RunManager.start's probe.
+                return False
+            self._run_armed = None
+            self._run_id = None
+            self._pending_since = None
+            return True
+
+    def armed(self):
+        """Whether a static stand-in may be used for the NEXT row."""
+        self._load()
+        if not self._sf:
+            return False
+        with self._run_lock:
+            rec = self._recording()
+            live = rec is not None and rec is not UNKNOWN_RUN
+            if self._run_armed is not None:
+                if live and self._run_id is not None and rec != self._run_id:
+                    # The latch belongs to a transect that is over and a
+                    # DIFFERENT one is recording (its Stop raced this Start, so
+                    # the new run never got a decision of its own). One line's
+                    # decision must not govern another's rows.
+                    return False
+                return self._run_armed
+            if live:
+                # A transect is RECORDING and no decision is latched: the latch
+                # was never taken, or was dropped under us. Refuse rather than
+                # let live gateway state decide - PROTOCOL.md's rule is that a
+                # row with no fix carries EMPTY cells, and a missing position
+                # is recoverable where a fabricated one is not.
+                return False
+        # Idle: the gateway's current state decides. NavReader.gateway_online
+        # is a cheap derived property (last-receive age), not I/O.
+        online = getattr(self._r, "gateway_online", None)
+        if online is None:
+            try:
+                online = bool((self._r.health() or {}).get("online"))
+            except Exception:  # noqa: BLE001
+                online = False
+        return not bool(online)
 
     def static_label(self):
         self._load()
         return (self._sf or {}).get("label") or \
             ("static fix" if self._sf else None)
 
-    def fix_at(self, epoch=None, max_age_s=None):
-        row = self._r.fix_at(epoch, max_age_s)
-        if row.get("valid"):
-            return row
-        self._load()
-        if not self._sf:
-            return row
+    def _stand_in(self, row):
         sf = self._sf
         row.update({"lat": sf["lat"], "lon": sf["lon"], "long": sf["lon"],
                     "xutm": sf["xutm"], "yutm": sf["yutm"],
-                    "utm_zone": sf["utm_zone"]})
+                    "utm_zone": sf["utm_zone"],
+                    # A static position is NOT a fix. Anything that keys on
+                    # `valid` (the UI pill, the preflight, ingest) has to keep
+                    # seeing False, and fix_kind says which of the two "not
+                    # valid" states this is.
+                    "valid": False, "fix_kind": "static",
+                    "static_fix": self.static_label()})
         row["nav_epoch"] = sf.get("captured_epoch")
         if row["nav_epoch"] and row.get("local_epoch"):
             row["age_s"] = abs(row["local_epoch"] - row["nav_epoch"])
-        row["static_fix"] = self.static_label()
         return row
+
+    def fix_at(self, epoch=None, max_age_s=None):
+        row = self._r.fix_at(epoch, max_age_s)
+        if row.get("valid"):
+            row["fix_kind"] = "live"
+            return row
+        if not self.armed():
+            # PROTOCOL.md: never fabricate. Empty cells, and the anomaly
+            # scanner raises nav_no_fix on the way past.
+            row["fix_kind"] = "none"
+            return row
+        return self._stand_in(row)
 
     def snapshot(self):
         snap = self._r.snapshot() or {}
-        if not snap.get("valid"):
-            self._load()
-            if self._sf:
-                sf = self._sf
-                snap.update({"lat": sf["lat"], "lon": sf["lon"],
-                             "xutm": sf["xutm"], "yutm": sf["yutm"],
-                             "utm_zone": sf["utm_zone"],
-                             "static_fix": self.static_label()})
-        return snap
+        if snap.get("valid"):
+            snap["fix_kind"] = "live"
+            return snap
+        if not self.armed():
+            snap["fix_kind"] = "none"
+            return snap
+        return self._stand_in(snap)
 
     def health(self):
         h = self._r.health()
         self._load()
         h["static_fix"] = self.static_label()
+        h["static_fix_armed"] = self.armed()
         return h
 
     def __getattr__(self, name):
@@ -218,6 +569,17 @@ class Anomalies:
         self._last = {}
         self._writing_since = {}  # node -> epoch its card write started
         self._disk = (0.0, None)  # (checked_at, free_mb) — see _runs_free_mb
+        self._skew_streak = {}   # (nodeA,nodeB) -> consecutive scans over budget
+        # scan() runs from the 2.5 s loop AND from /api/anomalies and /api/diag,
+        # which the UI's preflight() issues together in one Promise.all. Three
+        # ThreadingHTTPServer threads used to compute `cur - self._last` before
+        # any of them assigned self._last, so a single new fault (capture_paused,
+        # card_write_stuck) was emitted to the journal two or three times: the
+        # run's events.log carried duplicates, recent_counts() double-counted
+        # the kind, and a watcher polling /api/events saw several distinct
+        # errors for one event. One lock, held across the whole scan, because
+        # the read-then-assign of _last (and of _skew_streak) is the invariant.
+        self._lock = threading.Lock()
 
     def _runs_free_mb(self):
         """Free space on the runs volume, cached for a second.
@@ -234,6 +596,10 @@ class Anomalies:
         return val
 
     def scan(self):
+        with self._lock:
+            return self._scan_locked()
+
+    def _scan_locked(self):
         out = []
         now = time.time()
         run = self.runmgr.status()
@@ -343,11 +709,34 @@ class Anomalies:
             # "ISO 0"/isoValue 0, and slotWriting is unreported. Keying on
             # iso in (None,"","?") never matched real hardware (audit
             # 2026-08-23) - the body sends "ISO 0", not None.
-            locked = (st == NodeMonitor.CONNECTED and status
-                      and not (status.get("writable") or {})
-                      and (status.get("isoValue") in (0, None)
-                           or status.get("iso") in ("ISO 0", "0", None, "", "?"))
-                      and status.get("slotWritingLabel") in (None, "unknown", ""))
+            blind = (st == NodeMonitor.CONNECTED and status
+                     and not (status.get("writable") or {})
+                     and (status.get("isoValue") in (0, None)
+                          or status.get("iso") in ("ISO 0", "0", None, "", "?"))
+                     and status.get("slotWritingLabel") in (None, "unknown", ""))
+            # WHY the table is blind decides whether it is an alarm. Every
+            # clause above is satisfied by ABSENCE, and there are two benign
+            # ways to get an empty table:
+            #   * the degraded status body ({connected, busy:true, model:"",
+            #     id:"", log}) ilxctl answers with when the SDK mutex is held
+            #     past 4.5 s. PROTOCOL.md is explicit that busy:true means "the
+            #     node answered and told us nothing - do not reconcile against
+            #     it, do not count the missing keys as divergence"; diagnosing
+            #     a card stall from them does precisely that, and put a red
+            #     "power the body off and reformat the card" alarm in front of
+            #     the operator for a body that was merely slow (audit
+            #     2026-08-24, disputed finding - upheld on the contract, which
+            #     does not depend on how often the window is hit);
+            #   * a card drain: the property table is empty in transfer mode BY
+            #     DESIGN, which is why rigcore already skips those nodes for
+            #     reconcile. "locked" carries no information there either.
+            # A genuine table lock answers promptly with an empty table and no
+            # busy flag, so neither exemption hides the real card stall - and
+            # card_write_stuck below watches the write itself regardless.
+            excused = (bool(status.get("busy"))
+                       or bool(getattr(m, "suspend_control", False))
+                       or status.get("controlMode") == "transfer")
+            locked = bool(blind) and not excused
             if locked:
                 out.append(self._a(
                     "body_locked", m.name_,
@@ -362,7 +751,7 @@ class Anomalies:
                     "V60/UHS-II card. Frames will not deliver until then",
                     sev="bad"))
             conv = snap.get("convergence") or {}
-            if st == NodeMonitor.CONNECTED and not locked \
+            if st == NodeMonitor.CONNECTED and not blind and not excused \
                     and conv.get("synced") is False and conv.get("diverged"):
                 # Name the ilxctl error where there is one: for filetype /
                 # imagesize / transsize there is no readback, so the body's own
@@ -418,8 +807,17 @@ class Anomalies:
                         sev="bad" if held > SLOT_WRITING_CRITICAL_S else "warn"))
             else:
                 self._writing_since.pop(m.name_, None)
-            pk = status.get("priorityKeyLabel")
-            if status.get("connected") and pk == "Camera position":
+            # pc_control_lost and battery_low are read off `status`, and
+            # NodeMonitor never clears status on the OFFLINE transition - it
+            # only overwrites it on the next reachable poll. A node that lost
+            # PoE mid-run therefore kept raising "the body has taken control
+            # priority back" and "battery low (12%)" for a body that was not
+            # even powered, on top of node_offline/node_rebooted, sending the
+            # operator to the camera menu during a plain power loss (audit
+            # 2026-08-23). Same CONNECTED gate the card/overheat checks use.
+            pk = status.get("priorityKeyLabel") if st == NodeMonitor.CONNECTED \
+                else None
+            if pk == "Camera position":
                 out.append(self._a(
                     "pc_control_lost", m.name_,
                     "the body has taken control priority back",
@@ -428,7 +826,7 @@ class Anomalies:
                     "and PC save will not deliver - it masquerades as an SDK "
                     "bug. Set the body's priority back to PC remote",
                     sev="bad"))
-            batt = status.get("battery")
+            batt = status.get("battery") if st == NodeMonitor.CONNECTED else None
             if isinstance(batt, (int, float)) and 0 <= batt <= 15:
                 out.append(self._a("battery_low", m.name_,
                                    "battery low (%s%%)" % batt, {"battery": batt},
@@ -458,16 +856,41 @@ class Anomalies:
                 # the wrong end of the boat. The iKonvert is powered from the
                 # N2K bus, not from USB, so a dark bus means silence on a port
                 # that still opens perfectly well.
-                if snap and not snap.get("gateway_online"):
-                    # With a static fix armed the operator has already said
-                    # "no NMEA aboard, use this position" — that is a state
-                    # to display, not an alarm to chase.
-                    sf = snap.get("static_fix")
+                kind = (snap or {}).get("fix_kind")
+                # A run recording frames with NO position is the expensive
+                # case and it has to be said first: the static fix is only
+                # armed when the gateway was already dead at run start, so a
+                # mid-run bus drop writes EMPTY lat/long into the flight_log
+                # (PROTOCOL.md: never fabricate) and those frames cannot be
+                # placed afterwards. The old code reached this through an
+                # `elif` under nav_gateway_down, so the operator was told the
+                # gateway was down but never that the transect was losing
+                # position (audit 2026-08-23, nav finding #1).
+                if run.get("active") and snap and snap.get("lat") is None:
+                    out.append(self._a(
+                        "nav_no_fix", None,
+                        "RECORDING WITH NO POSITION - frames are getting "
+                        "empty lat/long",
+                        {"snap": {k: snap.get(k) for k in
+                                  ("sats", "fix_source", "age_s",
+                                   "gateway_online")},
+                         "fix_kind": kind},
+                        "these frames cannot be placed afterwards. Restore the "
+                        "N2K/GPS source now, or stop the line and restart it "
+                        "with the static fix armed (~/rig/static_fix.json) so "
+                        "at least the site position is recorded",
+                        sev="bad"))
+                elif snap and not snap.get("gateway_online"):
+                    # With a static fix standing in, the operator has already
+                    # said "no NMEA aboard, use this position" — that is a
+                    # state to display, not an alarm to chase.
+                    sf = snap.get("static_fix") if kind == "static" else None
                     out.append(self._a("nav_gateway_down", None,
                                        ("no live NMEA — static fix in use: %s"
                                         % sf) if sf
                                        else "iKonvert sending no data",
-                                       {"health": self.nav.health()},
+                                       {"health": self.nav.health(),
+                                        "fix_kind": kind},
                                        "flight-log positions use the armed "
                                        "static fix; plug in the iKonvert for "
                                        "live nav" if sf else
@@ -478,7 +901,8 @@ class Anomalies:
                 elif snap and snap.get("lat") is None:
                     out.append(self._a("nav_no_fix", None, "no GPS fix",
                                        {"snap": {k: snap.get(k) for k in
-                                                 ("sats", "fix_source", "age_s")}},
+                                                 ("sats", "fix_source", "age_s")},
+                                        "fix_kind": kind},
                                        "check the N2K backbone / GPS source"))
             except Exception:  # noqa: BLE001
                 pass
@@ -528,36 +952,111 @@ class Anomalies:
                 "a mismatched stereo pair, and a run start will drop the "
                 "preview; it also expires on its own"))
         # The Jetson volume the transects are actually written to.
-        # Node clock agreement. Every scheduled fire and every epoch_hw edge
-        # lives on the NODE's clock, so two nodes disagreeing with each other
-        # lands 1:1 in inter-camera exposure skew — the whole sync budget is
-        # 10 ms. With no local chrony master (the Jetson is gone in the
-        # macOS-host topology) the Pis free-run apart silently; measured
-        # 16.8 ms apart on 2026-08-20. Offsets are RTT-bounded /health
-        # samples, so only differences well above the noise floor alarm.
-        clocked = [(m.name_, m.clock) for m in self.monitors
-                   if getattr(m, "clock", None)
-                   and now - m.clock["at"] < 30
-                   and m.clock["rtt_ms"] < 20]
+        # ---- clock domains (contract C1) ----------------------------------
+        # Every scheduled fire epoch, every GPIO edge epoch/epoch_hw and every
+        # piagent /health time.epoch is on the NODE clock; the fire scheduler,
+        # nav's ring and rigd's own time.time() are on the HOST clock. Two
+        # things can go wrong and they need different alarms and different
+        # fixes, so they are two detectors:
+        #   node_clock_skew   the two nodes disagree with EACH OTHER -> lands
+        #                     1:1 in inter-camera exposure skew (10 ms budget).
+        #   host_clock_offset both nodes agree but the HOST does not -> the
+        #                     fire schedule's lead is eaten (every fire late)
+        #                     and nav lookups made at a node epoch hit the
+        #                     host-keyed ring at the wrong index.
+        # Both read the FILTERED offset (NodeMonitor.clock_offset_s: RTT-gated
+        # median of the recent window), never m.clock's last raw sample. A raw
+        # sample carries whatever the network did during that one poll, and the
+        # live journal shows what that costs: single-scan "82.9 ms" skew alarms
+        # while chronyc had the two Pis 20 us apart.
+        clocked, unmeasurable = [], []
+        for m in self.monitors:
+            if m.snapshot()["state"] == NodeMonitor.OFFLINE:
+                continue          # a node that is not answering has no clock
+            info = m.clock_offset_info()
+            if info.get("offset_s") is None:
+                continue
+            # Do NOT drop a slow-linked node out of the comparison silently:
+            # over a 20 ms link the midpoint estimate is network, not clock,
+            # and the operator needs to know the check could not be made
+            # rather than seeing an all-clear (audit 2026-08-23).
+            if (info.get("rtt_ms_best") or 0.0) >= CLOCK_RTT_LIMIT_MS:
+                unmeasurable.append((m.name_, info))
+                continue
+            clocked.append((m.name_, info))
+        for name, info in unmeasurable:
+            out.append(self._a(
+                "node_clock_unmeasurable", name,
+                "%s clock cannot be measured: best RTT %.1f ms over the last "
+                "%d samples" % (name, info["rtt_ms_best"], info["n"]),
+                {"rtt_ms_best": info["rtt_ms_best"], "n": info["n"],
+                 "offset_ms": round(info["offset_s"] * 1e3, 2)},
+                "the 10 ms stereo sync budget cannot be verified on this node "
+                "while its link is this slow - the offset above is mostly "
+                "network. Check the switch port / cable / PoE load, then "
+                "re-check chronyc tracking"))
+        # Node-to-node skew, but only once it has PERSISTED: a single scan is
+        # not evidence (see above). The streak is keyed on the node pair and
+        # reset the moment a scan comes back inside budget.
+        seen_pairs = set()
         for i in range(len(clocked)):
             for j in range(i + 1, len(clocked)):
-                (na, ca), (nb, cb) = clocked[i], clocked[j]
-                skew = abs(ca["offset_s"] - cb["offset_s"]) * 1000.0
-                noise = (ca["rtt_ms"] + cb["rtt_ms"]) / 2.0
-                if skew > max(5.0, noise):
-                    out.append(self._a(
-                        "node_clock_skew", None,
-                        "%s and %s clocks disagree by %.1f ms" % (na, nb, skew),
-                        {"skew_ms": round(skew, 2),
-                         "offsets_ms": {na: round(ca["offset_s"] * 1e3, 2),
-                                        nb: round(cb["offset_s"] * 1e3, 2)},
-                         "rtt_noise_ms": round(noise, 2)},
-                        "scheduled fires land this far apart and the strobe "
-                        "walks out of the exposure window. Re-point both "
-                        "nodes' chrony at ONE reachable master (the rigd "
-                        "host, or peer cam2 to cam1) and confirm with "
-                        "chronyc tracking",
-                        sev="bad" if skew > 8.0 else "warn"))
+                (na, ia), (nb, ib) = clocked[i], clocked[j]
+                pair = (na, nb)
+                seen_pairs.add(pair)
+                skew = abs(ia["offset_s"] - ib["offset_s"]) * 1000.0
+                noise = (ia["rtt_ms_best"] + ib["rtt_ms_best"]) / 2.0
+                if skew <= max(5.0, noise):
+                    self._skew_streak.pop(pair, None)
+                    continue
+                n = self._skew_streak.get(pair, 0) + 1
+                self._skew_streak[pair] = n
+                if n < CLOCK_SKEW_SCANS:
+                    continue
+                out.append(self._a(
+                    "node_clock_skew", None,
+                    "%s and %s clocks disagree by %.1f ms (%d scans running)"
+                    % (na, nb, skew, n),
+                    {"skew_ms": round(skew, 2),
+                     "offsets_ms": {na: round(ia["offset_s"] * 1e3, 2),
+                                    nb: round(ib["offset_s"] * 1e3, 2)},
+                     "rtt_noise_ms": round(noise, 2), "scans": n,
+                     "samples": {na: ia["n"], nb: ib["n"]}},
+                    "the whole stereo sync budget is 10 ms: scheduled fires "
+                    "land this far apart and the strobe walks out of the "
+                    "exposure window. Re-point both nodes' chrony at ONE "
+                    "reachable master (peer cam2 to cam1) and confirm with "
+                    "chronyc tracking",
+                    sev="bad" if skew > 8.0 else "warn"))
+        for pair in [p for p in self._skew_streak if p not in seen_pairs]:
+            self._skew_streak.pop(pair, None)
+        # The host itself. The nodes are chrony-locked to each other, so a
+        # common-mode node-minus-host offset never shows up as skew: it was
+        # invisible until it had eaten the fire schedule. Measured on this Mac
+        # 2026-08-23: 187 ms, drifting ~60 ppm, both nodes reporting late_ms
+        # ~33 ms on every fire and nav lookups ~190 ms off (19 cm at 1 m/s).
+        if clocked:
+            offs = sorted(i["offset_s"] for _, i in clocked)
+            k = len(offs)
+            med = offs[k // 2] if k % 2 else (offs[k // 2 - 1] + offs[k // 2]) / 2.0
+            if abs(med) > HOST_CLOCK_WARN_S:
+                out.append(self._a(
+                    "host_clock_offset", None,
+                    "the rigd host clock is %.0f ms %s the cameras"
+                    % (abs(med) * 1e3, "behind" if med > 0 else "ahead"),
+                    {"offset_s": round(med, 4),
+                     "offset_ms": round(med * 1e3, 2),
+                     "per_node_ms": {n: round(i["offset_s"] * 1e3, 2)
+                                     for n, i in clocked},
+                     "samples": {n: i["n"] for n, i in clocked}},
+                    "every fire is scheduled on the host clock and busy-waited "
+                    "on the node clock, so this offset comes straight out of "
+                    "the 10 ms stereo sync budget - and nav fixes are looked "
+                    "up at a node epoch against a host-keyed ring, putting "
+                    "every frame's position out by this much. Enable network "
+                    "time on the host (System Settings > General > Date & "
+                    "Time), then confirm the nodes' chronyc tracking",
+                    sev="bad" if abs(med) > HOST_CLOCK_BAD_S else "warn"))
         free = self._runs_free_mb()
         if isinstance(free, (int, float)) and free < RUNS_DISK_LOW_MB:
             out.append(self._a(
@@ -600,7 +1099,19 @@ class Rig:
         self.timesync = TimeSync(self.events)
         self.nav = self._start_nav()
         self._drain_lock = threading.Lock()
-        self._drain_status = {"active": False, "node": None, "last": None}
+        self._drain_status = {"active": False, "node": None, "last": None,
+                              "queue": [], "cancel_requested": False,
+                              "wedged": {}}
+        # Set to ask the running drain to stop. C4: the Drainer finishes the
+        # file it is on and never cancels between pull-verify and delete, so a
+        # cancel can never cost a card original.
+        self._drain_stop = threading.Event()
+        # node -> the monitor's rebooted_at at the moment its drain hit the
+        # "card index not ready" wedge. See _drain_wedge_reason().
+        self._drain_wedged = {}
+        self._imu_lock = threading.Lock()
+        self._imu_node = None
+        self._imu_dead_until = 0.0
         self.runmgr = RunManager(self.monitors, self.settings, self.timesync,
                                  self.events, self.nav)
         self.anomalies = Anomalies(self.monitors, self.runmgr, self.nav,
@@ -701,7 +1212,8 @@ class Rig:
             # nav for the whole lifetime of the process.
             self.events.emit("warn", "nav", "iKonvert not open yet: %s" % e)
         reader.start()
-        wrapped = StaticFixNav(reader, navmod, self.events)
+        wrapped = StaticFixNav(reader, navmod, self.events,
+                               run_active=self._recording_run_id)
         if wrapped.static_label():
             self.events.emit("warn", "nav",
                              "STATIC FIX armed: flight-log positions fall "
@@ -719,44 +1231,152 @@ class Rig:
 
     def drain_status(self):
         with self._drain_lock:
-            return dict(self._drain_status)
+            st = dict(self._drain_status)
+            st["wedged"] = {n: dict(v) for n, v in self._drain_wedged.items()}
+        st["cancel_requested"] = self._drain_stop.is_set()
+        return st
 
-    def start_drain(self, nodes, keep=False):
+    def cancel_drain(self):
+        """Ask the running drain to stop (contract C4).
+
+        There was no way out of a drain at all: FIELD-RUN's own numbers put a
+        full card at 10-15 minutes, RunManager.start refuses for the whole of
+        it, and the only escape an operator had was `launchctl kickstart -k`,
+        which SIGTERMs rigd and kills the drain thread mid-pull. The Event is
+        checked between FILES, never between a file's verify and its card
+        delete, so cancelling can never cost a card original."""
+        with self._drain_lock:
+            if not self._drain_status["active"]:
+                return {"ok": False, "error": "no drain is running"}
+            node = self._drain_status["node"]
+        self._drain_stop.set()
+        self.events.emit("warn", "drain",
+                         "drain cancel requested on %s - it stops after the "
+                         "file it is on; already-verified files stay pulled "
+                         "and the rest of the card is untouched" % node,
+                         node=node)
+        return {"ok": True, "cancelling": node}
+
+    # The wedge (HANDOFF §2.2, reproduced live 2026-08-23 on cam2): a body
+    # whose transfer subsystem is stuck never publishes "card index ready", so
+    # drain.py's _wait_index gives up after 90 s - twice, because it retries -
+    # and the whole auto-drain after every Stop burns 3 minutes and achieves
+    # nothing. Only a power cycle clears it, so re-attempting it automatically
+    # is pure cost. The skip is released the moment the monitor SEES the node
+    # reboot (piagent host_uptime_s reset -> NodeMonitor.rebooted_at moves), or
+    # when the operator asks for a drain by hand.
+    WEDGE_MARK = "card index not ready"
+
+    def _drain_wedge_reason(self, node):
+        """Why an AUTO drain should skip this node, or None."""
+        w = self._drain_wedged.get(node)
+        if not w:
+            return None
+        m = next((x for x in self.monitors if x.name_ == node), None)
+        if m is not None and getattr(m, "rebooted_at", None) != w["rebooted_at"]:
+            self._drain_wedged.pop(node, None)      # seen to reboot: clear it
+            return None
+        return ("%s's last drain wedged its transfer subsystem (%s) and it has "
+                "not been seen to power-cycle since - skipping the auto-drain. "
+                "Power-cycle the camera, then drain it by hand from the "
+                "Card drain panel in Review"
+                % (node, w["at_iso"]))
+
+    def start_drain(self, nodes, keep=False, auto=False):
+        """Claim the nodes and launch the drain worker. `auto` marks the
+        after-a-run drain, which honours the wedge skip; a manual drain is the
+        operator overriding it and clears the mark."""
+        want = list(nodes)
+        skipped = {}
+        for n in want:
+            m = next((x for x in self.monitors if x.name_ == n), None)
+            if m is None:
+                skipped[n] = "unknown node"
+            elif not m.is_connected():
+                skipped[n] = "not connected - its card was NOT drained"
+            elif auto:
+                why = self._drain_wedge_reason(n)
+                if why:
+                    skipped[n] = why
+            if n not in skipped and not auto:
+                self._drain_wedged.pop(n, None)
+        nodes = [n for n in want if n not in skipped]
+
+        err = None
         with self._drain_lock:
             if self._drain_status["active"]:
-                return {"ok": False, "error": "a drain is already running on %s"
-                        % self._drain_status["node"]}
-            if self.runmgr.status().get("active"):
-                return {"ok": False, "error": "a run is active - cannot drain"}
-            nodes = [n for n in nodes
-                     if any(m.name_ == n and m.is_connected() for m in self.monitors)]
-            if not nodes:
-                return {"ok": False, "error": "no connected node to drain"}
-            # Claim the nodes for the drain HERE, under the lock, before any
-            # run can observe them free: setting runmgr.draining/suspend only
-            # inside the worker thread left a window where RunManager.start saw
-            # draining=None and fired into a camera about to drop to transfer
-            # mode (audit 2026-08-23, TOCTOU). RunManager.start takes the same
-            # _drain_lock to check.
-            self._drain_status = {"active": True, "node": nodes[0], "last": None,
-                                  "queue": list(nodes)}
-            self.runmgr.draining = nodes[0]
-            for m in self.monitors:
-                if m.name_ in nodes:
-                    m.suspend_control = True
-        threading.Thread(target=self._drain_worker, args=(nodes, keep),
-                         daemon=True).start()
-        return {"ok": True, "draining": nodes}
+                err = ("a drain is already running on %s"
+                       % self._drain_status["node"])
+            elif not nodes:
+                err = "no node to drain"
+            else:
+                # Claim the nodes for the drain HERE, under the RUN MANAGER's
+                # OWN lock, before any run can observe them free. The previous
+                # fix claimed them under rigd's _drain_lock, which
+                # RunManager.start never takes: it checks self.draining under
+                # run.py's self._lock, so the two guards sat on different
+                # mutexes and the TOCTOU survived (audit 2026-08-23).
+                # status() is deliberately NOT called here - it takes the same
+                # non-reentrant lock and would deadlock.
+                with self.runmgr._lock:      # noqa: SLF001 - the shared claim
+                    if self.runmgr.active:
+                        err = "a run is active - cannot drain"
+                    elif getattr(self.runmgr, "draining", None):
+                        err = "a drain already holds %s" % self.runmgr.draining
+                    else:
+                        # The claim covers the whole QUEUE, not just the node
+                        # being drained right now: clearing it between nodes
+                        # reopened the same window for every node after the
+                        # first.
+                        self.runmgr.draining = nodes[0]
+            if err is None:
+                self._drain_stop = threading.Event()
+                self._drain_status = {"active": True, "node": nodes[0],
+                                      "last": None, "queue": list(nodes),
+                                      "skipped": skipped,
+                                      "cancel_requested": False}
+                for m in self.monitors:
+                    if m.name_ in nodes:
+                        m.suspend_control = True
+                stopev = self._drain_stop
+        # Every refusal path used to return a structured error that the
+        # /api/run/stop branch threw away, and none of them emitted an event -
+        # so an auto-drain that never happened was invisible everywhere (audit
+        # 2026-08-23). Say it out loud, naming the nodes that were dropped.
+        if skipped:
+            self.events.emit("warn", "drain",
+                             "card drain skipping %s"
+                             % ", ".join("%s (%s)" % kv
+                                         for kv in sorted(skipped.items())))
+        if err is not None:
+            self.events.emit("warn", "drain",
+                             "card drain not started: %s" % err)
+            return {"ok": False, "error": err, "skipped": skipped}
+        threading.Thread(target=self._drain_worker,
+                         args=(nodes, keep, stopev), daemon=True).start()
+        return {"ok": True, "draining": nodes, "skipped": skipped}
 
-    def _drain_worker(self, nodes, keep):
+    def _drain_worker(self, nodes, keep, stopev):
       try:
         for node in nodes:
             host = next((m.host for m in self.monitors if m.name_ == node), None)
             if host is None:
                 continue
+            if stopev.is_set():
+                self.events.emit("warn", "drain",
+                                 "drain cancelled before %s - its card was "
+                                 "NOT drained" % node, node=node)
+                continue
             # draining + suspend_control were claimed in start_drain under
-            # the lock; just point them at the current node.
-            self.runmgr.draining = node
+            # the lock; just point them at the current node. NOT cleared
+            # between nodes - see the claim comment there. Still under the run
+            # manager's lock: every write to `draining` goes through the same
+            # mutex RunManager.start reads it under, so there is exactly one
+            # rule to check rather than "this one is safe because...".
+            # Sequential with _drain_lock below, never nested inside it -
+            # start_drain takes them the other way round.
+            with self.runmgr._lock:          # noqa: SLF001
+                self.runmgr.draining = node
             with self._drain_lock:
                 self._drain_status["node"] = node
             self.events.emit("info", "drain", "card drain started on %s" % node,
@@ -765,26 +1385,31 @@ class Rig:
                 rep = draindrv.Drainer(
                     node, host, dest=self.DRAIN_DEST,
                     log=lambda m: self.events.emit("info", "drain", m)).run(
-                        keep_card=keep)
+                        keep_card=keep, stop=stopev)
                 sev = "warn" if rep.get("errors") else "info"
                 self.events.emit(
                     sev, "drain",
-                    "%s drain done: %d pulled (%.1f GB), %d deleted, %d errors"
-                    % (node, rep["pulled"], rep["bytes"] / 1e9, rep["deleted"],
+                    "%s drain %s: %d pulled (%.1f GB), %d deleted, %d errors"
+                    % (node, "cancelled" if rep.get("cancelled") else "done",
+                       rep["pulled"], rep["bytes"] / 1e9, rep["deleted"],
                        len(rep["errors"])), node=node,
+                    cancelled=bool(rep.get("cancelled")),
                     errors=rep["errors"][:5])
+                self._note_wedge(node, rep)
                 with self._drain_lock:
                     self._drain_status["last"] = {"node": node, "at": time.time(),
                                                   **{k: rep[k] for k in
                                                      ("pulled", "bytes", "deleted",
                                                       "verified")},
+                                                  "cancelled": bool(rep.get("cancelled")),
                                                   "errors": len(rep["errors"])}
                 # hand the pulled RAWs to ingest (best-effort; never blocks).
                 # Per-node staging dir - the drain writes ~/rig-raw/<node>/.
                 try:
                     import ingest
-                    ingest.ingest(os.path.join(self.DRAIN_DEST, node),
-                                  log=lambda *a: None)
+                    self._note_ingest(node, ingest.ingest(
+                        os.path.join(self.DRAIN_DEST, node),
+                        log=lambda *a: None))
                 except Exception as e:  # noqa: BLE001
                     self.events.emit("warn", "drain",
                                      "ingest after drain failed: %s" % e)
@@ -792,20 +1417,76 @@ class Rig:
                 self.events.emit("error", "drain",
                                  "drain on %s failed: %s" % (node, e), node=node)
             finally:
-                self.runmgr.draining = None
                 for m in self.monitors:
                     if m.name_ == node:
                         m.suspend_control = False
       finally:
         # Whatever happened (an exception before the per-node try, a host
         # lookup miss), release the drain claim so a leaked active flag can
-        # never block every future drain and run (audit 2026-08-23).
-        self.runmgr.draining = None
+        # never block every future drain and run (audit 2026-08-23). Under the
+        # run manager's lock, for the same reason the claim is.
+        with self.runmgr._lock:              # noqa: SLF001
+            self.runmgr.draining = None
         for m in self.monitors:
             m.suspend_control = False
         with self._drain_lock:
             self._drain_status["active"] = False
             self._drain_status["node"] = None
+            self._drain_status["queue"] = []
+
+    def _note_ingest(self, node, rep_i):
+        """Say what the post-drain ingest actually matched.
+
+        The automatic path threw away both the log and the return value, so a
+        drain that emptied the card and then matched NOTHING - a truncated
+        frame index, a body clock that has moved past the offset the mode
+        found, missing flight rows - left only "cam1 drain done: 169 pulled,
+        169 deleted, 0 errors" in the journal. The card originals are already
+        gone at that point and the RAWs sit in the staging dir unnamed and
+        unpaired, with nothing anywhere saying so; the operator's manual
+        ingest (FIELD-RUN.md) is hours later. ingest returns `totals` for
+        exactly this caller (audit 2026-08-24)."""
+        t = (rep_i or {}).get("totals") or {}
+        matched = t.get("matched", 0)
+        # A card with files that matched nothing, an ambiguous attribution, or
+        # a content conflict are all "look at this now"; the ordinary case is
+        # one info line saying how many frames were placed.
+        bad = bool(t.get("ambiguous") or t.get("conflicts")
+                   or (t.get("cards") and not matched))
+        self.events.emit(
+            "warn" if bad else "info", "drain",
+            "%s post-drain ingest: %d matched, %d unmatched, %d RAW placed, "
+            "%d leftover of %d card files%s%s"
+            % (node, matched, t.get("unmatched", 0), t.get("raw", 0),
+               t.get("leftover", 0), t.get("cards", 0),
+               ", %d CONFLICTS" % t["conflicts"] if t.get("conflicts") else "",
+               (", AMBIGUOUS: %s" % "; ".join(t["ambiguous"]))
+               if t.get("ambiguous") else ""),
+            node=node, ingest=t)
+        # ...and beside "deleted from card" in /api/drain and the UI's table.
+        with self._drain_lock:
+            last = self._drain_status.get("last")
+            if isinstance(last, dict) and last.get("node") == node:
+                last["ingest"] = t
+
+    def _note_wedge(self, node, rep):
+        """Remember (or clear) the transfer-subsystem wedge for this node."""
+        wedged = any(self.WEDGE_MARK in str(e) for e in (rep.get("errors") or []))
+        m = next((x for x in self.monitors if x.name_ == node), None)
+        with self._drain_lock:      # drain_status() iterates this dict
+            if not wedged:
+                self._drain_wedged.pop(node, None)
+                return
+            self._drain_wedged[node] = {
+                "at": time.time(),
+                "at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "rebooted_at": getattr(m, "rebooted_at", None) if m else None}
+        self.events.emit(
+            "warn", "drain",
+            "%s's card index never came ready - its transfer subsystem is "
+            "wedged. Auto-drain will SKIP this node until it is seen to "
+            "power-cycle (or you drain it by hand); its card keeps every "
+            "frame in the meantime" % node, node=node)
 
     def _startup_calibrate(self):
         """Measure per-camera trigger latency once the fleet is up.
@@ -857,6 +1538,29 @@ class Rig:
         while not self._stop.wait(5.0):
             if not self.nav:
                 continue
+            # Keep the static-fix latch tied to the run that owns it: adopt
+            # the active run's id (so a start that answered its client but
+            # never bound still ends up owned), and release the latch when no
+            # run is active - the run ended by a path other than POST
+            # /api/run/stop (an internal stop, a rigd-side abort), and a latch
+            # left behind would keep that transect's stand-in policy in force
+            # over the idle fleet.
+            #
+            # This tick used to clear UNCONDITIONALLY on "not active", which is
+            # also what RunManager.start reports for the whole of its multi-
+            # second live probe of every monitor: with one node unreachable the
+            # tick stripped the decision of the run that was starting, and a
+            # bus drop later in that run then fabricated positions from the
+            # static fix (audit 2026-08-24, review blocker). end_run_nav now
+            # refuses while a start is in flight.
+            try:
+                st = self.runmgr.status()
+                if st.get("active"):
+                    self.bind_run_nav(st.get("run_id"))
+                else:
+                    self.end_run_nav()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 ta = getattr(self.nav, "time_authority", None)
                 # gps_epoch() always returns a value (Jetson time when there is
@@ -908,6 +1612,9 @@ class Rig:
         run = self.runmgr.status()
         stats = (run.get("stats") or {}).get(m.name_, {}) if run.get("active") \
             else {}
+        clock = m.clock_offset_info()
+        if clock.get("offset_s") is not None:
+            clock["offset_s"] = round(clock["offset_s"], 4)
         # ilxctl already formats display labels (iso="ISO 400", shutter="1/200",
         # aperture="F8"); use them directly and carry raw numerics alongside.
         return {
@@ -960,12 +1667,20 @@ class Rig:
             "zoom_pos": status.get("zoomPosCur", status.get("zoomPos")),
             "zoom_setting_label": status.get("zoomSettingLabel"),
             "convergence": snap.get("convergence"),
-            # This node's clock vs ours, RTT-bounded, from the /health poll.
-            # Two nodes disagreeing with each other is 1:1 exposure skew.
+            # This node's clock vs the host's, from the /health poll. Two
+            # numbers on purpose: clock_offset_ms is the LAST RAW sample (what
+            # the most recent poll saw, network noise and all) and
+            # clock_offset_s is the FILTERED figure every decision is made on
+            # (contract C1: RTT-gated median of the last up-to-8 samples). They
+            # differ by tens of ms on a busy link, and an operator comparing
+            # the strip against an anomaly needs to see both rather than
+            # wonder which one lied.
             "clock_offset_ms": (round(m.clock["offset_s"] * 1e3, 2)
                                 if getattr(m, "clock", None) else None),
             "clock_rtt_ms": (round(m.clock["rtt_ms"], 2)
                              if getattr(m, "clock", None) else None),
+            "clock_offset_s": clock["offset_s"],
+            "clock_offset_info": clock,
             "gpio": h.get("gpio"), "imu": h.get("imu"),
             "disk_free_mb": h.get("disk_free_mb"),
             "cam_frames": h.get("cam_frames"),
@@ -973,19 +1688,78 @@ class Rig:
         }
 
     def fanout(self, api_path, body):
-        """Forward an ilxctl call to every connected camera (or one, if body has
-        a 'node'). Used for lens controls so cameras stay in lock-step."""
+        """Forward a lens call to every connected camera (or one, if body has
+        a 'node'). Lens position/speed stay PER CAMERA and out of `desired`
+        (docs/future-tests.md §1), so this is the only path they take.
+
+        What failed (fuzz 2026-08-23): a camera that was not connected was
+        skipped silently and the answer was still {"ok":true,"results":{}}, so
+        the UI's lens queue saw success, cleared its note and - for a STOP -
+        stopped retrying, against a lens that was still driving when the node
+        came back. Out-of-range values had the same shape: focus/position
+        -1 or 99999999 answered ok:true and nothing moved. Now a skipped node
+        is named, an addressed-but-skipped node is ok:false, and values are
+        clamped into the body's own published range with the clamp reported."""
         target = body.get("node")
+        if target is not None:
+            if not isinstance(target, str) or not self._known(target):
+                raise BadRequest("unknown node %r (known: %s)"
+                                 % (target, ", ".join(m.name_ for m in
+                                                      self.monitors)))
         payload = {k: v for k, v in body.items() if k != "node"}
-        results = {}
+        field, range_key = LENS_FIELD.get(api_path, (None, None))
+        # Validate only what was SENT: ilxctl supplies its own default for an
+        # absent field, and the defect being fixed is bad values reaching the
+        # body, not missing ones.
+        if field and field in payload:
+            payload[field] = want_int(payload[field], '"%s"' % field)
+        results, skipped, clamped = {}, {}, {}
         for m in self.monitors:
             if target and m.name_ != target:
                 continue
             if not m.is_connected():
+                skipped[m.name_] = "node not connected"
                 continue
+            p = dict(payload)
+            if field and field in p and range_key:
+                rng = (m.snapshot().get("status") or {}).get(range_key)
+                v, was = _clamp_to_range(p[field], rng)
+                if was:
+                    clamped[m.name_] = {"from": p[field], "to": v,
+                                        "range": rng}
+                    p[field] = v
             results[m.name_] = http_json("http://%s:8080%s" % (m.host, api_path),
-                                         payload, timeout=10)
-        return {"ok": True, "results": results}
+                                         p, timeout=10)
+        if not results:
+            return {"ok": False,
+                    "error": ("%s: node not connected" % target) if target
+                             else "no connected camera",
+                    "results": {}, "skipped": skipped}
+        ok = all(not (isinstance(r, dict) and r.get("ok") is False)
+                 for r in results.values())
+        out = {"ok": ok, "results": results}
+        if skipped:
+            out["skipped"] = skipped
+        if clamped:
+            out["clamped"] = clamped
+        return out
+
+    def _known(self, name):
+        return any(m.name_ == name for m in self.monitors)
+
+    # A failed IMU probe is remembered for this long. The IMU hangs off cam1;
+    # when cam1 loses PoE its IP stops answering ARP and every http_json to it
+    # blocks the full 3 s timeout. rig_ui polls /api/imu/window five times a
+    # second while the IMU tab is open, so rigd accumulated ~15 handler threads
+    # each parked on a dead socket - and because a browser allows six
+    # connections per origin, the queued IMU requests also delayed /api/fleet,
+    # /api/anomalies and /api/nav on the same tab, exactly when the operator
+    # needed to see node_offline (audit 2026-08-23).
+    IMU_DEAD_TTL_S = 10.0
+    # How long stop() waits for an active run to finalise before exiting
+    # anyway. Sized under launchd's 20 s default SIGKILL budget with room for
+    # serve_forever's 0.5 s poll and the monitor shutdown behind it.
+    STOP_DEADLINE_S = 12.0
 
     def _imu_host(self):
         """Host currently serving IMU samples.
@@ -993,17 +1767,40 @@ class Rig:
         The IMU is the rig's master orientation source for every camera, so the
         node it hangs off is discovered rather than hardcoded: it can be moved
         to another Pi without a code change. The last node that answered is
-        cached, and only re-probed once it stops answering."""
-        cached = getattr(self, "_imu_node", None)
-        order = ([m for m in self.monitors if m.name_ == cached] +
-                 [m for m in self.monitors if m.name_ != cached])
-        for m in order:
-            s = http_json("http://%s:8081/imu/latest" % m.host, timeout=3)
-            if s and s.get("epoch") is not None:
-                self._imu_node = m.name_
-                return m.host, s
-        self._imu_node = None
-        return None, None
+        cached; a node the MONITOR already knows is OFFLINE is never probed at
+        all, and a probe that finds nothing is remembered for IMU_DEAD_TTL_S so
+        the next hundred polls answer present:false for free. The probe itself
+        is serialised, so concurrent callers share one round trip instead of
+        each opening their own."""
+        now = time.monotonic()
+        if now < getattr(self, "_imu_dead_until", 0.0):
+            return None, None
+        with self._imu_lock:
+            # Re-check: a caller that queued behind the prober must not repeat
+            # the work it just did.
+            now = time.monotonic()
+            if now < self._imu_dead_until:
+                return None, None
+            cached = getattr(self, "_imu_node", None)
+            order = ([m for m in self.monitors if m.name_ == cached] +
+                     [m for m in self.monitors if m.name_ != cached])
+            probed = 0
+            for m in order:
+                if m.snapshot()["state"] == NodeMonitor.OFFLINE:
+                    continue          # no HTTP to a node we know is not there
+                probed += 1
+                s = http_json("http://%s:8081/imu/latest" % m.host, timeout=3)
+                if s and s.get("epoch") is not None:
+                    self._imu_node = m.name_
+                    self._imu_dead_until = 0.0
+                    return m.host, s
+            self._imu_node = None
+            self._imu_dead_until = time.monotonic() + self.IMU_DEAD_TTL_S
+            if probed:
+                self.events.emit("info", "imu",
+                                 "no node is serving IMU samples; not "
+                                 "re-probing for %ds" % self.IMU_DEAD_TTL_S)
+            return None, None
 
     def imu(self):
         host, s = self._imu_host()
@@ -1033,17 +1830,85 @@ class Rig:
 
     def nav_snapshot(self):
         if not self.nav:
-            return {"present": False}
+            return {"present": False, "fix_kind": "none", "valid": False}
         try:
             s = self.nav.snapshot() or {}
             if s.get("lat") is not None and s.get("lon") is not None:
                 import nav as navmod
                 x, y, z = navmod.latlon_to_utm(s["lat"], s["lon"])
                 s.update(xutm=x, yutm=y, utm_zone=z)
+            # fix_kind is the field the UI colours the header pill from, and it
+            # exists because "lat is not None" was doing that job: an armed
+            # STATIC position wore the same green "nav fix" as a live GPS fix
+            # and was plotted as a track (audit 2026-08-23). StaticFixNav sets
+            # it; derive it here too so a bare NavReader (no static wrapper)
+            # and a nav-less rigd still answer the contract.
+            if "fix_kind" not in s:
+                s["fix_kind"] = ("live" if s.get("valid") else
+                                 "static" if (s.get("lat") is not None
+                                              and s.get("static_fix"))
+                                 else "none")
+            if s["fix_kind"] != "live":
+                s["valid"] = False       # a static row is never a fix
             s["present"] = True
             return s
         except Exception as e:  # noqa: BLE001
-            return {"present": False, "error": str(e)}
+            return {"present": False, "fix_kind": "none", "valid": False,
+                    "error": str(e)}
+
+    # ---- static-fix arming (nav finding #1) -------------------------------
+    def _recording_run_id(self):
+        """The run_id of the transect recording right now, or None.
+
+        Deliberately a plain attribute read rather than runmgr.status(): this
+        is called from StaticFixNav.armed() on the pull workers' threads, once
+        per frame, and status() takes the run manager's non-reentrant lock."""
+        return (getattr(getattr(self, "runmgr", None), "active", None)
+                or {}).get("run_id")
+
+    def begin_run_nav(self):
+        """Latch the static-fix fallback for the run about to start.
+
+        Called from the /api/run/start handler because the decision is "was
+        the gateway alive when the operator pressed record", which only makes
+        sense at that instant: armed means the whole line carries the armed
+        position, unarmed means a mid-run bus drop writes EMPTY lat/long and
+        raises nav_no_fix rather than papering the gap over.
+
+        Returns the ownership TOKEN to hand back to bind_run_nav (the start
+        succeeded) or release_run_nav (it was refused). A None token means the
+        latch was already owned - a duplicate Start while a run is recording -
+        so this request took nothing and must release nothing."""
+        if not hasattr(self.nav, "begin_run"):
+            return None
+        online = bool(getattr(self.nav, "gateway_online", False))
+        armed, token = self.nav.begin_run(online)
+        if armed and token is not None:
+            self.events.emit(
+                "warn", "nav",
+                "no live NMEA at run start - the armed STATIC fix (%s) will "
+                "stand in for every frame of this run; positions are one "
+                "constant, not a track" % self.nav.static_label())
+        return token
+
+    def bind_run_nav(self, run_id, token=None):
+        """Give the latch the identity of the run that now owns it."""
+        if run_id and hasattr(self.nav, "bind_run"):
+            return bool(self.nav.bind_run(run_id, token))
+        return False
+
+    def release_run_nav(self, token):
+        """Undo a begin_run_nav whose start was refused. A None token is a
+        no-op ON PURPOSE: this request never took the latch, so the run that
+        did still owns its decision."""
+        if token is not None and hasattr(self.nav, "end_run"):
+            return bool(self.nav.end_run(token=token))
+        return False
+
+    def end_run_nav(self, run_id=None):
+        if hasattr(self.nav, "end_run"):
+            return bool(self.nav.end_run(run_id=run_id))
+        return False
 
     def stop(self):
         """Shut down cleanly, finalising an active run first.
@@ -1055,7 +1920,20 @@ class Rig:
         pulled, renamed, or given a flight_log row. runmgr.stop() drains the
         pull workers and writes the manifest, so the ordinary exit path stops
         creating that seam. Idempotent: SIGTERM and the KeyboardInterrupt path
-        can both land here."""
+        can both land here.
+
+        BOUNDED (audit 2026-08-23). launchd SIGKILLs 20 s after SIGTERM by
+        default, and RunManager.stop against a wedged node can spend longer
+        than that on node I/O alone: cap_thread.join(6) + a 6 s grace loop that
+        never clears while pulled < fired + w.join(8) behind a 30 s http_bytes
+        pull. rigd was killed before run.json was marked final, so the next
+        start had to rebuild the manifest as interrupted. The finalisation now
+        runs on its own thread with a deadline, so the process always reaches
+        "rigd down" inside the budget; whatever the join did not cover is
+        repaired by _recover_runs at the next start, which is strictly better
+        than being killed mid-write. deploy/rigd.launchd.plist also raises
+        ExitTimeOut to 60 so the normal (slow but healthy) stop is never cut
+        short in the first place."""
         if self._stopped.is_set():
             return
         self._stopped.set()
@@ -1064,7 +1942,28 @@ class Rig:
                 self.events.emit("warn", "lifecycle",
                                  "rigd is stopping with a run active - "
                                  "finalising it before exit")
-                self.runmgr.stop()
+                done = threading.Event()
+
+                def _fin():
+                    try:
+                        self.runmgr.stop()
+                    except Exception as e:  # noqa: BLE001
+                        self.events.emit("error", "lifecycle",
+                                         "could not finalise the active run: "
+                                         "%s" % e)
+                    finally:
+                        done.set()
+
+                t = threading.Thread(target=_fin, name="rigd-finalise",
+                                     daemon=True)
+                t.start()
+                if not done.wait(self.STOP_DEADLINE_S):
+                    self.events.emit(
+                        "error", "lifecycle",
+                        "run finalisation did not complete within %ds (a node "
+                        "is not answering) - exiting anyway; the next rigd "
+                        "start rebuilds this run's manifest from the "
+                        "flight_logs on disk" % self.STOP_DEADLINE_S)
         except Exception as e:  # noqa: BLE001
             self.events.emit("error", "lifecycle",
                              "could not finalise the active run: %s" % e)
@@ -1107,19 +2006,64 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _read_body(self):
+        """The POST body as a dict, or raise BadRequest.
+
+        "Cannot parse" and "no body" used to be the same answer, {}, so
+        POST /api/run/start with a truncated JSON body recorded a REAL transect
+        on the built-in defaults instead of refusing it (verified live). A body
+        that is valid JSON but not an OBJECT ("null", "[]", "3") is refused for
+        the same reason: every handler below immediately does b.get(...), which
+        on a list is an AttributeError and a 500."""
         try:
             n = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
-            n = 0
-        if n <= 0 or n > 1 << 20:
+            raise BadRequest("bad Content-Length header") from None
+        if n <= 0:
             return {}
+        if n > 1 << 20:
+            # Not read, so the connection cannot be reused - say so rather
+            # than leaving a megabyte of body framed as the next request.
+            self.close_connection = True
+            raise BadRequest("body too large (%d bytes; limit 1 MiB)" % n)
         try:
-            return json.loads(self.rfile.read(n).decode() or "{}")
-        except (ValueError, OSError):
-            return {}
+            raw = self.rfile.read(n)
+        except OSError as e:
+            raise BadRequest("could not read the request body: %s" % e) from None
+        # parse_constant refuses Infinity/-Infinity/NaN, which json.loads
+        # otherwise accepts silently: they are not JSON, no client of this
+        # daemon sends them, and every coercer downstream would have to guard
+        # them one at a time (want_int did not - audit 2026-08-24).
+        def _no_const(name):
+            raise BadRequest("JSON body contains %s, which is not a number"
+                             % name)
+
+        try:
+            b = json.loads(raw.decode("utf-8") or "{}",
+                           parse_constant=_no_const)
+        except (ValueError, UnicodeDecodeError) as e:
+            if isinstance(e, BadRequest):
+                raise
+            raise BadRequest("malformed JSON body: %s" % e) from None
+        # "null" is refused with the rest: rig_ui's api() sends a GET when it
+        # has no body and JSON.stringify of an object otherwise, so nothing
+        # legitimate ever POSTs a bare null - it is only ever a client bug or
+        # a fuzzer, and treating it as {} is what let a defaulted run start.
+        if not isinstance(b, dict):
+            raise BadRequest("JSON body must be an object, got %s"
+                             % ("null" if b is None else type(b).__name__))
+        return b
 
     def _mon(self, name):
         return next((m for m in RIG.monitors if m.name_ == name), None)
+
+    def _node(self, name, what="node"):
+        """A monitor for a node name the fleet actually has, or BadRequest."""
+        m = self._mon(name) if isinstance(name, str) else None
+        if m is None:
+            raise BadRequest("%s: unknown node %r (known: %s)"
+                             % (what, name,
+                                ", ".join(x.name_ for x in RIG.monitors)))
+        return m
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -1138,7 +2082,10 @@ class Handler(BaseHTTPRequestHandler):
             elif p == "/api/anomalies":
                 self._json({"anomalies": RIG.anomalies.scan()})
             elif p == "/api/events":
-                since = int((q.get("since") or ["0"])[0])
+                # ?since=abc used to reach int() and come back as a 500 with
+                # "invalid literal for int()" in the body, which reads as a
+                # rigd crash to anyone watching the journal.
+                since = qint(q, "since", 0, lo=0)
                 sev = (q.get("sev") or ["debug"])[0]
                 self._json(RIG.events.since(since, sev))
             elif p == "/api/settings":
@@ -1172,11 +2119,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.imu())
             elif p == "/api/imu/window":
                 now = time.time()
-                t0 = float((q.get("t0") or ["0"])[0] or 0)
+                t0 = qfloat(q, "t0", 0.0)
                 # A fresh client sends t0=0; give it the last second rather than
-                # every sample the ring holds.
+                # every sample the ring holds. A window that reaches further
+                # back than the ring is capped here rather than asking piagent
+                # for an hour of samples it would have to serialise.
                 if t0 <= 0:
                     t0 = now - 1.0
+                elif now - t0 > 600.0:
+                    t0 = now - 600.0
                 self._json(RIG.imu_window(t0, now))
             elif p == "/api/nav":
                 self._json(RIG.nav_snapshot())
@@ -1198,15 +2149,12 @@ class Handler(BaseHTTPRequestHandler):
             elif p == "/api/strobe":
                 self._json({"ok": True, "strobe": RIG.runmgr.get_strobe()})
             elif p == "/api/status":
-                m = self._mon((q.get("node") or [""])[0])
-                if not m:
-                    self._json({}, 404)
-                else:
-                    self._json(http_json("http://%s:8080/api/status" % m.host,
-                                         timeout=6))
+                m = self._node((q.get("node") or [""])[0], "?node")
+                self._json(http_json("http://%s:8080/api/status" % m.host,
+                                     timeout=6))
             elif p == "/api/shots":
-                m = self._mon((q.get("node") or [""])[0])
-                self._json(m.shots() if m else [])
+                m = self._node((q.get("node") or [""])[0], "?node")
+                self._json(m.shots())
             elif p == "/api/frame":
                 self._proxy_frame((q.get("node") or [""])[0],
                                   (q.get("name") or [""])[0])
@@ -1214,6 +2162,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._proxy_liveview((q.get("node") or [""])[0])
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
+        except BadRequest as e:
+            # A client-side mistake is a 400 naming the field, never a 500
+            # carrying a Python exception string, and it is not journalled as
+            # a rigd error - a fuzzer must not be able to fill the event log.
+            self._json({"ok": False, "error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
             RIG.events.emit("error", "http", "GET %s: %s" % (p, e))
             self._json({"ok": False, "error": str(e)}, 500)
@@ -1335,8 +2288,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         p = u.path
-        b = self._read_body()
         try:
+            # INSIDE the try, so a malformed body is a 400 with a message
+            # rather than an exception on the way to the dispatch (D1).
+            b = self._read_body()
             if p == "/api/settings":
                 rep = RIG.settings.update(b)
                 # A rejected value is returned, not swallowed: an out-of-range
@@ -1350,16 +2305,25 @@ class Handler(BaseHTTPRequestHandler):
                 # Stage on the primary only. `desired` is untouched and that
                 # node is pinned so the 3 s reconcile cannot yank the preview
                 # back before the operator has looked at it.
-                self._json(RIG.settings.preview(b, node=b.get("node")))
+                node = b.get("node")
+                if node is not None:
+                    node = self._node(node, '"node"').name_
+                self._json(RIG.settings.preview(b, node=node))
             elif p == "/api/settings/commit":
                 self._json(RIG.settings.commit())
             elif p in ("/api/settings/discard", "/api/settings/revert"):
                 self._json(RIG.settings.discard())
             elif p == "/api/settings/auto":
-                RIG.settings.set_auto(bool(b.get("on")))
-                self._json({"ok": True})
+                # bool("maybe") is True: {"on":"maybe"} armed the auto-exposure
+                # servo on the live rig, which then drives the fleet's exposure
+                # by itself for the rest of the session. A truthy string is not
+                # consent - require a real bool.
+                on = want_bool(b.get("on"), '"on"')
+                RIG.settings.set_auto(on)
+                self._json({"ok": True, "auto": on})
             elif p == "/api/ev":
-                cur = RIG.settings.bump_ev(int(b.get("steps", 0)))
+                cur = RIG.settings.bump_ev(
+                    want_int(b.get("steps", 0), '"steps"', -30, 30))
                 self._json({"ok": True, "expcomp_mev": cur})
             elif p == "/api/run/start":
                 # A pinned preview means cam1 is deliberately NOT on the fleet
@@ -1372,20 +2336,81 @@ class Handler(BaseHTTPRequestHandler):
                     RIG.settings.discard("a run was started while a preview was "
                                          "pinned - the fleet must be matched to "
                                          "record")
-                self._json(RIG.runmgr.start(b or {}))
+                # Latch the static-fix decision BEFORE the run exists, so the
+                # very first frame is judged by the same rule as the last. The
+                # token is this request's proof of ownership: it binds the
+                # latch to the run that started, or releases it if the start
+                # was refused. On "run already active" the token is None and
+                # nothing is released - dropping the RECORDING run's latch here
+                # is how a duplicate Start used to end in fabricated positions
+                # (audit 2026-08-24, review blocker). try/finally so a start
+                # that raises cannot leak the latch either.
+                tok = RIG.begin_run_nav()
+                bound = False
+                try:
+                    res = RIG.runmgr.start(b)
+                    if res.get("ok"):
+                        bound = RIG.bind_run_nav(res.get("run_id"), tok)
+                finally:
+                    if not bound:
+                        RIG.release_run_nav(tok)
+                self._json(res)
             elif p == "/api/run/stop":
+                # `drain` is honoured as an explicit override; absent, the
+                # ~/rig/auto_drain policy decides.
+                want_drain = (want_bool(b["drain"], '"drain"') if "drain" in b
+                              else RIG.auto_drain_default())
                 res = RIG.runmgr.stop()
-                if res.get("ok") and b.get("drain", RIG.auto_drain_default()):
-                    RIG.start_drain([n for n in res.get("summary", {})])
-                    res["drain_started"] = True
+                # Named, so a Stop that races another transect's Start cannot
+                # release the latch that Start is holding.
+                RIG.end_run_nav(run_id=res.get("run_id"))
+                if res.get("ok") and want_drain:
+                    # drain_started used to be hardcoded True while
+                    # start_drain's return value was discarded, so a Stop with
+                    # both nodes down reported a drain that never began and
+                    # nothing anywhere said the cards were not emptied (audit
+                    # 2026-08-23). Report what actually happened.
+                    d = RIG.start_drain([n for n in res.get("summary", {})],
+                                        auto=True)
+                    res["drain"] = d
+                    res["drain_started"] = bool(d.get("ok"))
+                else:
+                    res["drain_started"] = False
                 self._json(res)
             elif p == "/api/drain":
-                # Manual drain of one node or all connected. Refused during a run.
-                nodes = b.get("nodes") or [m.name_ for m in RIG.monitors
-                                           if m.is_connected()]
-                self._json(RIG.start_drain(nodes, keep=bool(b.get("keep"))))
+                # Manual drain of one node or all connected. Refused during a
+                # run. A manual drain is the operator overriding the wedge
+                # skip, so it clears the mark (see Rig.start_drain).
+                nodes = b.get("nodes")
+                if nodes is None:
+                    nodes = [m.name_ for m in RIG.monitors if m.is_connected()]
+                elif not isinstance(nodes, list):
+                    raise BadRequest('"nodes" must be a list of node names')
+                else:
+                    nodes = [self._node(n, '"nodes"').name_ for n in nodes]
+                self._json(RIG.start_drain(
+                    nodes, keep=want_bool(b.get("keep", False), '"keep"')))
+            elif p == "/api/drain/cancel":
+                self._json(RIG.cancel_drain())
             elif p == "/api/capture":
-                self._json(RIG.runmgr.capture_once(af=bool(b.get("af"))))
+                # The rig is ALWAYS manual focus - never AF, on any path. This
+                # is the one HTTP entry point that could still ask a body to
+                # autofocus on the shutter press (capture_once -> ilxctl
+                # /api/shutter {"af":true}), and nothing in the UI or the test
+                # harness sends it. Refuse it here rather than leave the rule
+                # depending on nobody typing it.
+                if want_bool(b.get("af", False), '"af"'):
+                    self._json({"ok": False, "error":
+                                "this rig is manual focus on every path: "
+                                "autofocus would move the lens between the "
+                                "stereo pair's calibration and this frame. "
+                                "Set focus with /api/focus/position"}, 400)
+                    return
+                # capture_once's result is passed through VERBATIM: it carries
+                # per-node late_ms/skew and (run lane, 2026-08-23) host_offset_s,
+                # the node-minus-host offset the fire was scheduled against.
+                # Nothing here may reshape or round it.
+                self._json(RIG.runmgr.capture_once(af=False))
             elif p == "/api/calibrate":
                 # Never into a live transect: calibration holds FOCUS (an
                 # AE-lock on the body) and its exposures race the run's own
@@ -1395,14 +2420,42 @@ class Handler(BaseHTTPRequestHandler):
                                 "a run is active - calibration would corrupt "
                                 "its exposures; stop the run first"}, 409)
                     return
+                # samples < 1 measured nothing and answered ok:true with an
+                # empty map; a junk value reached int() and became a 500.
+                # Every calibration sample is a real exposure on both bodies,
+                # so the upper bound is a shutter-count guard, not a nicety.
+                samples = want_int(b.get("samples", 5), '"samples"', 1, 50)
+                nodes = b.get("nodes")
+                if nodes is None:
+                    mons = None
+                elif not isinstance(nodes, list):
+                    raise BadRequest('"nodes" must be a list of node names')
+                else:
+                    mons = [self._node(n, '"nodes"') for n in nodes]
                 self._json({"ok": True,
                             "latency_ms": {k: round(v * 1000, 2) for k, v in
                                            RIG.runmgr.calibrate_trigger(
-                                               samples=int(b.get("samples", 5)),
+                                               samples=samples, nodes=mons,
                                                force=True   # operator asked
                                            ).items()}})
             elif p == "/api/reconcile":
-                RIG.settings.reconcile_all(force=True)
+                # "Push the desired vector at the bodies NOW" — the manual kick
+                # for the 3 s loop, used when a body has been nudged on its own
+                # menu or a blind field is suspect. It is NOT the exposure
+                # apply button: that is POST /api/settings, which is what the
+                # UI's "Apply <cam>'s exposure to fleet" posts.
+                #
+                # exposure= must therefore be passed EXPLICITLY. reconcile_all's
+                # contract is "exposure=None follows force", and a bare
+                # force=True counts as an explicit fleet apply — so this call
+                # re-pushed `desired`'s exposure onto every body and silently
+                # destroyed a deliberate per-camera split (reproduced on a fake
+                # rig: cam2 balanced to ISO 3200, one POST here and it was back
+                # on the fleet's 400, with nothing in the journal to say so).
+                # Exposure is per-camera BETWEEN explicit applies and this is
+                # not one of them: force the rest of the vector, leave the
+                # split alone. Regression: audit_rigd.py D8.
+                RIG.settings.reconcile_all(force=True, exposure=False)
                 self._json({"ok": True})
             elif p == "/api/strobe":
                 # Strobe config: enable/node/delta_ms/pulse_ms. Validation and
@@ -1441,7 +2494,11 @@ class Handler(BaseHTTPRequestHandler):
                 # and the disagreement never reached the convergence badge.
                 # (The rig is always MF; this is how it STAYS MF, and how a
                 # deliberate change is recorded rather than fought.)
-                rep = RIG.settings.update({"focus_mode": b.get("mode")})
+                if "mode" not in b:
+                    raise BadRequest('"mode" is required (the rig is always '
+                                     "manual focus: 1 = MF)")
+                rep = RIG.settings.update(
+                    {"focus_mode": want_int(b["mode"], '"mode"')})
                 self._json({"ok": bool(rep["applied"]), "applied":
                             rep["applied"], "rejected": rep["rejected"]})
             elif p == "/api/exposure":
@@ -1451,16 +2508,38 @@ class Handler(BaseHTTPRequestHandler):
                 # leaves the bodies different. A node key is REQUIRED here so
                 # no client can fleet-write exposure by accident; the split
                 # shows up as convergence.exposure_split, never as a fault.
-                m = self._mon(b.get("node"))
-                if not m:
-                    self._json({"ok": False, "error": "a 'node' key naming one "
-                                "camera is required on /api/exposure"}, 400)
-                    return
+                #
+                # Everything is checked HERE, before the node is contacted.
+                # {"value":"abc"} used to be forwarded: ilxctl parsed it as 0,
+                # SetDeviceProperty stalled the SDK ~6 s, the monitor's status
+                # poll timed out behind it and cam1 flapped to "no connected
+                # camera", 409ing every call for the next several polls - all
+                # from one typo (verified live 2026-08-23). ilxctl rejects it
+                # at the door now too, but old builds are in the field and a
+                # camera is too expensive to spend on a typo either way.
+                # The node key is REQUIRED so no client can fleet-write
+                # exposure by accident (it is per-camera between applies).
+                m = self._node(b.get("node"), '"node"')
+                which = b.get("which")
+                if which not in EXPOSURE_WHICH:
+                    raise BadRequest('"which" must be one of %s (got %r)'
+                                     % ("|".join(EXPOSURE_WHICH), which))
+                value = want_int(b.get("value"), '"value"')
+                # When the body publishes its own legal values for this field,
+                # a value outside them cannot succeed - and on this hardware
+                # trying costs an SDK stall, so it is refused rather than sent.
+                status = m.snapshot().get("status") or {}
+                choices = status.get(rigcore.CHOICE_KEY.get(which) or "")
+                if isinstance(choices, list) and choices and value not in choices:
+                    raise BadRequest(
+                        "%s does not offer %s=%d; it offers %s"
+                        % (m.name_, which, value,
+                           ",".join(str(c) for c in choices[:16])))
                 if not m.is_connected():
                     self._json({"ok": False, "error": "%s has no connected "
                                 "camera" % m.name_}, 409)
                     return
-                r = m.set_exposure(b.get("which"), b.get("value"))
+                r = m.set_exposure(which, value)
                 self._json(r if isinstance(r, dict)
                            else {"ok": False, "error": "no response"})
             elif p in ("/api/focus/drive", "/api/focus/position",
@@ -1476,21 +2555,25 @@ class Handler(BaseHTTPRequestHandler):
                 # at least visible.
                 self._json(RIG.fanout(p, b))
             elif p == "/api/node/connect":
-                m = self._mon(b.get("node"))
-                if not m:
-                    self._json({"ok": False, "error": "bad node"}, 400); return
+                m = self._node(b.get("node"))
                 r = http_json("http://%s:8080/api/connect" % m.host, body={},
                               timeout=30)
                 self._json(r)
             elif p == "/api/node/focus":
-                m = self._mon(b.get("node"))
-                if not m:
-                    self._json({"ok": False, "error": "bad node"}, 400); return
+                m = self._node(b.get("node"))
+                # FOCUS is the AE-lock line, not autofocus: the rig is always
+                # MF. A truthy string here would latch the hold with no way to
+                # tell it had been asked for - require a real bool.
                 r = http_json("http://%s:8081/gpio/focus" % m.host,
-                              {"hold": bool(b.get("hold"))}, timeout=8)
+                              {"hold": want_bool(b.get("hold", False),
+                                                 '"hold"')}, timeout=8)
                 self._json(r)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
+        except BadRequest as e:
+            # See do_GET: a client-side mistake is a clean 400 naming the
+            # field, and is not journalled as a rigd error.
+            self._json({"ok": False, "error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
             RIG.events.emit("error", "http", "POST %s: %s" % (p, e))
             self._json({"ok": False, "error": str(e)}, 500)

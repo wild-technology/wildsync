@@ -66,7 +66,20 @@ sys.path.insert(0, RIG)
 # resolved, and every contract test that reads it failed as an unrelated
 # FileNotFoundError mid-suite rather than as a checkable assertion.
 PROTOCOL_PATH = os.path.join(os.path.dirname(RIG), "docs", "PROTOCOL.md")
-FNAME_RE = re.compile(r"^Cam(\d+)_(\d{8})_(\d{6})\.(\d{2})\.jpg$")
+# Cam{N}_YYYYMMDD_hhmmss.ss[_k].jpg. The optional _k is run.py's _uniq_dest
+# disambiguator, and it is part of the convention, not a violation of it:
+# centisecond resolution is not a unique key, so when two frames resolve to the
+# same instant the second is filed as ..._1.jpg rather than overwriting the
+# first - which is the very behaviour the "two frames at the same capture
+# instant get two distinct files" contract in suite_pull requires. Without the
+# _k branch this regex rejected a name the code deliberately and correctly
+# produces, so "every filename still matches the rename convention" failed
+# whenever two ordinary frames happened to land in one centisecond. That is
+# load-dependent (frames arrive in bursts when the host is busy) and it fired
+# in 1 of 6 concurrent full soaktest runs on a saturated machine, 2026-08-24:
+# ['Cam2_20260824_064835.80_1.jpg']. Groups 1-4 are unchanged, so the camera
+# number and time-field readers below keep working.
+FNAME_RE = re.compile(r"^Cam(\d+)_(\d{8})_(\d{6})\.(\d{2})(?:_\d+)?\.jpg$")
 
 PASS, FAIL, NOTES, DEFECTS = [], [], [], []
 
@@ -1097,8 +1110,14 @@ def suite_runmgr(opts):
               rowa[idx["datetime"]])
         check("time_source is recorded", rowa[idx["time_source"]] in
               ("gps", "jetson"), rowa[idx["time_source"]])
-        check("capture_source is one of gpio_edge|exif|command",
-              rowa[idx["capture_source"]] in ("gpio_edge", "exif", "command"),
+        # gpio_edge_soft: a real EXPOSURE edge whose node could not stamp it
+        # in the kernel, so its instant is the pipe-read stamp and its error
+        # bar is the read excursion rather than the clock offset. A separate
+        # value because rigcore's strobe verdict and rig_ui's "measured"
+        # spread both key on gpio_edge meaning hardware-timed.
+        check("capture_source is one of gpio_edge|gpio_edge_soft|exif|command",
+              rowa[idx["capture_source"]] in ("gpio_edge", "gpio_edge_soft",
+                                              "exif", "command"),
               rowa[idx["capture_source"]])
 
         # ---- EXIF clock calibration ---------------------------------------
@@ -1195,10 +1214,33 @@ def suite_runmgr(opts):
         index = env.runmgr.active["index"] if env.runmgr.active else []
         g = [e for e in index if e["orig"].startswith("ILXG")]
         srcs = [e["src"] for e in g]
+        # DOMAINS, and a tolerance rather than a rounding boundary. The pushed
+        # edges are NODE-clock instants; an indexed epoch is a HOST one, because
+        # run.py converts every capture instant out of the fleet's clock domain
+        # with ONE common offset before it reaches nav, the datetime and this
+        # index. So convert the expectation the same way before comparing.
+        #
+        # The comparison used to be round(epoch, 2) == round(edge, 2), which is
+        # a hard 5 ms boundary standing in for a tolerance: ANY residual flips a
+        # value that happens to sit near a centisecond, and fails a check about
+        # ATTRIBUTION on a rounding artefact. The residual is the clock offset
+        # itself — on loopback fakes both "clocks" are the same clock, so the
+        # true offset is 0 and every measured one is estimate noise. The failing
+        # gate run: edge 3 at ...695.9549 (rounds to .95) came back indexed at
+        # ...695.955x (rounds to .96), so a SUB-MILLISECOND difference was
+        # reported as a wrong capture instant. It is load-dependent — 8/8 clean
+        # here on an idle machine, failing on the gate run that had three lanes
+        # testing at once — which is exactly what a flaky gate looks like.
+        # The defect this exists to catch is 0.10 s (frame 2 taking frame 3's
+        # edge) to 0.20 s (frame 1 taking frame 3's), i.e. 5-10x the tolerance
+        # used here, and a fallback to EXIF/command shows up in `srcs` anyway.
+        off = env.runmgr.fleet_clock_offset()
+        want = sorted(x - off for x in edges)
+        got = sorted(e["epoch"] for e in g)
         contract("each frame is stamped with ITS OWN GPIO exposure edge",
                  len(g) == 3 and srcs.count("gpio_edge") == 3
-                 and sorted(round(e["epoch"], 2) for e in g)
-                 == sorted(round(x, 2) for x in edges),
+                 and len(got) == len(want)
+                 and all(abs(a - b) <= 0.02 for a, b in zip(got, want)),
                  "run.py:416-424",
                  "three frames land in one 0.4 s pull cycle with three pending "
                  "EXPOSURE edges. match_exposure_edge() drains the whole cursor "
@@ -1207,9 +1249,9 @@ def suite_runmgr(opts):
                  "to EXIF/command time. Capture timestamps — the entire point of "
                  "the GPIO harness — are wrong whenever more than one frame "
                  "arrives per poll.",
-                 "sources=%s epochs=%s vs edges=%s"
-                 % (srcs, [round(e["epoch"], 2) for e in g],
-                    [round(x, 2) for x in edges]))
+                 "sources=%s epochs=%s vs edges(host domain, off=%+.4f)=%s"
+                 % (srcs, [round(e["epoch"], 3) for e in g], off,
+                    [round(x, 3) for x in want]))
 
         # ---- a node that power-cycles mid-run (shared PoE feed) ------------
         n_before = len(read_flight(fl_a)[1])
@@ -1407,11 +1449,49 @@ def suite_pull(opts):
             return read_flight(fl)[1]
 
         def good_frame(tag):
-            a.add_frame(epoch=time.time(), name="ILXOK%s.JPG" % tag)
+            # BASELINE FIRST. This used to add the frame and only then sample
+            # n0, so if the worker pulled it and wrote its row before the n0
+            # statement ran, n0 already counted it and the wait was for a
+            # SECOND row that nobody was going to write - 8 s later the check
+            # reported a healthy frame as lost. The gap is normally microseconds
+            # against a ~0.4 s poll, but it is a scheduling gap, so a busy host
+            # widens it without bound: observed once in 6 concurrent full
+            # soaktest runs on a saturated machine, 2026-08-24, with every
+            # later check in the same section passing against frames that were
+            # landing fine. Sampling before the add makes the comparison
+            # monotone - the row can only ever push the count above the
+            # baseline, whenever it lands.
             n0 = len(rows())
+            a.add_frame(epoch=time.time(), name="ILXOK%s.JPG" % tag)
             return wait_for(lambda: len(rows()) > n0, 8)
 
         check("baseline: a healthy frame lands", bool(good_frame("A")))
+
+        # A faulted frame must never leave a flight_log row it cannot back with
+        # bytes. These sections used to assert that instead as len(rows()) == n0
+        # - "no row appeared at all" - which is a claim about the WHOLE camera
+        # over a 2 s window, not about the frame under test, and it is not the
+        # harness's to make: the pull worker retries with backoff (MAX_ATTEMPTS
+        # 4), so a frame faulted in an EARLIER section can legitimately land in
+        # THIS one the moment its fault is lifted, and _handle() writes the file
+        # a delete + nav + IMU round trip before its row, so a row can also
+        # cross the n0 sample on its own. Both widen with host load: observed
+        # 2026-08-24 in a concurrent, CPU-saturated run, where ILXPERM's retry
+        # succeeded inside the vanish window and "a vanished frame writes no
+        # row" failed with every frame on disk and intact.
+        #
+        # So assert the invariant that is actually the contract, per row, and
+        # is immune to whose frame it is: no row may point at a frame that is
+        # not on disk at a non-zero length. A failure path that logged anyway
+        # still fails it - open() raised, so there is no file to point at.
+        def unbacked(since):
+            return [r_[0] for r_ in rows()[since:]
+                    if not os.path.exists(os.path.join(cam, r_[0]))
+                    or os.path.getsize(os.path.join(cam, r_[0])) == 0]
+
+        def stubs():
+            return [f for f in os.listdir(cam) if f.startswith("Cam2_")
+                    and os.path.getsize(os.path.join(cam, f)) == 0]
 
         # ---- disk full -----------------------------------------------------
         s0 = env.seq()
@@ -1432,8 +1512,9 @@ def suite_pull(opts):
         check("disk full during a pull raises a pull_fail event",
               bool(ev) and ev[-1]["sev"] in ("warn", "error"),
               ev[-1]["msg"] if ev else "no event")
-        check("disk full writes no flight_log row", len(rows()) == n0,
-              "%d -> %d" % (n0, len(rows())))
+        check("disk full logs no frame it could not write",
+              not unbacked(n0) and not stubs(),
+              "unbacked rows=%s stubs=%s" % (unbacked(n0), stubs()))
         check("the worker survives a disk-full frame", bool(good_frame("B")))
 
         # ---- permission denied ----------------------------------------------
@@ -1450,8 +1531,9 @@ def suite_pull(opts):
             ev = env.evs(s0, kind="pull_fail")
             check("permission denied raises a pull_fail event", bool(ev),
                   ev[-1]["msg"] if ev else "no event")
-            check("permission denied writes no flight_log row",
-                  len(rows()) == n0, "%d -> %d" % (n0, len(rows())))
+            check("permission denied logs no frame it could not write",
+                  not unbacked(n0) and not stubs(),
+                  "unbacked rows=%s stubs=%s" % (unbacked(n0), stubs()))
             check("the worker survives a permission-denied frame",
                   bool(good_frame("C")))
 
@@ -1465,15 +1547,27 @@ def suite_pull(opts):
         ev = env.evs(s0, kind="pull_fail")
         check("a frame that vanishes mid-pull raises pull_fail", bool(ev),
               ev[-1]["msg"] if ev else "no event")
-        check("a vanished frame writes no row and leaves no stub file",
-              len(rows()) == n0
-              and not any(f.startswith("Cam2_") and
-                          os.path.getsize(os.path.join(cam, f)) == 0
-                          for f in os.listdir(cam)))
+        # Deliberately NOT "ILXGONE is never indexed": `vanish` only 404s the
+        # download while /api/shots keeps listing the frame, so once the fault
+        # is lifted above a surviving retry may legitimately pull it - that is
+        # the retry contract working, not a defect. What must hold either way is
+        # that no row is written the bytes cannot back.
+        check("a vanished frame leaves no row it cannot back, and no stub file",
+              not unbacked(n0) and not stubs(),
+              "unbacked rows=%s stubs=%s" % (unbacked(n0), stubs()))
         check("the worker survives a vanished frame", bool(good_frame("D")))
-        note("a frame whose pull fails is added to `seen` before the download "
-             "(run.py:123-125), so it is never retried — a transient link error "
-             "loses that frame from the survey permanently")
+        # WAS a standing note ("added to `seen` before the download, so it is
+        # never retried"). Fixed 2026-08-23 (R9): a name is marked seen only
+        # once the bytes are on disk, or after MAX_ATTEMPTS with a loud
+        # pull_fail. Assert the mechanism rather than re-print a stale claim —
+        # a note nobody can fail is how the old one survived being fixed.
+        check("a failed pull is retried, not written off "
+              "(name marked seen only after the bytes land)",
+              runmod.PullWorker.MAX_ATTEMPTS >= 2
+              and len(runmod.PullWorker.BACKOFF_S) >= 1,
+              "MAX_ATTEMPTS=%s backoff=%s"
+              % (runmod.PullWorker.MAX_ATTEMPTS,
+                 runmod.PullWorker.BACKOFF_S))
 
         # ---- node goes away entirely mid-pull -------------------------------
         s0 = env.seq()
@@ -1482,13 +1576,25 @@ def suite_pull(opts):
         a.set_fault("ilx", hang_s=1.5)
         time.sleep(0.6)
         a.down()
-        time.sleep(1.5)
+        # Wait for the monitor to actually SEE the node go, rather than
+        # sleeping a fixed 1.5 s and hoping a poll landed inside it. An outage
+        # nothing sampled cannot be journalled - and the hang fault above
+        # blinds the monitor for most of that window by design, so the old
+        # fixed sleep was asserting that an event was observed by an observer
+        # it had just gagged. It failed ~1 in 8 under CPU load. Clearing the
+        # hang first frees the monitor from its socket read; the node is still
+        # down, so the next poll sees a refused connection. This also makes the
+        # check STRONGER: it now asserts the monitor notices at all
+        # (audit 2026-08-24, VERIFY).
         a.clear_faults()
+        m2 = env.mon("cam2")
+        saw_it_go = wait_for(lambda: m2.state != m2.CONNECTED, 8)
         a.up()
         env.wait_state("cam2", "CAM_CONNECTED", 8)
         check("a node lost mid-pull is journalled, not silent",
-              bool(env.evs(s0, kind="pull_fail"))
-              or bool(env.evs(s0, kind="node_transition")))
+              saw_it_go and (bool(env.evs(s0, kind="pull_fail"))
+                             or bool(env.evs(s0, kind="node_transition"))),
+              "monitor saw it go=%s state=%s" % (saw_it_go, m2.state))
         check("the worker keeps working after the node returns",
               bool(good_frame("E")))
 
@@ -1505,19 +1611,46 @@ def suite_pull(opts):
         onshelf = [f for f in os.listdir(cam) if f.endswith(".jpg")]
         bad = [f for f in onshelf
                if os.path.getsize(os.path.join(cam, f)) == full // 2]
-        # A new row here is NOT a failure any more. The pull worker retries a
-        # failed transfer with backoff, so once the fault is cleared above the
-        # frame is recovered and legitimately logged - which is the whole point
-        # of the retry. What must never happen is a TRUNCATED file on disk, or a
-        # flight_log row pointing at a frame that is short or missing. Assert
-        # that instead of "no row at all", which only passed before retry existed
-        # and otherwise fails intermittently depending on whether a retry lands
-        # inside the observation window.
-        short_rows = [r_[0] for r_ in new
-                      if not os.path.exists(os.path.join(cam, r_[0]))
-                      or os.path.getsize(os.path.join(cam, r_[0])) != full]
+        # A new row here is NOT a failure. The pull worker retries a failed
+        # transfer with backoff, so once the fault is cleared above the frame is
+        # recovered and legitimately logged - which is the whole point of retry.
+        #
+        # ATTRIBUTION, and this is the half the check used to get wrong: it
+        # compared EVERY row that appeared in the window against `full`, which
+        # is ILXTRUNC's size ALONE. Any other frame's row landing in the same
+        # window is then reported as "short" purely because its size differs -
+        # and one can land there with nothing wrong at all, because _handle()
+        # writes the destination file, then does the node-side delete + nav +
+        # IMU round trip (5 s and 4 s timeouts), and only THEN writerow(). A
+        # frame whose file was already on disk when n0 was sampled can have its
+        # row written after it. Reproduced deterministically 2026-08-24 by
+        # stalling one imu_snapshot call: a COMPLETE 788-byte frame (ILXSLOW)
+        # was reported as short against ILXTRUNC's full=787 while ZERO
+        # truncated files were on disk - the same signature this check produced
+        # once in a loaded gate run (4 concurrent soaktests, CPU saturated).
+        #
+        # So assert the contract per FRAME, through run.json's index, plus the
+        # two invariants that really are global. index_frame() runs at the END
+        # of _write_flight, after the row is flushed, so an index entry is a
+        # race-free "this frame is completely done" signal.
+        idx = {e.get("orig"): e
+               for e in (env.runmgr.active or {}).get("index", [])}
+        t_dest = (idx.get(nt) or {}).get("file")
+        t_path = os.path.join(cam, t_dest) if t_dest else None
+        # ILXTRUNC either never completed (no index entry, no row - the frame
+        # was refused, which is what the fault should cause) or it was retried
+        # after the fault cleared and must then be present WHOLE and logged.
+        # Never short, never a row pointing at a short file.
+        trunc_ok = (t_dest is None
+                    or (os.path.exists(t_path)
+                        and os.path.getsize(t_path) == full
+                        and t_dest in {r_[0] for r_ in rows()}))
+        # Global and race-free in this direction: the file is written before the
+        # row, so a row whose file is absent is a real defect, whoever wrote it.
+        orphan_rows = [r_[0] for r_ in new
+                       if not os.path.exists(os.path.join(cam, r_[0]))]
         contract("a truncated frame is rejected, not logged as a good capture",
-                 not bad and not short_rows,
+                 not bad and trunc_ok and not orphan_rows,
                  "run.py:127-157 (the size argument is never used) + rigcore.py:170-179",
                  "ilxctl lists the frame as %d bytes; the transfer delivers "
                  "half of them (a partial PC-save, or a link that dies "
@@ -1526,9 +1659,14 @@ def suite_pull(opts):
                  "expected `size` and never compares it, and nothing checks for "
                  "the JPEG EOI marker, so the corrupt frame is written to the "
                  "run folder and logged as a normal capture." % full,
-                 "%d truncated file(s) on disk, %d new row(s) of which %d point "
-                 "at a short or missing frame"
-                 % (len(bad), len(new), len(short_rows)))
+                 "%d truncated file(s) on disk; ILXTRUNC -> %s (%s bytes of "
+                 "%d, logged=%s); %d new row(s), %d of them pointing at a "
+                 "missing file"
+                 % (len(bad), t_dest or "not pulled",
+                    (os.path.getsize(t_path)
+                     if t_path and os.path.exists(t_path) else "-"),
+                    full, t_dest in {r_[0] for r_ in rows()} if t_dest else "-",
+                    len(new), len(orphan_rows)))
 
         # ---- flight_log integrity across every fault above -------------------
         hdr, rr = read_flight(fl)
@@ -1550,20 +1688,51 @@ def suite_pull(opts):
         # ---- two frames sharing one capture instant -------------------------
         # Pin the clock so the collision is deterministic; in the field the same
         # thing happens whenever two frames share a capture instant.
+        #
+        # The contract is per FRAME - each of these two must end up as its own
+        # file, at full length, with its own flight_log row - so it is asserted
+        # per frame, through run.json's index, which records the camera name
+        # each destination file came from. It used to be asserted by comparing
+        # a ROW COUNT taken after a wait against a FILE COUNT taken from a
+        # listing before it. _handle() creates the destination file and writes
+        # the row up to a delete + nav + IMU round trip later, so those two
+        # samples are not of the same instant: a frame landing in between is
+        # counted as a row with no file (measured: file at T-0.4 ms, row at
+        # T+0.6 ms, 1 run in 40 under load), and a frame landing after the wait
+        # is counted as a file with no row. The check failed in BOTH directions
+        # and could even pass with one of each cancelling out - a sampling
+        # artefact, never a lost frame (audit 2026-08-24).
         n0 = len(rows())
-        files0 = set(os.listdir(cam))
         real_now = env.timesync.now
         fixed = time.time()
         env.timesync.now = lambda: (fixed, "jetson")
-        a.add_frame(epoch=fixed, name="ILXDUP1.JPG", exif=False)
-        a.add_frame(epoch=fixed, name="ILXDUP2.JPG", exif=False)
-        wait_for(lambda: len(rows()) >= n0 + 2, 8)
+        DUPS = ("ILXDUP1.JPG", "ILXDUP2.JPG")
+        a.add_frame(epoch=fixed, name=DUPS[0], exif=False)
+        a.add_frame(epoch=fixed, name=DUPS[1], exif=False)
+        with a._lock:
+            dup_size = {s_["name"]: s_["size"] for s_ in a.shots
+                        if s_["name"] in DUPS}
+
+        def _dup_index():
+            return {e["orig"]: e for e
+                    in (env.runmgr.active or {}).get("index", [])
+                    if e.get("orig") in DUPS}
+
+        wait_for(lambda: len(_dup_index()) == len(DUPS), 8)
         env.timesync.now = real_now
+        idx = _dup_index()
+        dest = {k: e.get("file") for k, e in idx.items()}
+        logged = {r_[0] for r_ in rows()}
+        sizes = {k: (os.path.getsize(os.path.join(cam, f))
+                     if f and os.path.exists(os.path.join(cam, f)) else None)
+                 for k, f in dest.items()}
         new_rows = rows()[n0:]
-        new_files = set(os.listdir(cam)) - files0
         contract("two frames at the same capture instant get two distinct files",
-                 len({r_[0] for r_ in new_rows}) == len(new_rows)
-                 and len(new_files) == len(new_rows),
+                 len(idx) == len(DUPS)
+                 and len(set(dest.values())) == len(DUPS)
+                 and all(sizes[k] == dup_size.get(k) for k in DUPS)
+                 and all(f in logged for f in dest.values())
+                 and len({r_[0] for r_ in new_rows}) == len(new_rows),
                  "run.py:59-62 (_fmt_fname) + run.py:139-146 (the unguarded open)",
                  "the destination name is derived only from the capture instant "
                  "at centisecond resolution and written with a bare open(dest, "
@@ -1575,9 +1744,11 @@ def suite_pull(opts):
                  "second silently overwrites the first image while the "
                  "flight_log gains two rows pointing at the one surviving file. "
                  "A frame is destroyed and the log says otherwise.",
-                 "%d rows -> %d distinct names, %d new files: %s"
-                 % (len(new_rows), len({r_[0] for r_ in new_rows}),
-                    len(new_files), sorted(r_[0] for r_ in new_rows)))
+                 "%s -> %s, bytes on disk %s of %s, all logged=%s"
+                 % (list(DUPS), [dest.get(k) for k in DUPS],
+                    [sizes.get(k) for k in DUPS],
+                    [dup_size.get(k) for k in DUPS],
+                    all(f in logged for f in dest.values())))
 
         # ---- RAW sidecar ----------------------------------------------------
         files0 = set(os.listdir(cam))
@@ -1899,11 +2070,19 @@ def suite_resource(opts):
         wait_for(lambda: threading.active_count() <= t0, 25)
         jsonl = os.path.getsize(env.events.path) if \
             os.path.exists(env.events.path) else 0
-        note("rigd.jsonl grew to %d bytes for %d events (%.0f B/event) and "
-             "rigcore.EventLog has no rotation or size cap (PROTOCOL.md:146 "
-             "calls it 'rolling'): at the observed idle rate a multi-day "
-             "deployment fills the Jetson's disk" %
-             (jsonl, env.events._seq, jsonl / max(1, env.events._seq)))
+        # WAS a standing note claiming EventLog had no rotation or size cap.
+        # It does: MAX_BYTES with exactly one kept generation (rigcore.py:111,
+        # _rotate_locked), which is what PROTOCOL.md:146 means by "rolling".
+        # Keep the measured rate visible — it is what sizes the cap — but
+        # assert the cap exists so this cannot rot back into a false claim.
+        note("rigd.jsonl grew to %d bytes for %d events (%.0f B/event); "
+             "EventLog caps at %.0f MB with one kept generation" %
+             (jsonl, env.events._seq, jsonl / max(1, env.events._seq),
+              rigcore.EventLog.MAX_BYTES / (1 << 20)))
+        check("the event journal has a size cap and rotates",
+              rigcore.EventLog.MAX_BYTES > 0
+              and hasattr(rigcore.EventLog, "_rotate_locked"),
+              "MAX_BYTES=%d" % rigcore.EventLog.MAX_BYTES)
     finally:
         env.close()
 
@@ -2112,11 +2291,43 @@ def soak(seconds, opts):
 
 
 # ===========================================================================
+# The per-lane audit suites (rig/tests/audit_<lane>.py, contract C5) live in
+# their own files and are imported LAZILY — at call time, not at import time.
+# A syntax error or a bad top-level import in one lane's audit file would
+# otherwise take the whole gate down at `import soaktest`, which is exactly
+# backwards: the gate exists to report that lane as broken, not to vanish with
+# it. So an import failure becomes one FAILing check named after the suite and
+# every other suite still runs.
+AUDIT_LANES = ["run", "rigcore", "rigd", "drain", "ui", "piagent", "ilxctl",
+               "nav", "verify"]
+
+
+def _audit_suite(lane):
+    def runner(opts):
+        sect("audit-%s (rig/tests/audit_%s.py)" % (lane, lane))
+        try:
+            mod = __import__("audit_%s" % lane)
+        except Exception as e:                                # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            check("audit_%s.py imports" % lane, False, repr(e))
+            return
+        fn = getattr(mod, "suite", None)
+        if not callable(fn):
+            check("audit_%s.py exposes suite(opts)" % lane, False,
+                  "no callable `suite`")
+            return
+        fn(opts)
+    runner.__name__ = "suite_audit_%s" % lane
+    return runner
+
+
 SUITES = [("fake", suite_fake), ("monitor", suite_monitor),
           ("strobe", suite_strobe),
           ("settings", suite_settings), ("runmgr", suite_runmgr),
           ("pull", suite_pull), ("drain", suite_drain),
           ("resource", suite_resource)]
+SUITES += [("audit-" + lane, _audit_suite(lane)) for lane in AUDIT_LANES]
 
 
 def main():
@@ -2189,4 +2400,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # The audit_<lane> suites do `from soaktest import check, sect, ...`. Run as
+    # a script this file is sys.modules["__main__"], so that import loaded a
+    # SECOND copy of it — with its own PASS/FAIL lists and a second netguard
+    # wrapped around rigcore.http_json. Every audit result went into a module
+    # nobody reports on: 653 audit checks ran and the gate printed
+    # "0 passed, 0 failed / ALL PASS". Alias the two names to one module object
+    # before any lazy suite import can happen.
+    sys.modules.setdefault("soaktest", sys.modules[__name__])
     sys.exit(main())

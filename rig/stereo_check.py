@@ -19,7 +19,6 @@ consistent, and survey-like).
 """
 import argparse
 import glob
-import json
 import math
 import os
 import statistics
@@ -29,15 +28,21 @@ import cv2
 import numpy as np
 from PIL import Image
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from ingest import read_frame_index  # noqa: E402 - C3: the FULL frame index
+
 SENSOR_W_MM = 35.7         # ILX-LR1 full-frame width
 FLAT_PORT = 1.33           # refraction through a flat port scales focal length
 PORT = [FLAT_PORT]         # overridable: --port-factor 1.0 for a dome port
 
 
 def pairs_of(root):
-    doc = json.load(open(os.path.join(root, "run.json")))
+    # run.json carries only the LAST 2000 index entries, so a long transect's
+    # head silently vanished from the check; read_frame_index prefers the
+    # append-only <run>/index.jsonl and falls back to run.json (contract C3).
     rows = {1: [], 2: []}
-    for e in doc["index"]:
+    for e in read_frame_index(root):
         rows.setdefault(e["cam"], []).append(e)
     rows[1].sort(key=lambda r: r["epoch"]); rows[2].sort(key=lambda r: r["epoch"])
     out = []
@@ -71,9 +76,11 @@ def load(path, scale):
 
 
 def intrinsics(path, scale):
-    ex = Image.open(path).getexif().get_ifd(0x8769)
+    # one open, not two — and callers must check the file exists first
+    with Image.open(path) as im:
+        ex = im.getexif().get_ifd(0x8769)
+        w, h = im.size
     f_mm = float(ex.get(0x920A) or 29.0)
-    w, h = Image.open(path).size
     f_px = f_mm / SENSOR_W_MM * w * PORT[0] * scale
     return np.array([[f_px, 0, w * scale / 2], [0, f_px, h * scale / 2], [0, 0, 1]])
 
@@ -147,8 +154,15 @@ def main():
     bf = cv2.BFMatcher(cv2.NORM_L2)
     K = None
     good_res, ctrl_res = [], []
+    missing = 0
     for i, (r1, r2) in enumerate(sel):
         p1, p2 = card_jpg(a.run_root, r1), card_jpg(a.run_root, r2)
+        # An unmatched row has no .card.JPG on disk (and a partly-ingested run
+        # has gaps): skip the pair instead of tracebacking out of the whole
+        # check on the very first Image.open (audit 2026-08-23, low).
+        if not (os.path.isfile(p1) and os.path.isfile(p2)):
+            missing += 1
+            continue
         if K is None:
             K = intrinsics(p1, a.scale)
         i1, i2 = load(p1, a.scale), load(p2, a.scale)
@@ -176,6 +190,9 @@ def main():
                 if rc:
                     ctrl_res.append(rc)
     print()
+    if missing:
+        print("skipped %d selected pairs with no .card.JPG on disk "
+              "(unmatched or not yet ingested)" % missing)
     for label, res in (("LOGGED PAIRS", good_res), ("CONTROL: cam1[i] vs cam2[i+1] (mis-paired)", ctrl_res)):
         if not res:
             print("%s: no usable estimates" % label); continue

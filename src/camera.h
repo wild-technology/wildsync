@@ -65,11 +65,43 @@ public:
     static bool sdkInit();
     static void sdkRelease();
 
+    // Operator rule (docs/FIELD-RUN.md): this rig is ALWAYS manual focus, on
+    // every path. It is enforced HERE, in the process that actually talks to
+    // the SDK, not only in rigd - see Camera::setFocusMode. The escape hatch
+    // for bench work is deliberately out-of-band: ilxctl --allow-autofocus,
+    // which no field unit is ever started with.
+    static void allowAutofocus(bool on);
+    static bool autofocusAllowed();
+    // The refusal text, shared with main.cpp so the door and the SDK layer
+    // say the same thing.
+    static std::string autofocusRefusal(const std::string& what);
+
+    // X7: an error produced by a bounded SDK acquisition that timed out. It
+    // means "this request never reached the body" - NOT "the body refused
+    // it". The two must not be conflated: a refusal is evidence about the
+    // CAMERA (rigcore records it as a divergence and alarms on it), this is
+    // evidence about the daemon and a retry fixes it.
+    static bool isBusyError(const std::string& err);
+
+    // Which SDK call, if any, is holding the camera right now, and for how
+    // long. Reads atomics only - it has to answer while the SDK mutex is
+    // wedged, which is precisely when anyone asks.
+    bool sdkBusyInfo(std::string& op, double& heldSec) const;
+
+    // TEST ONLY (ilxctl --test-sdk-hold): hold the SDK mutex for ms on a
+    // detached thread, imitating a body wedged inside an SDK call. There is
+    // no other way to reproduce HANDOFF 2.1 off the hardware - the fakes
+    // answer every property call instantly and hold no mutex.
+    void holdSdkForTest(int ms);
+
     // Discovery / lifecycle -------------------------------------------------
     std::vector<CameraInfo> enumerate(int timeoutSec = 3);
     bool connect(int index, std::string& err,
                  SDK::CrSdkControlMode mode = SDK::CrSdkControlMode_Remote);
-    void disconnect();
+    // X7: returns false (with *err set to an isBusyError string) when the SDK
+    // could not be taken - the session is left open rather than the worker
+    // stranded. Callers that do not care may ignore both.
+    bool disconnect(std::string* err = nullptr);
     SDK::CrSdkControlMode controlMode() const { return m_mode; }
 
     // Card drain (SDK "Remote Transfer"): list what the card holds, pull a
@@ -97,7 +129,13 @@ public:
                                                    CrInt32u addSize) override;
     bool cardIndexReady() const { return m_cardIndexReady.load(); }
     bool isConnected() const { return m_connected.load(); }
-    std::string modelName() const;
+    // True while a connect attempt is in flight (X2/X5): the HTTP layer keys
+    // its "pending, come back later" answers on this instead of piling more
+    // workers onto m_sdkMutex behind a possibly-wedged SDK::Connect.
+    bool isConnecting() const { return m_connecting.load(); }
+    // Not const: the read is bounded on the SDK mutex (X7), which needs the
+    // in-flight bookkeeping below.
+    std::string modelName();
 
     // Aggregate state for the UI, already JSON-encoded.
     std::string statusJson();
@@ -187,12 +225,52 @@ public:
     void log(const std::string& msg);
 
 private:
+    // X7 (wedged-SDK audit): bounded, wedge-aware acquisition of m_sdkMutex,
+    // used by every HTTP-facing SDK entry point. A plain lock_guard is what
+    // let one stuck body take the whole daemon down with it; the policy and
+    // the two timeouts are documented at the top of camera.cpp.
+    class SdkHold {
+    public:
+        SdkHold(Camera& cam, const char* op, std::chrono::milliseconds wait);
+        ~SdkHold();
+        SdkHold(const SdkHold&) = delete;
+        SdkHold& operator=(const SdkHold&) = delete;
+        explicit operator bool() const { return m_held; }
+        // The error to hand back when the hold was refused. Never a claim
+        // about the camera: isBusyError() recognises it as "not sent".
+        std::string error() const;
+        // cardList drops the mutex between index retries; the retake needs
+        // the same bound the first take had.
+        void release();
+        bool retake(std::chrono::milliseconds wait);
+
+    private:
+        bool take(std::chrono::milliseconds wait);
+        Camera& m_cam;
+        const char* m_op;
+        std::unique_lock<std::recursive_timed_mutex> m_lk;
+        bool m_held = false;
+    };
+    void sdkEnter(const char* op);
+    void sdkExit();
+    // The two answers /api/status can give with no property table behind
+    // them: a connect in flight, or an SDK call in the way. Same shape.
+    std::string shortStatusJson(bool connected, const char* flag);
+    // One place to say no to autofocus (the MF operator rule).
+    bool autofocusBlocked(const std::string& what, std::string& err);
+
     // All SDK calls funnel through these, under m_sdkMutex.
     // getProp's `out` is only good for the scalar accessors (code, type, flags,
     // current value): its GetValues() buffer belongs to an SDK array that is
     // released before returning. Ranges go through getPropRange instead.
     bool getProp(CrInt32u code, SDK::CrDeviceProperty& out);
     bool getPropRange(CrInt32u code, PropRange& out);
+    // Choice list of an array-typed property, extracted while the SDK still
+    // owns the value buffer (getProp's shallow copy cannot provide it - see
+    // the note above). elemBytes is the wire width, for masked comparison of
+    // signed values (negative expcomp vs its UInt16 two's complement).
+    bool getPropChoices(CrInt32u code, std::vector<long long>& out,
+                        std::size_t& elemBytes);
     bool setProp(CrInt32u code, long long value, std::string& err);
     bool setPropLocked(CrInt32u code, long long value, std::string& err);
     // Write ignoring the property's enable flag, sweeping wire types and
@@ -222,9 +300,14 @@ private:
     // remote-transfer completion handshake
     std::mutex m_rtMutex;
     std::condition_variable m_rtCv;
-    int m_rtResult = 0;          // 0 pending, 1 ok, -1 failed, -2 busy
+    int m_rtResult = 0;          // 0 pending, 1 ok, -1 failed, -2 busy, -3 dropped
     CrInt32u m_rtPercent = 0;
     std::string m_rtFile;
+    // The basename the CURRENT cardPull is waiting for (X4). The result slot
+    // above is unkeyed, so a late Result_OK from a previous timed-out
+    // transfer used to complete the NEXT pull's wait; the callback now drops
+    // any result whose reported path does not end in this name.
+    std::string m_rtWant;
     std::atomic<bool> m_cardIndexReady{false};
     // True from just before SDK::Connect until the attempt concludes; lets
     // statusJson answer without the SDK mutex while a connect blocks.
@@ -239,7 +322,17 @@ private:
     // reconnect, so it is replayed from OnConnected.
     std::string m_saveDir;
 
-    mutable std::recursive_mutex m_sdkMutex;
+    // Timed (X2): the HTTP-facing entry points bound their wait on this so a
+    // wedged SDK call (a stuck SDK::Connect holds it until the body is
+    // power-cycled) can never consume the whole httplib worker pool.
+    mutable std::recursive_timed_mutex m_sdkMutex;
+    // X7: who is inside the SDK, and since when. Deliberately atomics and NOT
+    // guarded by m_sdkMutex - the only moment this matters is when that mutex
+    // cannot be taken. Depth counts holders (nested takes by the owning
+    // thread included); op/since describe the outermost one.
+    std::atomic<int> m_sdkDepth{0};
+    std::atomic<long long> m_sdkSinceMs{0};
+    std::atomic<const char*> m_sdkOp{nullptr};
 
     // Connect completion handshake.
     std::mutex m_connectMutex;

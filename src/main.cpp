@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <map>
 #include <mutex>
 #include <cctype>
 #include <cerrno>
@@ -31,6 +33,18 @@ namespace {
 Camera g_cam;
 httplib::Server g_srv;
 std::atomic<bool> g_stopping{false};
+// X2/X5: single-flight gate around discovery+connect. Exactly ONE thread may
+// be inside doConnect (or the card-mode reconnect) at a time; every other
+// /api/connect answers pending:true immediately instead of stranding an HTTP
+// worker on the SDK mutex behind a possibly-wedged SDK::Connect. It also
+// covers the enumerate window m_connecting cannot see (doConnect runs
+// enumerate BEFORE connect), which is exactly the deploy-time boot race.
+std::atomic<bool> g_connectBusy{false};
+// RAII release for g_connectBusy - claimed via exchange(true) by the winner.
+struct ConnectGate {
+    std::atomic<bool>& flag;
+    ~ConnectGate() { flag = false; }
+};
 // Where the camera drops frames sent to the PC; also what the review pane lists.
 std::string g_saveDir;
 
@@ -147,6 +161,34 @@ long long jsonInt(const std::string& body, const std::string& key, long long dfl
     return static_cast<long long>(v);
 }
 
+// X3: strict integer read for the write endpoints. jsonInt's default-on-
+// garbage is right for optional tuning knobs but wrong for a value that will
+// be WRITTEN to the camera: "abc" fell through jsonNum's catch to 0, and
+// SetDeviceProperty(0) stalled the SDK ~6 s - long enough for the monitor's
+// status poll to time out and flap the node (live rig 2026-08-23). A write
+// API must reject a malformed request at the door, not forward a guess.
+bool jsonIntStrict(const std::string& body, const std::string& key, long long& out,
+                   std::string& why) {
+    std::string sv;
+    if (!jsonFind(body, key, sv)) {
+        why = "missing";
+        return false;
+    }
+    char* end = nullptr;
+    const double v = std::strtod(sv.c_str(), &end);
+    if (end == sv.c_str() || end == nullptr || *end != '\0') {
+        why = "not a number: \"" + sv + "\"";
+        return false;
+    }
+    if (!std::isfinite(v) || v != std::floor(v) ||
+        v < -static_cast<double>(1LL << 53) || v > static_cast<double>(1LL << 53)) {
+        why = "not an integer in range: \"" + sv + "\"";
+        return false;
+    }
+    out = static_cast<long long>(v);
+    return true;
+}
+
 bool jsonBool(const std::string& body, const std::string& key, bool dflt) {
     std::string s;
     if (!jsonFind(body, key, s)) return dflt;
@@ -175,15 +217,80 @@ void fail(httplib::Response& res, const std::string& err, int status = 400) {
     res.set_content("{\"ok\":false,\"error\":\"" + e + "\"}", "application/json");
 }
 
+// X2/X5: the "come back later" answer for a connect already in flight.
+// ok:false so old callers treat it as a failed (retryable) connect; the
+// pending:true key lets rigcore tell it apart from the dead-handle case it
+// used to (falsely) diagnose from "already connected".
+void pendingConnect(httplib::Response& res) {
+    res.status = 409;
+    res.set_content(
+        "{\"ok\":false,\"pending\":true,\"error\":\"connect in progress\"}",
+        "application/json");
+}
+
+// X7: "the SDK never took this request" is NOT "the body refused it", and the
+// two must not arrive as the same answer. A refusal is evidence about the
+// CAMERA - rigcore keeps it in blind_errors and alarms settings_divergent on
+// it, which for a wedged body sends the operator hunting the wrong fault. This
+// says the request was not sent, names the SDK call that is in the way (and
+// how long it has held the camera), and uses the same 409 the pending-connect
+// answer uses, which means the same thing: nothing happened, come back.
+void sdkBusy(httplib::Response& res, const std::string& err) {
+    res.status = 409;
+    res.set_content("{\"ok\":false,\"busy\":true,\"applied\":false,\"error\":\"" +
+                        jsonEscapeStr(err) + "\"}",
+                    "application/json");
+}
+
+// The manual-focus operator rule, refused at the door. 403, not 400: this is
+// policy, and no retry will ever satisfy it. It is also LOGGED, because the
+// log tail is what /api/status carries to rigd and the operator - an attempt
+// to put a body in AF mid-survey has to leave a trace even though it was
+// stopped. Camera::setFocusMode / captureOnce refuse the same thing again
+// underneath, for callers that never come through here.
+bool afRefused(httplib::Response& res, const std::string& what) {
+    if (Camera::autofocusAllowed()) return false;
+    g_cam.log("REFUSED " + what + " at /api - manual focus only");
+    fail(res, Camera::autofocusRefusal(what), 403);
+    return true;
+}
+
 // Wrap a handler so an SDK-side failure becomes a clean JSON error.
 template <typename Fn>
 void guarded(httplib::Response& res, Fn fn) {
+    // X2: every camera operation below takes m_sdkMutex unconditionally, so
+    // one that arrives while a connect is in flight blocks its HTTP worker
+    // for as long as the SDK holds the lock - forever, against the wedged
+    // SDK::Connect of HANDOFF 2.2. Nothing it could do would work anyway:
+    // during the handshake SDK::Connect has already handed back a handle but
+    // OnConnected has not fired, so the write goes to a half-open session
+    // (the live-rig 6 s SetDeviceProperty stall). Refuse at the door.
+    if (g_cam.isConnecting()) {
+        pendingConnect(res);
+        return;
+    }
     std::string err;
     if (fn(err)) {
         ok(res);
+    } else if (Camera::isBusyError(err)) {
+        sdkBusy(res, err);
     } else {
         fail(res, err);
     }
+}
+
+// X3 companion for endpoints whose numeric field has a documented default:
+// an ABSENT key keeps the default, but a present-and-garbage one is refused
+// (it used to silently become the default/0 and go to the SDK). Sends the 400
+// itself; returns false when the request must not proceed.
+bool numFieldOk(const httplib::Request& req, httplib::Response& res, const char* key) {
+    std::string sv;
+    if (!jsonFind(req.body, key, sv)) return true;    // absent: default applies
+    long long v;
+    std::string why;
+    if (jsonIntStrict(req.body, key, v, why)) return true;
+    fail(res, std::string("bad \"") + key + "\": " + why);
+    return false;
 }
 
 void onSignal(int) {
@@ -201,6 +308,8 @@ int main(int argc, char** argv) {
     int camIndex = -1;          // --camera N, -1 = unset
     std::string camMatch;       // --match SUBSTR against id or model
     bool listOnly = false;      // --list: enumerate and exit
+    bool allowAf = false;       // --allow-autofocus: bench hatch, see below
+    bool testHold = false;      // --test-sdk-hold: audit suite hook
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -211,6 +320,8 @@ int main(int argc, char** argv) {
         else if (a == "--match" && i + 1 < argc) camMatch = argv[++i];
         else if (a == "--list") listOnly = true;
         else if (a == "--no-autoconnect") autoConnect = false;
+        else if (a == "--allow-autofocus") allowAf = true;
+        else if (a == "--test-sdk-hold") testHold = true;
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "ilxctl - Sony ILX-LR1 control panel\n\n"
@@ -220,7 +331,12 @@ int main(int argc, char** argv) {
                 "  --camera N        connect to enumerated camera N (default: prefer ILX-LR1)\n"
                 "  --match SUBSTR    connect to the camera whose id or model contains SUBSTR\n"
                 "  --list            list attached cameras and exit\n"
-                "  --no-autoconnect  start without opening the camera\n");
+                "  --no-autoconnect  start without opening the camera\n"
+                "  --allow-autofocus BENCH ONLY: lift the manual-focus rule.\n"
+                "                    Without it every autofocus request is\n"
+                "                    refused - the rig is always MF.\n"
+                "  --test-sdk-hold   TEST ONLY: expose /api/test/sdk-hold,\n"
+                "                    which wedges the SDK on purpose.\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
@@ -236,6 +352,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "warning: could not create %s\n", saveDir.c_str());
     }
     g_saveDir = saveDir;
+
+    // The MF operator rule is enforced in Camera (setFocusMode + captureOnce);
+    // this is its only hatch, and it is deliberately a start-up decision so
+    // that nothing reachable over :8080 can turn autofocus on.
+    Camera::allowAutofocus(allowAf);
+    if (allowAf) {
+        std::fprintf(stderr,
+                     "WARNING: --allow-autofocus - the manual-focus operator "
+                     "rule is OFF in this process. Never in the field.\n");
+    }
+    if (testHold) {
+        std::fprintf(stderr,
+                     "WARNING: --test-sdk-hold - /api/test/sdk-hold can wedge "
+                     "this daemon's SDK on purpose. Never in the field.\n");
+    }
 
     if (!Camera::sdkInit()) {
 #ifdef __APPLE__
@@ -331,23 +462,67 @@ int main(int argc, char** argv) {
         res.set_content(g_cam.statusJson(), "application/json");
     });
 
+    // X2 (stuck-connect audit): every /api/connect that arrived while a
+    // connect was wedged inside the SDK used to strand one HTTP worker on the
+    // SDK mutex - eight of those and the daemon stopped answering /api/status
+    // (the bind-before-connect fix defeated). One connect at a time; everyone
+    // else is answered pending:true immediately. X5: the same gate covers the
+    // startup connect, so a deploy-time poll gets pending:true instead of the
+    // false "already connected (dead SDK handle)" diagnosis.
     g_srv.Post("/api/connect", [&](const httplib::Request&, httplib::Response& res) {
         if (g_cam.isConnected()) {
             ok(res, "\"model\":\"" + g_cam.modelName() + "\"");
             return;
         }
+        if (g_cam.isConnecting() || g_connectBusy.load()) {
+            pendingConnect(res);
+            return;
+        }
+        if (g_connectBusy.exchange(true)) {    // two handlers raced the check
+            pendingConnect(res);
+            return;
+        }
+        ConnectGate gate{g_connectBusy};
         std::string err;
-        if (doConnect(err)) ok(res, "\"model\":\"" + g_cam.modelName() + "\"");
-        else fail(res, err);
+        if (doConnect(err)) {
+            ok(res, "\"model\":\"" + g_cam.modelName() + "\"");
+        } else if (err.find("connect in progress") != std::string::npos) {
+            pendingConnect(res);               // lost a race with the SDK side
+        } else if (err == "already connected" && g_cam.isConnected()) {
+            // X5: the SDK's own auto-reconnect (CrReconnecting_ON) can finish
+            // between the isConnected() check above and connect() taking the
+            // handle. Reporting the raw error there is what put 300 false
+            // "connect failed: already connected (dead SDK handle - restart
+            // ilxctl)" lines in the live journal: the body was up the whole
+            // time. A connect that finds the camera connected SUCCEEDED.
+            ok(res, "\"model\":\"" + g_cam.modelName() + "\"");
+        } else {
+            fail(res, err);
+        }
     });
 
     g_srv.Post("/api/disconnect", [](const httplib::Request&, httplib::Response& res) {
-        g_cam.disconnect();
+        // X2: disconnect() takes the SDK mutex unconditionally; during a
+        // wedged connect that stranded the worker forever. Refuse fast.
+        if (g_cam.isConnecting()) {
+            pendingConnect(res);
+            return;
+        }
+        // X7: a wedged SDK cannot release the handle. Say that, rather than
+        // reporting a disconnect that did not happen (or blocking here, which
+        // is how this worker used to be lost).
+        std::string err;
+        if (!g_cam.disconnect(&err)) {
+            sdkBusy(res, err);
+            return;
+        }
         ok(res);
     });
 
     g_srv.Post("/api/shutter", [](const httplib::Request& req, httplib::Response& res) {
         const bool af = jsonBool(req.body, "af", false);
+        // af:true is a half-press, i.e. autofocus. Same rule, same 403.
+        if (af && afRefused(res, "an autofocus release")) return;
         guarded(res, [&](std::string& e) { return g_cam.shutter(af, e); });
     });
 
@@ -360,6 +535,7 @@ int main(int argc, char** argv) {
         const double sec = jsonNum(req.body, "intervalSec", 1.0);
         const int count = static_cast<int>(jsonInt(req.body, "count", 0, 0, 1000000));
         const bool af = jsonBool(req.body, "af", false);
+        if (af && afRefused(res, "an autofocus sequence")) return;
         guarded(res, [&](std::string& e) { return g_cam.startInterval(sec, count, af, e); });
     });
 
@@ -392,31 +568,45 @@ int main(int argc, char** argv) {
     });
 
     g_srv.Post("/api/focus/mode", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldOk(req, res, "mode")) return;             // X3
         const long long v = jsonInt(req.body, "mode", 1, -kMaxJsonAbs, kMaxJsonAbs);
+        // OPERATOR RULE: always manual focus. Refused in Camera::setFocusMode
+        // whatever the caller, and again here at the door so the answer is a
+        // 403 - a policy refusal that no retry will ever satisfy - rather than
+        // a 400 that reads like a transient camera error. This endpoint is the
+        // node's own :8080 page as well as rigd, and the page offers whatever
+        // focus modes the body publishes (AF-S/AF-C included).
+        if (v != SDK::CrFocus_MF &&
+            afRefused(res, "focus mode " + std::to_string(v))) return;
         guarded(res, [&](std::string& e) { return g_cam.setFocusMode(v, e); });
     });
 
     g_srv.Post("/api/focus/drive", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldOk(req, res, "step")) return;             // X3
         const int step = static_cast<int>(jsonInt(req.body, "step", 0, -1000000, 1000000));
         guarded(res, [&](std::string& e) { return g_cam.focusDrive(step, e); });
     });
 
     g_srv.Post("/api/focus/position", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldOk(req, res, "value")) return;            // X3
         const long long v = jsonInt(req.body, "value", 0, -kMaxJsonAbs, kMaxJsonAbs);
         guarded(res, [&](std::string& e) { return g_cam.setFocusPosition(v, e); });
     });
 
     g_srv.Post("/api/zoom/drive", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldOk(req, res, "speed")) return;            // X3
         const int speed = static_cast<int>(jsonInt(req.body, "speed", 0, -1000000, 1000000));
         guarded(res, [&](std::string& e) { return g_cam.zoomDrive(speed, e); });
     });
 
     g_srv.Post("/api/zoom/position", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldOk(req, res, "value")) return;            // X3
         const long long v = jsonInt(req.body, "value", 0, -kMaxJsonAbs, kMaxJsonAbs);
         guarded(res, [&](std::string& e) { return g_cam.setZoomPosition(v, e); });
     });
 
     g_srv.Post("/api/zoom/setting", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldOk(req, res, "value")) return;            // X3
         const long long v = jsonInt(req.body, "value", 1, -kMaxJsonAbs, kMaxJsonAbs);
         guarded(res, [&](std::string& e) { return g_cam.setZoomSetting(v, e); });
     });
@@ -449,6 +639,7 @@ int main(int argc, char** argv) {
         // fallback for the older UI. Reading the wrong key silently fell back to
         // the default and forced the camera to card-only on every call, which
         // broke PC-save. Default to PC+card so a bare call errs toward transfer.
+        if (!numFieldOk(req, res, "dest") || !numFieldOk(req, res, "value")) return; // X3
         const long long v = jsonInt(req.body, "dest",
                                     jsonInt(req.body, "value", 3, -kMaxJsonAbs, kMaxJsonAbs),
                                     -kMaxJsonAbs, kMaxJsonAbs);
@@ -456,8 +647,21 @@ int main(int argc, char** argv) {
     });
 
     g_srv.Post("/api/exposure", [](const httplib::Request& req, httplib::Response& res) {
+        // X3: reject a missing/non-numeric "value" at the door. It used to
+        // parse as 0 and stall the SDK ~6 s in SetDeviceProperty (see
+        // jsonIntStrict); the choice-list check against the body's own
+        // selectable values lives in Camera::setExposure.
         const std::string which = jsonStr(req.body, "which");
-        const long long v = jsonInt(req.body, "value", 0, -kMaxJsonAbs, kMaxJsonAbs);
+        if (which.empty()) {
+            fail(res, "need \"which\" (iso|shutter|aperture|filetype|...)");
+            return;
+        }
+        long long v = 0;
+        std::string why;
+        if (!jsonIntStrict(req.body, "value", v, why)) {
+            fail(res, "bad \"value\": " + why);
+            return;
+        }
         guarded(res, [&](std::string& e) { return g_cam.setExposure(which, v, e); });
     });
 
@@ -513,9 +717,21 @@ int main(int argc, char** argv) {
         std::string err;
         const int maxNums = static_cast<int>(jsonInt("{\"n\":" + req.get_param_value("n") + "}", "n", 4000, 1, 20000));
         if (!g_cam.cardList(ents, err, maxNums)) {
-            fail(res, err, 503);
+            if (Camera::isBusyError(err)) sdkBusy(res, err);
+            else fail(res, err, 503);
             return;
         }
+        // X6: per-content file count. A RAW+JPEG frame is ONE content with
+        // two files, and /api/card/delete removes the whole content - so the
+        // drain must know a content still has an unpulled sibling BEFORE it
+        // deletes (the full-size card JPEG of a verified RAW used to be
+        // erased silently). filesInContent > 1 tells it to pull every file
+        // of the content (or refuse the delete).
+        // The count is trustworthy even on a truncated listing: cardList
+        // emits every file of each content it touches and only stops at a
+        // DAY boundary, so `n` can cut contents but never splits one.
+        std::map<CrInt32u, int> perContent;
+        for (const auto& e : ents) ++perContent[e.contentId];
         std::string out = "{\"ok\":true,\"count\":" + std::to_string(ents.size()) + ",\"files\":[";
         for (std::size_t i = 0; i < ents.size(); ++i) {
             const auto& e = ents[i];
@@ -527,6 +743,7 @@ int main(int argc, char** argv) {
                    ",\"name\":\"" + jsonEscapeStr(e.name) + "\"" +
                    ",\"size\":" + std::to_string(e.size) +
                    ",\"format\":" + std::to_string(e.format) +
+                   ",\"filesInContent\":" + std::to_string(perContent[e.contentId]) +
                    ",\"captured_utc\":" + std::to_string(e.capturedUtc) + "}";
         }
         out += "]}";
@@ -548,7 +765,8 @@ int main(int argc, char** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         if (!g_cam.cardPull(static_cast<CrInt32u>(cid), static_cast<CrInt32u>(fid), dir, name,
                             bytes, err, 180)) {
-            fail(res, err, 503);
+            if (Camera::isBusyError(err)) sdkBusy(res, err);
+            else fail(res, err, 503);
             return;
         }
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -574,7 +792,8 @@ int main(int argc, char** argv) {
         }
         std::string err;
         if (!g_cam.cardDelete(static_cast<CrInt32u>(cid), err)) {
-            fail(res, err, 503);
+            if (Camera::isBusyError(err)) sdkBusy(res, err);
+            else fail(res, err, 503);
             return;
         }
         ok(res, "\"deleted\":" + std::to_string(cid));
@@ -591,7 +810,23 @@ int main(int argc, char** argv) {
             fail(res, "mode must be remote|transfer", 400);
             return;
         }
-        g_cam.disconnect();
+        // X2/X5: this path disconnects, re-enumerates and reconnects - all of
+        // which would pile onto the SDK mutex behind a connect in flight and
+        // strand this worker. Same single-flight gate as /api/connect.
+        if (g_cam.isConnecting()) {
+            pendingConnect(res);
+            return;
+        }
+        if (g_connectBusy.exchange(true)) {
+            pendingConnect(res);
+            return;
+        }
+        ConnectGate gate{g_connectBusy};
+        std::string derr;
+        if (!g_cam.disconnect(&derr)) {     // X7: wedged SDK, nothing to do here
+            sdkBusy(res, derr);
+            return;
+        }
         std::string err;
         if (m == SDK::CrSdkControlMode_RemoteTransfer) {
             // Bare connect in transfer mode: no PC-save setup (it cannot shoot).
@@ -687,7 +922,8 @@ int main(int argc, char** argv) {
                 lvCache.swap(jpg);
                 lvAt = now;
             } else if (lvCache.empty()) {
-                fail(res, err, 503);
+                if (Camera::isBusyError(err)) sdkBusy(res, err);
+                else fail(res, err, 503);
                 return;
             }
         }
@@ -739,6 +975,23 @@ int main(int argc, char** argv) {
                  ",\"archive\":\"" + archive + "\"");
     });
 
+    // TEST ONLY (--test-sdk-hold). A body wedged inside an SDK call is the
+    // fault X7 is about (HANDOFF 2.1), and nothing camera-less reproduces it:
+    // with no camera every SDK entry point returns "not connected" in
+    // microseconds, and the in-process fakes hold no mutex at all. This takes
+    // the SDK mutex on a detached thread for a bounded number of ms so the
+    // audit suite can prove that writes answer, and that the daemon keeps
+    // answering /api/status, while the camera is unreachable. Not registered
+    // unless the flag is passed, so a field unit does not have this route.
+    if (testHold) {
+        g_srv.Post("/api/test/sdk-hold", [](const httplib::Request& req,
+                                            httplib::Response& res) {
+            const long long ms = jsonInt(req.body, "ms", 5000, 0, 60000);
+            g_cam.holdSdkForTest(static_cast<int>(ms));
+            ok(res, "\"ms\":" + std::to_string(ms));
+        });
+    }
+
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
@@ -750,6 +1003,13 @@ int main(int argc, char** argv) {
     std::thread startupConnect;
     if (autoConnect) {
         startupConnect = std::thread([&] {
+            // X5: rigcore polls from the moment the port binds, i.e. while
+            // this thread is still inside enumerate() - a window m_connecting
+            // cannot cover. Claiming the gate makes a concurrent /api/connect
+            // answer pending:true instead of re-enumerating (and releasing
+            // m_enumInfo) under the pending SDK::Connect.
+            if (g_connectBusy.exchange(true)) return;   // a handler beat us
+            ConnectGate gate{g_connectBusy};
             std::string err;
             if (!doConnect(err)) g_cam.log("Startup connect: " + err);
         });
