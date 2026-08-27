@@ -21,6 +21,11 @@ Covers, and FAILS on the pre-fix code for:
       hardware capture instant with a clock-error-only bar
   P9  the FOCUS lease covers a node-side interval whose period outlives it,
       and dies with the hold on the gpioset release path too
+  P10 second IMU slot (imu2 / rig/imu_olive.py): absent-by-default is
+      byte-compatible with pre-imu2 payloads, /imu2/* endpoints, imu2 nested
+      in /health's imu section, per-slot rate floors, the acquire loop brings
+      a probed olive online end-to-end, and undecodable bytes are counted
+      and surfaced (raw tail), never raised or published
 
 Usage:  python3 rig/tests/audit_piagent.py        (or via soaktest's registry)
 """
@@ -165,6 +170,11 @@ def _post(url, body):
     req = _rq.Request(url, data=json.dumps(body).encode(),
                       headers={"Content-Type": "application/json"})
     with _rq.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+def _get(url):
+    with _rq.urlopen(url, timeout=5) as r:
         return json.loads(r.read().decode())
 
 
@@ -684,12 +694,149 @@ def suite(opts):
           and fresh_fn(FakeReader(att_age=0.05)) is True
           and fresh_fn(FakeReader(att_age=30.0)) is False)
 
+    # ---- P10: second IMU slot (imu2 / imu_olive) --------------------------
+    # The Olive olixVision at cam2 gets its own slot, its own endpoints and a
+    # health sub-object nested in the imu section. The contract under test is
+    # ADDITIVE ONLY: with the unit absent (this host), every pre-imu2 payload
+    # is byte-identical to before, and nothing a wedged slot 2 does can take
+    # /health or /imu/* down with it.
+    sect("audit piagent: second IMU slot imu2 (P10)")
+    import imu_olive                                  # noqa: E402
+
+    check("piagent exposes an IMU2 slot, enabled (auto-probe) by default",
+          getattr(piagent, "IMU2", None) is not None
+          and piagent.IMU2.enabled is True)
+    h2 = piagent.IMU2.health()
+    check("imu2 absent on this host reads present:false",
+          h2.get("present") is False and h2.get("enabled") is True)
+
+    h = piagent.health()
+    check("/health nests imu2 INSIDE the imu section (it rides rigd's "
+          "existing forwarding of h['imu'] to the fleet view)",
+          (h.get("imu") or {}).get("imu2", {}).get("present") is False)
+    check("the imu section is otherwise unchanged (additive only)",
+          set(h["imu"].keys()) - {"imu2"} == {"present"},
+          "unexpected keys %r" % (set(h["imu"].keys()) - {"imu2", "present"},))
+
+    srv2 = ThreadingHTTPServer(("127.0.0.1", 0), piagent.Handler)
+    srv2.daemon_threads = True
+    threading.Thread(target=srv2.serve_forever, daemon=True).start()
+    base2 = "http://127.0.0.1:%d" % srv2.server_address[1]
+    try:
+        check("/imu/latest payload is byte-compatible with pre-imu2 piagent",
+              _get(base2 + "/imu/latest") == {"present": False},
+              "the olive must never leak into the payload rigd elects the "
+              "MASTER orientation source from")
+        check("/imu2/latest answers the shape /imu/latest always had",
+              _get(base2 + "/imu2/latest") == {"present": False})
+        check("/imu2/window answers the /imu/window shape",
+              _get(base2 + "/imu2/window?t0=0&t1=1")
+              == {"present": False, "samples": []})
+        # With a live slot-2 reader the endpoint serves its samples.
+        piagent.IMU2.reader = FakeReader(rate=100.0, frame=100.0,
+                                         measured=True, att_age=0.05)
+        try:
+            s2 = _get(base2 + "/imu2/latest")
+            check("/imu2/latest serves the slot-2 reader's sample",
+                  s2.get("roll") == 1.0 and "epoch" in s2)
+        finally:
+            piagent.IMU2.reader = None
+    finally:
+        srv2.shutdown()
+        srv2.server_close()
+
+    # A wedged slot 2 must cost /health an error FIELD, not the endpoint —
+    # /health also carries the clock stamp the host's offset model feeds on.
+    class _Wedged:
+        def health(self):
+            raise RuntimeError("olive wedged")
+    old_imu2 = piagent.IMU2
+    piagent.IMU2 = _Wedged()
+    try:
+        h = piagent.health()
+        check("a wedged imu2 cannot take /health down",
+              h["imu"]["imu2"].get("present") is False
+              and "olive wedged" in (h["imu"]["imu2"].get("error") or ""))
+    finally:
+        piagent.IMU2 = old_imu2
+
+    # Config gate: the PIAGENT_IMU2 spellings.
+    ioff = piagent.Imu2(spec="off")
+    check("PIAGENT_IMU2=off disables the slot without starting a thread",
+          ioff.enabled is False
+          and ioff.health() == {"present": False, "enabled": False})
+    idev = piagent.Imu2(spec="olive:/dev/ttyACM7")
+    iudp = piagent.Imu2(spec="olive:udp:47901")
+    check("olive:<device> and olive:udp:<port> specs parse through",
+          idev.spec == "/dev/ttyACM7" and iudp.spec == "udp:47901")
+    idev.shutdown()
+    iudp.shutdown()
+
+    # Slot-2 floors are the SLOT's, not the YB's: a device whose healthy
+    # cadence has never been measured must not inherit the 60 Hz frame spec.
+    i2f = piagent.Imu2(spec="off")
+    i2f.reader = FakeReader(rate=49.8, frame=20.0, measured=True,
+                            att_age=0.02)
+    i2f.info = {"present": True, "sample_rate_hz": 49.8}
+    h2f = i2f.health()
+    check("imu2 judges the frame rate against its own floor (10 Hz, not 60)",
+          h2f.get("frame_floor_hz") == 10.0
+          and h2f.get("imu_rate_low") is False,
+          "floor %r low %r - the same reader IS low for slot 1"
+          % (h2f.get("frame_floor_hz"), h2f.get("imu_rate_low")))
+
+    # End-to-end through the slot machinery — probe, construct, start,
+    # sample — against imu_olive's synthetic stream. No hardware involved.
+    isim = piagent.Imu2(spec="olive:sim")
+    got = wait_for(lambda: isim.reader is not None, timeout=15.0,
+                   interval=0.2)
+    check("the acquire loop brings a probed olive online by itself", got)
+    if got:
+        s = wait_for(lambda: (isim.latest() or {}).get("roll") is not None,
+                     timeout=5.0, interval=0.1) and isim.latest()
+        check("slot-2 samples carry the imu_yb key set flight_log reads",
+              bool(s) and all(k in s for k in
+                              ("pitch", "roll", "yaw", "heading", "ax", "ay",
+                               "az", "gx", "gy", "gz", "temp", "epoch")),
+              "got %r" % (sorted(s) if s else None,))
+        check("slot-2 samples are in rig units (the sim streams SI: "
+              "|a| must land at ~1 g, angles in degrees)",
+              bool(s) and 0.8 < math.sqrt((s["ax"] or 0) ** 2
+                                          + (s["ay"] or 0) ** 2
+                                          + (s["az"] or 0) ** 2) < 1.2
+              and abs(s["roll"]) < 45,
+              "%r" % ({k: s.get(k) for k in ("ax", "ay", "az", "roll")}
+                      if s else None,))
+        hs = wait_for(lambda: isim.health().get("imu_rate_low") is not None,
+                      timeout=5.0, interval=0.2) and isim.health()
+        check("slot-2 health measures a live attitude rate off the ring",
+              bool(hs) and (hs.get("attitude_hz") or 0) > 20
+              and hs.get("imu_rate_low") is False,
+              "%r" % ({k: hs.get(k) for k in
+                       ("attitude_hz", "imu_rate_low", "attitude_floor_hz")}
+                      if hs else None,))
+    isim.shutdown()
+
+    # The tolerant driver itself: bytes it cannot decode must be COUNTED and
+    # SHOWN (that hex tail is tomorrow's bring-up evidence), never raised out
+    # of the ingest path or published as samples.
+    ro = imu_olive.ImuReader(port="sim")
+    ro._tr = imu_olive.SimTransport()        # transport identity only
+    ro._ingest(b"\x00\x01\xfe\xba" * 200, time.time())
+    sto = ro.checksum_state()
+    check("imu_olive: undecodable bytes are counted, not raised or ringed",
+          ro.rejected_frames() >= 1 and len(ro._ring) == 0)
+    check("imu_olive: the undecoded raw tail is surfaced for bring-up",
+          bool(sto.get("raw_tail_hex")) and sto.get("dormant") is True,
+          "%r" % (sto,))
+
     # ---- teardown ---------------------------------------------------------
     for g in cleanup:
         g._watchdog_run = False
         g._mon_run = False
     piagent.GPIO._watchdog_run = False
     piagent.IMU.shutdown()
+    piagent.IMU2.shutdown()
     note("piagent audit suite done (temp home: %s)" % _TMP)
 
 

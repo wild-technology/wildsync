@@ -275,6 +275,14 @@ class Drainer:
                 wanted = wanted[:limit]
             self.log("[%s] card holds %d contents (%d files), %d contents to drain"
                      % (self.node, len(contents), len(files), len(wanted)))
+            if rep["skipped"]:
+                # A content with no RAW (JPEG-only, HEIF-only) is outside the
+                # survey policy and is deliberately not drained - but silence
+                # here made "the card still shows shots after a full drain"
+                # look like a drain fault (audit 2026-08-27). Name the choice.
+                self.log("[%s] %d content(s) hold no RAW and are LEFT ON THE "
+                         "CARD - not survey policy; format or pull them "
+                         "manually if wanted" % (self.node, rep["skipped"]))
             for flist in wanted:
                 if stop is not None and stop.is_set():
                     rep["cancelled"] = True

@@ -161,6 +161,48 @@
   .neq{font-family:var(--mono);font-size:11px;color:var(--warn);border:1px solid var(--warn);
        border-radius:6px;padding:1px 6px}
   .lensnote{font-family:var(--mono);font-size:11px;color:var(--bad);min-height:14px}
+
+  /* ---- overlays, dialogs (projects, format confirm) ---- */
+  .overlay{position:fixed;inset:0;background:rgba(4,5,8,.84);z-index:50;display:none;
+           align-items:flex-start;justify-content:center;padding:5vh 20px 20px;overflow:auto}
+  .overlay.show{display:flex}
+  .dialog{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+          max-width:760px;width:100%;padding:22px 24px}
+  .dialog h2{margin-top:0}
+  .dialog .danger{color:var(--bad);font-weight:700}
+  .projrow{display:flex;gap:12px;align-items:center;padding:9px 10px;border:1px solid var(--line);
+           border-radius:9px;margin-bottom:8px;background:var(--panel2)}
+  .projrow .nm{font-weight:600}
+  .projrow.cur{border-color:var(--accent)}
+  /* ---- diagnostics ---- */
+  .loglines{font-family:var(--mono);font-size:12.5px;line-height:1.65;max-height:52vh;
+            overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .loglines .ln{padding:1px 0;border-bottom:1px dotted var(--grid)}
+  .loglines .t{color:var(--muted);margin-right:8px}
+  .loglines .wa{color:var(--warn)}
+  .loglines .hi{color:var(--bad);font-weight:700}
+  .alertline{color:var(--bad);font-weight:700;font-family:var(--mono);font-size:13px;
+             padding:7px 9px;border:1px solid var(--bad);border-radius:8px;margin-bottom:7px;
+             background:color-mix(in srgb,var(--bad) 9%,transparent)}
+  .alertline .t{color:var(--muted);font-weight:400;margin-right:8px}
+  .alertline.warnline{color:var(--warn);border-color:var(--warn);
+             background:color-mix(in srgb,var(--warn) 8%,transparent)}
+  table.diagt{border-collapse:collapse;width:100%;font-size:13px}
+  table.diagt th{font-family:var(--mono);font-size:11px;text-transform:uppercase;
+                 letter-spacing:.06em;color:var(--muted);text-align:left;padding:4px 10px 4px 0}
+  table.diagt td{padding:4px 10px 4px 0;border-top:1px solid var(--grid);font-family:var(--mono)}
+  /* ---- map ---- */
+  .mapwrap{position:relative}
+  #mapCanvas{width:100%;height:calc(100vh - 230px);min-height:420px;display:block;
+             background:#0b0d11;border:1px solid var(--line);border-radius:10px;
+             cursor:grab;touch-action:none}
+  #mapCanvas.drag{cursor:grabbing}
+  #mapTip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--line);
+          padding:6px 9px;border-radius:8px;font:12px var(--mono);display:none;z-index:6;max-width:300px}
+  #mapThumb{position:absolute;right:12px;top:12px;background:var(--panel);border:1px solid var(--line);
+            border-radius:10px;padding:8px;display:none;z-index:7;width:300px}
+  #mapThumb img{width:100%;border-radius:6px;display:block}
+  #mapThumb .cap{font:11px var(--mono);color:var(--muted);margin-top:5px;word-break:break-all}
 </style>
 </head>
 <body>
@@ -178,15 +220,19 @@
   <!-- Global alert surface: anomalies are polled on their own timer, so a fault
        is visible from every tab, not only while Controls happens to be open. -->
   <span id="hAnom" class="pill" title="anomalies">anomalies —</span>
+  <span id="hProj" class="pill" title="active project — click to manage" style="cursor:pointer">project —</span>
   <span style="flex:1"></span>
   <span class="clock" id="hClock">—</span>
 </header>
 <nav id="tabs">
   <button data-t="review" class="active">Review</button>
   <button data-t="transects">Transects</button>
+  <button data-t="map">Map</button>
   <button data-t="controls">Controls</button>
   <button data-t="nav">Nav</button>
   <button data-t="imu">IMU</button>
+  <button data-t="diag">Diag</button>
+  <button data-t="alerts">Alerts</button>
   <button data-t="events">Events</button>
 </nav>
 <main>
@@ -411,7 +457,123 @@
     </div>
     <div class="card"><div id="evList" style="max-height:70vh;overflow:auto"></div></div>
   </section>
+
+  <!-- MAP — where every frame was taken + the boat's trail. Pure canvas in
+       UTM metres: the rig is offline at sea, so there is no tile server to
+       lean on; a metric plot with a scale bar is the honest offering. -->
+  <section class="tab" id="tab-map">
+    <div class="row" style="margin-bottom:8px">
+      <div id="mapRuns" class="row" style="gap:10px"></div>
+      <span style="flex:1"></span>
+      <button class="act" id="mapFollow" title="keep the newest position centred">follow: off</button>
+      <button class="act" id="mapFit">Fit</button>
+      <button class="act" id="mapZin">+</button>
+      <button class="act" id="mapZout">−</button>
+    </div>
+    <div class="mapwrap">
+      <canvas id="mapCanvas"></canvas>
+      <div id="mapTip"></div>
+      <div id="mapThumb"><img alt=""><div class="cap"></div></div>
+    </div>
+    <div id="mapInfo" class="small muted" style="margin-top:6px">—</div>
+  </section>
+
+  <!-- DIAG — the operator's engine-room page: status log, storage, cards,
+       destructive ops behind confirmations, and the core settings vector. -->
+  <section class="tab" id="tab-diag">
+    <div class="grid" style="grid-template-columns:minmax(340px,1.35fr) minmax(300px,1fr)">
+      <div class="card">
+        <h2>Status log</h2>
+        <div class="row" style="margin-bottom:6px">
+          <label>Show<select id="dgSev"><option value="info" selected>status</option>
+            <option value="warn">warnings+</option><option value="error">errors</option></select></label>
+          <button class="act toggle on" id="dgFollow">following</button>
+        </div>
+        <div id="dgLog" class="loglines"><span class="muted small">reading the journal…</span></div>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:12px">
+          <h2>Project &amp; storage</h2>
+          <div id="dgRig"></div>
+          <div class="row" style="margin-top:8px">
+            <button class="act" id="dgProjBtn">Projects…</button>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px">
+          <h2>Cameras &amp; cards</h2>
+          <div id="dgCams"></div>
+        </div>
+        <div class="card" style="margin-bottom:12px">
+          <h2>Operations</h2>
+          <div id="dgDrainState" class="small muted" style="margin-bottom:6px"></div>
+          <div id="dgOps"></div>
+          <h2 style="margin-top:14px">Recent runs — download</h2>
+          <div id="dgRuns" class="small"></div>
+        </div>
+        <div class="card">
+          <h2>Core settings — fleet vector</h2>
+          <div id="dgSettings"></div>
+          <div class="small muted" style="margin-top:6px">edit on the Controls tab; the
+            3&nbsp;s reconcile converges every connected body to this vector</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ALERTS — only what needs a human: active anomalies plus the warn/error
+       history, big and red. -->
+  <section class="tab" id="tab-alerts">
+    <div class="card">
+      <h2>Active anomalies</h2>
+      <div id="alActive"><span class="muted small">none</span></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h2>Warning &amp; error history</h2>
+      <div id="alHist"><span class="muted small">none</span></div>
+    </div>
+  </section>
 </main>
+<!-- PROJECT PICKER / INTRO -->
+<div class="overlay" id="projOverlay">
+  <div class="dialog">
+    <h2>Projects</h2>
+    <div class="small muted" style="margin-bottom:10px">A project owns its transects, drained
+      RAWs and exports. Everything the rig records lands inside the open project.</div>
+    <div id="projList"><span class="muted small">reading…</span></div>
+    <h2 style="margin-top:16px">New project</h2>
+    <div class="row"><label>Name<input id="pjName" placeholder="e.g. Jamestown Reef 2026" style="width:240px"></label>
+      <label>Vessel<input id="pjVessel" style="width:140px"></label>
+      <label>Site<input id="pjSite" style="width:150px"></label></div>
+    <div class="row" style="margin-top:6px">
+      <label>Operator<input id="pjOperator" style="width:140px"></label>
+      <label style="flex:1">Notes<input id="pjNotes" style="width:100%"></label></div>
+    <div class="row" style="margin-top:12px">
+      <span id="projErr" class="small" style="color:var(--bad)"></span>
+      <span style="flex:1"></span>
+      <button class="act" id="projClose">Close</button>
+      <button class="act go" id="projCreate">Create &amp; open</button>
+    </div>
+  </div>
+</div>
+
+<!-- FORMAT CONFIRM — a destructive act gets a real dialogue: facts first,
+     then the operator types the camera's name. -->
+<div class="overlay" id="fmtModal">
+  <div class="dialog">
+    <h2 class="danger">Erase card — <span id="fmName">?</span></h2>
+    <div id="fmFacts" style="margin:10px 0"></div>
+    <div class="danger" style="margin-bottom:10px">This permanently erases every image on the
+      card. There is no undo.</div>
+    <div class="row">
+      <label>Type <span class="mono" id="fmWord">cam?</span> to confirm
+        <input id="fmType" autocomplete="off" style="width:130px"></label>
+      <span style="flex:1"></span>
+      <button class="act" id="fmCancel">Cancel</button>
+      <button class="act stop" id="fmGo" disabled>Erase card</button>
+    </div>
+    <div id="fmResult" class="small" style="margin-top:8px"></div>
+  </div>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -437,6 +599,9 @@ function showTab(t){
   if(t==='imu') pollImuWindow();
   if(t==='review'){ renderPair(); pollPairs(true); pollDrain(true); }
   if(t==='transects') pollTransects(true);
+  if(t==='diag'){ pollDiag(); pollDiagLog(); }
+  if(t==='alerts') pollAlerts();
+  if(t==='map') mapShow();
 }
 // Live view is expensive in a way that is invisible from the browser: ilxctl's
 // liveViewJpeg() takes the same recursive SDK mutex as image transfer, so every
@@ -479,6 +644,29 @@ async function pollFleet(){
   const ridShort=ridFull.length>18?(ridFull.slice(0,17)+'…'):ridFull;
   pill($('#hRun'), run.active?('run '+ridShort+' · '+run.frames+' frm'):'no run', run.active?'on':'');
   $('#hRun').title=run.active?('run '+ridFull):'';
+  // The run's own degradation state, LIVE. paused_for / failed_fires /
+  // unpaired_shots were served on every poll and rendered nowhere - a
+  // single-camera catastrophe was invisible until run.json was read after
+  // the fact (audit 2026-08-27).
+  if(run.active){
+    const sy=run.sync||{}, st=run.stats||{};
+    const per=Object.keys(st).sort().map(n=>{
+      const w=st[n]||{};
+      return `${n} ${w.pulled||0}${w.failed?` (<b style="color:var(--bad)">${w.failed} failed</b>)`:''}`;
+    }).join(' · ');
+    let health='';
+    if(sy.paused_for){
+      health=`<div style="color:var(--bad);font-weight:700;margin-top:3px">CAPTURE PAUSED — `+
+        `${escapeHtml(sy.paused_for.node||'?')} stopped answering fires after shot `+
+        `${sy.paused_for.after_shot??'?'}; the other camera is NOT firing alone. `+
+        `Resumes when the camera reconnects and a probe frame arrives.</div>`;
+    } else if((sy.failed_fires||0)>0||(sy.unpaired_shots||0)>0){
+      health=`<div style="color:var(--warn);margin-top:3px">${sy.failed_fires||0} failed fire(s) · `+
+        `${sy.unpaired_shots||0} unpaired shot(s) so far</div>`;
+    }
+    $('#runInfo').innerHTML=`recording <span class="mono">${escapeHtml(ridFull)}</span> — `+
+      `${run.frames} frames · ${per||'starting…'}${health}`;
+  }
   // RunManager refuses a start over a live run; say so on the button instead
   // of letting the click bounce off pre-flight as "the rig is not fit to
   // survey" (misleading for "already recording").
@@ -2540,15 +2728,499 @@ async function pollEvents(){
 }
 $('#evSev').onchange=()=>{evSeq=0;$('#evList').innerHTML='';};
 
+
+// ============================ PROJECTS =====================================
+// A project owns runs/, raw/ and exports/. Switching is a page-level event:
+// every cached run list, pair index and map layer belongs to the old tree, so
+// open/create simply reloads the page against the new one.
+let PROJ=null, PROJ_INTRO_DONE=false;
+async function loadProject(){
+  const r=await api('/api/project');
+  if(!r||!r.active) return;
+  PROJ=r;
+  $('#hProj').textContent='project: '+r.active.name;
+  $('#hProj').classList.toggle('on', !r.active.legacy);
+  // First-run intro: no project has ever been chosen on this rig.
+  if(!r.explicit && !PROJ_INTRO_DONE){ PROJ_INTRO_DONE=true; openProjects(); }
+}
+async function openProjects(){
+  $('#projErr').textContent='';
+  $('#projOverlay').classList.add('show');
+  const r=await api('/api/projects');
+  const l=$('#projList');
+  if(!r||!r.projects){ l.innerHTML='<span class="small" style="color:var(--bad)">could not read projects</span>'; return; }
+  l.innerHTML = r.projects.map(p=>`<div class="projrow ${p.active?'cur':''}">
+      <span class="nm">${escapeHtml(p.name)}</span>
+      <span class="small muted">${p.runs} run${p.runs===1?'':'s'}${p.last_run?' · last '+escapeHtml(p.last_run):''}${p.legacy?' · pre-project data':''}</span>
+      <span style="flex:1"></span>
+      ${p.active?'<span class="pill on">open</span>'
+                :`<button class="act" data-open="${escapeHtml(p.slug)}">Open</button>`}
+    </div>`).join('') || '<span class="muted small">no projects yet — create the first below</span>';
+  l.querySelectorAll('button[data-open]').forEach(b=>b.onclick=()=>projOpen(b.dataset.open));
+}
+async function projOpen(slug){
+  const r=await api('/api/project/open',{slug});
+  if(r&&r.ok) location.reload();
+  else $('#projErr').textContent=(r&&r.error)||'could not open the project';
+}
+
+// ============================ DIAG =========================================
+let DIAG=null, DG_SEQ=0;
+function gb(mb){ return mb==null?'—':(mb/1024).toFixed(1)+' GB'; }
+// The per-frame cost the fleet vector implies (LossLessL RAW ~33 MB + S Fine
+// JPEG ~5 MB). Used ONLY to translate a body's remaining-shots into "about
+// how much card is left" for the operator — the body's own count is the truth.
+const FRAME_MB_EST = 38;
+async function pollDiag(){
+  const [d,dr]=await Promise.all([api('/api/diag'),api('/api/drain')]);
+  if(d&&d.ts){ DIAG=d; renderDiagRig(d); renderDiagCams(d); renderDiagSettings(d); }
+  renderDiagOps(d,dr);
+  renderDiagRuns();
+}
+function renderDiagRig(d){
+  const st=d.storage||{}, pj=st.project||{};
+  const t=d.time||{}, nav=d.nav||{};
+  $('#dgRig').innerHTML =
+    kvrow('project', escapeHtml(pj.name||'—') + (pj.legacy?' <span class="muted">(legacy layout)</span>':''))+
+    kvrow('runs dir', `<span class="mono small">${escapeHtml(st.runs_dir||'—')}</span>`)+
+    kvrow('raw dir', `<span class="mono small">${escapeHtml(pj.raw_dir||'—')}</span>`)+
+    kvrow('host disk free', gb(st.jetson_free_mb) + ((st.jetson_free_mb||0) < (st.low_threshold_mb||5000) ? ' <b style="color:var(--bad)">LOW</b>':''))+
+    kvrow('time source', escapeHtml(t.source||'—') + (t.gps_offset_s!=null?` <span class="muted">(host ${t.gps_offset_s>0?'+':''}${t.gps_offset_s}s vs GPS)</span>`:''))+
+    kvrow('nav', nav.online?'<span style="color:var(--ok)">live NMEA</span>':'<span style="color:var(--warn)">no live fix — static fallback</span>')+
+    kvrow('run', (d.run&&d.run.active)
+      ? `<b>recording ${escapeHtml(d.run.run_id||'')}</b> — ${d.run.frames} frames`+
+        ((d.run.sync&&d.run.sync.paused_for)?' · <b style="color:var(--bad)">PAUSED</b>':'')
+      : 'idle');
+}
+function renderDiagCams(d){
+  const rows=(FLEET&&FLEET.nodes)||[];
+  if(!rows.length){ $('#dgCams').innerHTML='<span class="muted small">no camera data yet</span>'; return; }
+  $('#dgCams').innerHTML = '<table class="diagt"><tr><th>cam</th><th>state</th><th>card</th><th>≈left</th><th>clock</th><th>spool</th><th>body</th></tr>'+
+    rows.map(n=>{
+      const rem=n.remaining_shots, gbLeft=rem!=null?((rem*FRAME_MB_EST)/1024).toFixed(0)+' GB':'—';
+      const bad=v=>`<span style="color:var(--bad);font-weight:700">${v}</span>`;
+      const card=(n.slot_status==='OK'?(rem!=null?rem+' shots':'OK'):bad(n.slot_status||'?'))
+        +(n.slot_writing_label && n.slot_writing_label!=='idle'?' '+bad(n.slot_writing_label):'');
+      const clock=n.clock_offset_ms!=null?n.clock_offset_ms+' ms':'—';
+      const body=[n.program&&n.program!=='M'?bad(escapeHtml(n.program)):null,
+                  n.overheating_label&&n.overheating_label!=='ok'?bad('HOT'):null,
+                  n.battery!=null?n.battery+'%':null].filter(Boolean).join(' ')||'ok';
+      return `<tr><td>${escapeHtml(n.name)}</td>
+        <td>${n.connected?'<span style="color:var(--ok)">connected</span>':bad(escapeHtml(n.state||'?'))}</td>
+        <td>${card}</td><td>${gbLeft}</td><td>${clock}</td>
+        <td>${n.disk_free_mb!=null?gb(n.disk_free_mb):'—'}</td><td>${body}</td></tr>`;
+    }).join('')+'</table>';
+}
+function renderDiagSettings(d){
+  const want=(d&&d.desired)||{};
+  const nodes=(FLEET&&FLEET.nodes)||[];
+  const conv=nodes.map(n=>{
+    const c=n.convergence||{};
+    return `${escapeHtml(n.name)}: `+(c.synced?'<span style="color:var(--ok)">synced</span>'
+      : c.diverged&&c.diverged.length?`<span style="color:var(--bad);font-weight:700">diverged: ${escapeHtml(c.diverged.join(','))}</span>`
+      : '<span class="muted">—</span>');
+  }).join(' · ');
+  const show=['aperture','shutter','iso','drive','program','focus_mode','filetype','imagesize','transsize','rawtype','store_dest','wb_mode','colortemp'];
+  $('#dgSettings').innerHTML =
+    '<div class="mono small" style="line-height:1.9">'+
+    show.filter(k=>want[k]!=null).map(k=>`${k}=<b>${escapeHtml(String(want[k]))}</b>`).join(' · ')+
+    '</div><div class="small" style="margin-top:6px">'+(conv||'')+'</div>';
+}
+function renderDiagOps(d,dr){
+  const drainActive=dr&&dr.active;
+  const last=dr&&dr.last;
+  if(last&&last.node&&last.at){ window.DRAIN_LAST=window.DRAIN_LAST||{}; window.DRAIN_LAST[last.node]=last.at; }
+  $('#dgDrainState').innerHTML = drainActive
+    ? `<b style="color:var(--warn)">drain running on ${escapeHtml(dr.node||'?')}…</b>`
+    : (last?`last drain: ${escapeHtml(last.node||'?')} — ${last.pulled} pulled, ${last.deleted} deleted`+
+            (last.errors?`, <b style="color:var(--bad)">${last.errors} errors</b>`:''):'no drain yet this session');
+  const nodes=(FLEET&&FLEET.nodes)||[];
+  $('#dgOps').innerHTML = nodes.map(n=>`<div class="row" style="margin-bottom:6px">
+      <span class="mono" style="min-width:52px">${escapeHtml(n.name)}</span>
+      <button class="act" data-drain="${escapeHtml(n.name)}" ${(!n.connected||drainActive)?'disabled':''}>⏏ Download images (drain card)</button>
+      <button class="act stop" data-format="${escapeHtml(n.name)}" ${(!n.connected||drainActive)?'disabled':''}>Format card…</button>
+    </div>`).join('');
+  $('#dgOps').querySelectorAll('button[data-drain]').forEach(b=>b.onclick=async()=>{
+    b.disabled=true;
+    const r=await api('/api/drain',{nodes:[b.dataset.drain]});
+    if(!(r&&r.ok!==false)) alert('drain refused: '+((r&&r.error)||'no answer'));
+    pollDiag();
+  });
+  $('#dgOps').querySelectorAll('button[data-format]').forEach(b=>b.onclick=()=>fmtOpen(b.dataset.format));
+}
+async function renderDiagRuns(){
+  const r=await api('/api/runs');
+  const runs=(r&&r.runs)||[];
+  $('#dgRuns').innerHTML = runs.slice(0,8).map(x=>`<div class="row" style="margin-bottom:4px">
+      <span class="mono" style="flex:1;overflow:hidden;text-overflow:ellipsis">${escapeHtml(x.run_id||x.id||'?')}</span>
+      <span class="muted">${x.frames!=null?x.frames+' frames':''}</span>
+      <a class="act" style="text-decoration:none" href="/api/run/zip?id=${encodeURIComponent(x.run_id||x.id)}" download>ZIP</a>
+    </div>`).join('') || '<span class="muted small">no runs in this project yet</span>';
+}
+// Status log — the journal, formatted for reading: one line per event,
+// timestamp first, warnings amber, errors red+bold.
+async function pollDiagLog(){
+  const sev=$('#dgSev').value;
+  const r=await api('/api/events?since='+DG_SEQ+'&sev='+sev);
+  if(!r||!r.events) return;
+  DG_SEQ=r.next;
+  const l=$('#dgLog');
+  if(l.firstElementChild&&l.firstElementChild.tagName==='SPAN') l.innerHTML='';
+  r.events.forEach(e=>{
+    const d=new Date(e.ts*1000).toISOString().slice(11,19);
+    const cls=e.sev==='error'?'hi':e.sev==='warn'?'wa':'';
+    const msg=e.msg.charAt(0).toUpperCase()+e.msg.slice(1);
+    l.insertAdjacentHTML('beforeend',
+      `<div class="ln ${cls}"><span class="t">${d}</span>${e.node?('['+escapeHtml(e.node)+'] '):''}${escapeHtml(msg)}</div>`);
+  });
+  while(l.children.length>500) l.removeChild(l.firstChild);
+  if($('#dgFollow').classList.contains('on')) l.scrollTop=l.scrollHeight;
+}
+
+// ============================ ALERTS =======================================
+async function pollAlerts(){
+  const [an,ev]=await Promise.all([api('/api/anomalies'),api('/api/events?since=0&sev=warn')]);
+  const act=(an&&an.anomalies)||[];
+  $('#alActive').innerHTML = act.length? act.map(a=>
+      `<div class="alertline${a.sev==='bad'?'':' warnline'}"><span class="t">${escapeHtml(a.node||'rig')}</span>${escapeHtml(a.msg)}${a.hint?`<div class="small" style="font-weight:400;margin-top:4px;color:var(--muted)">${escapeHtml(a.hint)}</div>`:''}</div>`
+    ).join('') : '<span class="muted small">none — all clear</span>';
+  const evs=((ev&&ev.events)||[]).slice(-80).reverse();
+  $('#alHist').innerHTML = evs.length? evs.map(e=>{
+      const d=new Date(e.ts*1000).toISOString().replace('T',' ').slice(5,19);
+      return `<div class="alertline${e.sev==='error'?'':' warnline'}"><span class="t">${d}</span>${e.node?('['+escapeHtml(e.node)+'] '):''}${escapeHtml(e.msg)}</div>`;
+    }).join('') : '<span class="muted small">none this session</span>';
+}
+
+// ============================ FORMAT DIALOG ================================
+// Two gates in the UI (facts + typing the camera name) and two more in the
+// backend (rigd refuses during run/drain; the node needs its confirm token).
+let FMT_NODE=null;
+function fmtOpen(name){
+  FMT_NODE=name;
+  const n=((FLEET&&FLEET.nodes)||[]).find(x=>x.name===name)||{};
+  $('#fmName').textContent=name;
+  $('#fmWord').textContent=name;
+  $('#fmType').value=''; $('#fmGo').disabled=true; $('#fmResult').textContent='';
+  const rem=n.remaining_shots;
+  $('#fmFacts').innerHTML =
+    kvrow('body', escapeHtml((n.model||'?')+' · '+(n.id||'?')))+
+    kvrow('card', escapeHtml(n.slot_status||'?')+(rem!=null?` · ${rem} shots free (≈${((rem*FRAME_MB_EST)/1024).toFixed(0)} GB)`:''))+
+    kvrow('last drain', escapeHtml(fmtLastDrain(name)));
+  $('#fmtModal').classList.add('show');
+  $('#fmType').focus();
+}
+function fmtLastDrain(name){
+  const l=window.DRAIN_LAST&&window.DRAIN_LAST[name];
+  return l?new Date(l*1000).toISOString().replace('T',' ').slice(0,16)+'Z':'unknown — anything on this card may exist nowhere else';
+}
+$('#fmType').oninput=()=>{ $('#fmGo').disabled = $('#fmType').value.trim()!==FMT_NODE; };
+$('#fmCancel').onclick=()=>$('#fmtModal').classList.remove('show');
+$('#fmGo').onclick=async()=>{
+  $('#fmGo').disabled=true;
+  $('#fmResult').textContent='formatting… (the body reports completion itself)';
+  const r=await api('/api/node/format',{node:FMT_NODE,confirm:'format'},100000);
+  if(r&&r.ok){ $('#fmResult').innerHTML='<span style="color:var(--ok)">card erased and verified</span>';
+    setTimeout(()=>$('#fmtModal').classList.remove('show'),1500); }
+  else $('#fmResult').innerHTML='<span style="color:var(--bad)">format failed: '+escapeHtml((r&&r.error)||'no answer')+'</span>';
+  pollDiag();
+};
+
+
+// ============================ MAP ==========================================
+// Offline by construction: at sea there is no tile server, so the map is a
+// metric UTM plot — breadcrumb trail from the flight logs (+ the live fix
+// while a run records), one dot per captured frame, scale bar, north arrow.
+const MAP={ runs:{}, order:[], view:null, live:[], liveAt:0, follow:false,
+            init:false, hover:null, sel:null };
+const MAP_COLORS=['#5aa9e6','#3fbf7f','#e6a94b','#b48ce6','#e66a9b','#6ae6d5','#c9e65a','#e2574c'];
+
+// WGS84 -> UTM (metres). Compact Karney-free series — centimetre-class over a
+// survey box, which is far inside the GPS error the rows already carry.
+function llToUtm(lat,lon){
+  const a=6378137, f=1/298.257223563, k0=0.9996;
+  const zone=Math.floor((lon+180)/6)+1, lam0=((zone-1)*6-180+3)*Math.PI/180;
+  const phi=lat*Math.PI/180, lam=lon*Math.PI/180;
+  const e2=f*(2-f), ep2=e2/(1-e2);
+  const N=a/Math.sqrt(1-e2*Math.sin(phi)**2), T=Math.tan(phi)**2;
+  const C=ep2*Math.cos(phi)**2, A=Math.cos(phi)*(lam-lam0);
+  const M=a*((1-e2/4-3*e2*e2/64-5*e2**3/256)*phi
+    -(3*e2/8+3*e2*e2/32+45*e2**3/1024)*Math.sin(2*phi)
+    +(15*e2*e2/256+45*e2**3/1024)*Math.sin(4*phi)
+    -(35*e2**3/3072)*Math.sin(6*phi));
+  const x=k0*N*(A+(1-T+C)*A**3/6+(5-18*T+T*T+72*C-58*ep2)*A**5/120)+500000;
+  const y=k0*(M+N*Math.tan(phi)*(A*A/2+(5-T+9*C+4*C*C)*A**4/24
+    +(61-58*T+T*T+600*C-330*ep2)*A**6/720));
+  return {x, y: lat<0? y+10000000 : y, zone};
+}
+
+async function fetchText(p, tmoMs){
+  const c=new AbortController(); const t=setTimeout(()=>c.abort(), tmoMs||10000);
+  try{ const r=await fetch(p,{signal:c.signal}); return r.ok? await r.text():null; }
+  catch(e){ return null; } finally{ clearTimeout(t); }
+}
+function parseFlightCsv(txt){
+  if(!txt) return [];
+  const lines=txt.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return [];
+  const hdr=lines[0].split(','), ix={};
+  hdr.forEach((h,i)=>ix[h.trim()]=i);
+  const out=[];
+  for(let i=1;i<lines.length;i++){
+    const c=lines[i].split(',');
+    const x=parseFloat(c[ix.xutm]), y=parseFloat(c[ix.yutm]);
+    if(!isFinite(x)||!isFinite(y)) continue;
+    out.push({x, y, file:c[ix.filename], dt:c[ix.datetime],
+              zone:c[ix.utm_zone], depth:c[ix.depth_from_xplore9]||'',
+              hdg:parseFloat(c[ix.heading_imu])});
+  }
+  return out;
+}
+async function mapLoadRun(rid){
+  const layer=MAP.runs[rid];
+  const [c1,c2]=await Promise.all([
+    fetchText('/api/run/flight_log?id='+encodeURIComponent(rid)+'&cam=cam1'),
+    fetchText('/api/run/flight_log?id='+encodeURIComponent(rid)+'&cam=cam2')]);
+  layer.rows={cam1:parseFlightCsv(c1), cam2:parseFlightCsv(c2)};
+  layer.loaded=true;
+  mapDraw();
+}
+async function mapShow(){
+  mapInitOnce();
+  const r=await api('/api/runs');
+  const runs=((r&&r.runs)||[]).slice(0,12);
+  runs.forEach((x,i)=>{
+    const rid=x.run_id;
+    if(!MAP.runs[rid]){
+      MAP.runs[rid]={on:MAP.order.length===0&&i===0, loaded:false,
+                     color:MAP_COLORS[MAP.order.length%MAP_COLORS.length],
+                     rows:{cam1:[],cam2:[]}};
+      MAP.order.push(rid);
+    }
+  });
+  $('#mapRuns').innerHTML=MAP.order.map(rid=>{
+    const l=MAP.runs[rid];
+    return `<label style="flex-direction:row;align-items:center;gap:5px;font-family:var(--mono);font-size:12px">
+      <input type="checkbox" data-rid="${escapeHtml(rid)}" ${l.on?'checked':''}>
+      <span style="color:${l.color}">■</span>${escapeHtml(rid.slice(0,18))}</label>`;
+  }).join('');
+  $('#mapRuns').querySelectorAll('input[data-rid]').forEach(cb=>cb.onchange=()=>{
+    const l=MAP.runs[cb.dataset.rid]; l.on=cb.checked;
+    if(cb.checked&&!l.loaded) mapLoadRun(cb.dataset.rid);
+    else mapDraw();
+    if(cb.checked&&!MAP.view) setTimeout(mapFit,600);
+  });
+  const first=MAP.order.find(rid=>MAP.runs[rid].on);
+  if(first&&!MAP.runs[first].loaded) await mapLoadRun(first);
+  if(!MAP.view) mapFit(); else mapDraw();
+}
+function mapVisiblePts(){
+  const pts=[];
+  for(const rid of MAP.order){
+    const l=MAP.runs[rid]; if(!l.on) continue;
+    for(const cam of ['cam1','cam2'])
+      for(const p of l.rows[cam]) pts.push({...p, rid, cam, color:l.color});
+  }
+  return pts;
+}
+function mapFit(){
+  const pts=mapVisiblePts().concat(MAP.live);
+  const cv=$('#mapCanvas');
+  if(!pts.length){ MAP.view=null; mapDraw(); return; }
+  let x0=1/0,x1=-1/0,y0=1/0,y1=-1/0;
+  pts.forEach(p=>{x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y);});
+  const w=cv.clientWidth,h=cv.clientHeight;
+  const span=Math.max(x1-x0,y1-y0,10);
+  MAP.view={cx:(x0+x1)/2, cy:(y0+y1)/2, s:Math.min(w,h)/(span*1.25)};
+  mapDraw();
+}
+function mapPx(p){ // UTM -> canvas CSS px (north up)
+  const cv=$('#mapCanvas'), v=MAP.view;
+  return {px:cv.clientWidth/2+(p.x-v.cx)*v.s, py:cv.clientHeight/2-(p.y-v.cy)*v.s};
+}
+let MAP_RAF=0;
+function mapDraw(){ if(!MAP_RAF) MAP_RAF=requestAnimationFrame(mapDrawNow); }
+function mapDrawNow(){
+  MAP_RAF=0;
+  const cv=$('#mapCanvas'); if(!cv.clientWidth) return;
+  const dpr=window.devicePixelRatio||1;
+  if(cv.width!==cv.clientWidth*dpr||cv.height!==cv.clientHeight*dpr){
+    cv.width=cv.clientWidth*dpr; cv.height=cv.clientHeight*dpr; }
+  const g=cv.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,cv.clientWidth,cv.clientHeight);
+  const pts=mapVisiblePts();
+  if(!MAP.view){
+    g.fillStyle='#8b90a0'; g.font='13px ui-monospace,monospace'; g.textAlign='center';
+    g.fillText(pts.length?'…':'no positioned frames yet — pick a run above, or start a transect',
+               cv.clientWidth/2, cv.clientHeight/2);
+    $('#mapInfo').textContent='—';
+    return;
+  }
+  const v=MAP.view, w=cv.clientWidth, h=cv.clientHeight;
+  // graticule: pick a step that lands 60-160 px apart
+  const steps=[1,2,5,10,20,50,100,200,500,1000,2000,5000,10000];
+  const step=steps.find(st=>st*v.s>=60)||10000;
+  g.strokeStyle='#1c1f26'; g.lineWidth=1; g.beginPath();
+  const ex0=v.cx-w/2/v.s, ex1=v.cx+w/2/v.s, ny0=v.cy-h/2/v.s, ny1=v.cy+h/2/v.s;
+  for(let x=Math.ceil(ex0/step)*step;x<=ex1;x+=step){ const p=mapPx({x,y:v.cy}); g.moveTo(p.px,0); g.lineTo(p.px,h); }
+  for(let y=Math.ceil(ny0/step)*step;y<=ny1;y+=step){ const p=mapPx({x:v.cx,y}); g.moveTo(0,p.py); g.lineTo(w,p.py); }
+  g.stroke();
+  // trail per visible run: cam1 rows (boat GPS) joined in order
+  for(const rid of MAP.order){
+    const l=MAP.runs[rid]; if(!l.on) continue;
+    const rows=l.rows.cam1.length?l.rows.cam1:l.rows.cam2;
+    if(rows.length>1){
+      g.strokeStyle=l.color+'66'; g.lineWidth=2; g.beginPath();
+      rows.forEach((p,i)=>{const q=mapPx(p); i?g.lineTo(q.px,q.py):g.moveTo(q.px,q.py);});
+      g.stroke();
+    }
+  }
+  // frame dots: cam1 filled, cam2 ring — a stereo pair reads as ◉ on top of ○
+  for(const p of pts){
+    const q=mapPx(p);
+    if(q.px<-8||q.py<-8||q.px>w+8||q.py>h+8) continue;
+    g.beginPath(); g.arc(q.px,q.py,p.cam==='cam1'?3:4.5,0,7);
+    if(p.cam==='cam1'){ g.fillStyle=p.color; g.fill(); }
+    else{ g.strokeStyle=p.color; g.lineWidth=1.6; g.stroke(); }
+  }
+  // live breadcrumb
+  if(MAP.live.length){
+    g.strokeStyle='#e6a94b'; g.setLineDash([4,4]); g.lineWidth=2; g.beginPath();
+    MAP.live.forEach((p,i)=>{const q=mapPx(p); i?g.lineTo(q.px,q.py):g.moveTo(q.px,q.py);});
+    g.stroke(); g.setLineDash([]);
+    const last=mapPx(MAP.live[MAP.live.length-1]);
+    g.fillStyle='#e6a94b'; g.beginPath(); g.arc(last.px,last.py,6,0,7); g.fill();
+    g.fillStyle='#0e0f12'; g.beginPath(); g.arc(last.px,last.py,2.5,0,7); g.fill();
+  }
+  // selected point highlight
+  if(MAP.sel){ const q=mapPx(MAP.sel); g.strokeStyle='#fff'; g.lineWidth=2;
+    g.beginPath(); g.arc(q.px,q.py,8,0,7); g.stroke(); }
+  // scale bar
+  const targets=[1,2,5,10,20,50,100,200,500,1000,2000,5000];
+  const bar=targets.find(t=>t*v.s>=70)||5000;
+  g.strokeStyle='#e8eaf0'; g.lineWidth=2; g.beginPath();
+  g.moveTo(14,h-16); g.lineTo(14+bar*v.s,h-16); g.stroke();
+  g.fillStyle='#e8eaf0'; g.font='11px ui-monospace,monospace'; g.textAlign='left';
+  g.fillText(bar>=1000?(bar/1000)+' km':bar+' m',14,h-22);
+  // north arrow
+  g.save(); g.translate(w-26,26);
+  g.fillStyle='#e8eaf0'; g.beginPath(); g.moveTo(0,-11); g.lineTo(6,7); g.lineTo(0,3);
+  g.lineTo(-6,7); g.closePath(); g.fill(); g.textAlign='center'; g.fillText('N',0,20);
+  g.restore();
+  const zone=(pts[0]&&pts[0].zone)||(MAP.live[0]&&MAP.live[0].zoneLabel)||'';
+  $('#mapInfo').textContent=`${pts.length} frames plotted · UTM ${zone||'?'} · grid ${step>=1000?(step/1000)+' km':step+' m'}`+
+    (MAP.live.length?` · live trail ${MAP.live.length} fixes`:'');
+}
+function mapInitOnce(){
+  if(MAP.init) return; MAP.init=true;
+  const cv=$('#mapCanvas');
+  let drag=null;
+  cv.addEventListener('pointerdown',e=>{ drag={x:e.clientX,y:e.clientY}; cv.classList.add('drag'); cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointerup',e=>{
+    cv.classList.remove('drag');
+    if(drag&&Math.hypot(e.clientX-drag.x,e.clientY-drag.y)<4) mapClick(e);
+    drag=null; });
+  cv.addEventListener('pointermove',e=>{
+    if(drag&&MAP.view){
+      MAP.view.cx-=(e.clientX-drag.x)/MAP.view.s;
+      MAP.view.cy+=(e.clientY-drag.y)/MAP.view.s;
+      drag={x:e.clientX,y:e.clientY}; MAP.follow=false; syncFollowBtn(); mapDraw();
+    } else mapHover(e);
+  });
+  cv.addEventListener('wheel',e=>{
+    if(!MAP.view) return; e.preventDefault();
+    const r=cv.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
+    const k=Math.exp(-e.deltaY*0.0015);
+    const wx=MAP.view.cx+(mx-r.width/2)/MAP.view.s, wy=MAP.view.cy-(my-r.height/2)/MAP.view.s;
+    MAP.view.s=Math.min(80,Math.max(0.01,MAP.view.s*k));
+    MAP.view.cx=wx-(mx-r.width/2)/MAP.view.s; MAP.view.cy=wy+(my-r.height/2)/MAP.view.s;
+    mapDraw();
+  },{passive:false});
+  $('#mapFit').onclick=mapFit;
+  $('#mapZin').onclick=()=>{ if(MAP.view){MAP.view.s=Math.min(80,MAP.view.s*1.5); mapDraw();} };
+  $('#mapZout').onclick=()=>{ if(MAP.view){MAP.view.s=Math.max(0.01,MAP.view.s/1.5); mapDraw();} };
+  $('#mapFollow').onclick=()=>{ MAP.follow=!MAP.follow; syncFollowBtn();
+    if(MAP.follow&&MAP.live.length){ const p=MAP.live[MAP.live.length-1];
+      MAP.view=MAP.view||{cx:p.x,cy:p.y,s:2}; MAP.view.cx=p.x; MAP.view.cy=p.y; mapDraw(); } };
+  window.addEventListener('resize',mapDraw);
+}
+function syncFollowBtn(){ $('#mapFollow').textContent='follow: '+(MAP.follow?'on':'off');
+  $('#mapFollow').classList.toggle('on',MAP.follow); }
+function mapNearest(e){
+  const cv=$('#mapCanvas'), r=cv.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  let best=null,bd=144;
+  for(const p of mapVisiblePts()){
+    const q=mapPx(p), d=(q.px-mx)**2+(q.py-my)**2;
+    if(d<bd){bd=d;best=p;}
+  }
+  return best;
+}
+function mapHover(e){
+  if(!MAP.view) return;
+  const p=mapNearest(e), tip=$('#mapTip');
+  if(!p){ tip.style.display='none'; return; }
+  const r=$('#mapCanvas').getBoundingClientRect(), wrap=tip.parentElement.getBoundingClientRect();
+  tip.style.display='block';
+  tip.style.left=(e.clientX-wrap.left+14)+'px'; tip.style.top=(e.clientY-wrap.top+10)+'px';
+  tip.innerHTML=`${escapeHtml(p.file||'')}<br><span class="muted">${escapeHtml(p.dt||'')}${p.depth?' · '+escapeHtml(p.depth)+' m':''}${isFinite(p.hdg)?' · hdg '+p.hdg.toFixed(0)+'°':''}</span>`;
+}
+function mapClick(e){
+  if(!MAP.view) return;
+  const p=mapNearest(e), th=$('#mapThumb');
+  MAP.sel=p; mapDraw();
+  if(!p){ th.style.display='none'; return; }
+  th.style.display='block';
+  th.querySelector('img').src='/api/run/frame?id='+encodeURIComponent(p.rid)+'&cam='+p.cam+'&name='+encodeURIComponent(p.file);
+  th.querySelector('.cap').textContent=p.rid+' · '+p.cam+' · '+p.file;
+}
+// Live breadcrumb + keeping an ACTIVE run's layer growing on screen.
+async function pollMapLive(){
+  if(TAB!=='map'||document.hidden) return;
+  const nv=await api('/api/nav');
+  const fx=nv&&nv.fix;
+  if(fx&&isFinite(fx.lat)&&isFinite(fx.lon)&&nv.online){
+    const u=llToUtm(fx.lat,fx.lon);
+    const last=MAP.live[MAP.live.length-1];
+    if(!last||Math.hypot(u.x-last.x,u.y-last.y)>0.5){
+      MAP.live.push({x:u.x,y:u.y,zoneLabel:u.zone});
+      if(MAP.live.length>6000) MAP.live.splice(0,1000);
+      if(MAP.follow&&MAP.view){ MAP.view.cx=u.x; MAP.view.cy=u.y; }
+      mapDraw();
+    }
+  }
+  const run=FLEET&&FLEET.run;
+  if(run&&run.active&&run.run_id){
+    if(!MAP.runs[run.run_id]) mapShow();
+    else if(Date.now()-MAP.liveAt>10000){ MAP.liveAt=Date.now();
+      if(MAP.runs[run.run_id].on) mapLoadRun(run.run_id); }
+  }
+}
+
 // ---- helpers + loops --------------------------------------------------------
 function kvrow(k,v){return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;}
 function fmt(v,n){return v==null||isNaN(v)?'—':(+v).toFixed(n);}
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 pollFleet(); pollEvents(); pollAnoms(); hydrateSettings(); hydrateStrobe();
+loadProject();
+$('#hProj').onclick=openProjects;
+$('#projClose').onclick=()=>$('#projOverlay').classList.remove('show');
+$('#projCreate').onclick=async()=>{
+  const r=await api('/api/project/create',{name:$('#pjName').value,vessel:$('#pjVessel').value,
+    site:$('#pjSite').value,operator:$('#pjOperator').value,notes:$('#pjNotes').value});
+  if(r&&r.ok) location.reload();
+  else $('#projErr').textContent=(r&&r.error)||'could not create the project';
+};
+$('#dgProjBtn').onclick=openProjects;
+$('#dgFollow').onclick=()=>$('#dgFollow').classList.toggle('on');
+$('#dgSev').onchange=()=>{DG_SEQ=0;$('#dgLog').innerHTML='';pollDiagLog();};
 pollDrain(true);
 syncApplyBtn();
 setInterval(pollFleet, 2000);
+setInterval(pollMapLive, 2500);
+setInterval(()=>{ if(TAB==='diag'&&!document.hidden){ pollDiag(); pollDiagLog(); } }, 3000);
+setInterval(()=>{ if(TAB==='alerts'&&!document.hidden) pollAlerts(); }, 4000);
 // The pair list reads rigd's own disk (RunBrowser caches on file mtimes), so
 // polling it while Review is visible is cheap; the camera-spool fallback is
 // the only branch that touches a node, and only when no run exists.

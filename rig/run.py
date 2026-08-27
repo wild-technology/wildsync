@@ -34,7 +34,10 @@ import threading
 import time
 
 import rigcore
-from rigcore import http_json, http_bytes, RUNS_DIR
+from rigcore import http_json, http_bytes
+# RUNS_DIR is deliberately NOT from-imported: the project layer (rig/project.py)
+# reassigns rigcore.RUNS_DIR when the operator opens a project, and a from-import
+# would freeze this module on whatever project was active at import time.
 
 try:
     import navlog
@@ -530,14 +533,30 @@ class PullWorker(threading.Thread):
         return True
 
     def run(self):
-        os.makedirs(self.cam_dir, exist_ok=True)
-        path = os.path.join(self.cam_dir, "flight_log.csv")
-        new = not os.path.exists(path)
-        self._flight_fh = open(path, "a", newline="")
-        self._flight = csv.writer(self._flight_fh)
-        if new:
-            self._flight.writerow(FLIGHT_HEADER)
-            self._flight_fh.flush()
+        # Guarded: an OSError here (full disk, permissions after a project
+        # switch, a dead volume) used to kill this worker thread before its
+        # first pull, silently - the run then recorded nothing from this
+        # camera while claiming to record. Frames matter more than metadata:
+        # pull anyway, say loudly that positions are being lost.
+        try:
+            os.makedirs(self.cam_dir, exist_ok=True)
+            path = os.path.join(self.cam_dir, "flight_log.csv")
+            new = not os.path.exists(path)
+            self._flight_fh = open(path, "a", newline="")
+            self._flight = csv.writer(self._flight_fh)
+            if new:
+                self._flight.writerow(FLIGHT_HEADER)
+                self._flight_fh.flush()
+                os.fsync(self._flight_fh.fileno())
+        except OSError as e:
+            self._flight_fh = None
+            self._flight = None
+            self.events.emit(
+                "error", "pull",
+                "[%s] flight_log.csv cannot be written (%s) - frames will "
+                "still be pulled, but every position/attitude row for this "
+                "camera is LOST for this run" % (self.mon.name_, e),
+                node=self.mon.name_)
         late = False
         while not (self._stopev.is_set() or self._baseline(late)):
             # Never baseline off a listing that did not happen. An empty
@@ -668,14 +687,40 @@ class PullWorker(threading.Thread):
                     with self._lock:
                         self.orphans += 1
                     self.provider.note_orphan(self.mon.name_, 1)
+                self._note_unpulled(name, "abandoned after %d pull attempts"
+                                    % p["attempts"],
+                                    epoch=(lost or {}).get("epoch")
+                                    if isinstance(lost, dict) else None)
                 self.provider.events.emit(
                     "error", "pull_fail",
                     "%s abandoned after %d attempts - that frame is NOT in the "
-                    "survey; the JPEG is still on the node and on the card"
+                    "survey; the JPEG is still on the node and on the card, "
+                    "and unpulled.jsonl keeps its identity for ingest"
                     % (name, p["attempts"]), node=self.mon.name_, frame=name)
             else:
                 self.retries += 1
                 p["next_try"] = time.time() + self._retry_delay(p["attempts"])
+
+
+    def _note_unpulled(self, name, reason, epoch=None):
+        """One JSON line per frame this run failed to keep. The card RAW for
+        such a frame survives, gets drained, hash-verified - and then the card
+        original is deleted - so without this sidecar its identity is lost
+        forever ("leftover" in ingest with no run, no instant, no XMP). The
+        sidecar is the bridge: name, claimed command epoch, why."""
+        try:
+            path = os.path.join(os.path.dirname(self.cam_dir),
+                                "unpulled.jsonl")
+            rec = {"ts": round(time.time(), 3), "cam": self.mon.name_,
+                   "orig": name, "reason": reason}
+            if epoch is not None:
+                rec["cmd_epoch"] = round(epoch, 6)
+            with open(path, "a") as fh:
+                fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            pass                      # the event below still records the loss
 
     def _retry_delay(self, attempts):
         """Seconds before the next attempt at a frame that would not pull.
@@ -739,13 +784,30 @@ class PullWorker(threading.Thread):
         # A link that dies mid-frame yields a short read with no exception, and a
         # half-written frame that still gets a flight_log row is worse than a
         # missing one: it looks like real survey data. Reject it here.
-        if size and len(data) != size:
+        if not size:
+            # The spool lists a frame the moment the SDK creates it, size 0
+            # until the write completes (the listing refreshes every poll).
+            # Skipping the size check for these accepted unverifiable bytes;
+            # retry instead - the pending queue holds the frame.
+            return fail("warn", "%s has no size in the listing yet - retrying"
+                        % name)
+        if len(data) != size:
             return fail("error", "%s truncated: got %d of %d bytes"
                         % (name, len(data), size))
         ext = os.path.splitext(name)[1].lower() or ".jpg"
         if ext in (".jpg", ".jpeg") and not (data[:2] == b"\xff\xd8"
                                              and data[-2:] == b"\xff\xd9"):
             return fail("error", "%s is not a complete JPEG (bad SOI/EOI)" % name)
+        # The RAW/HEIF siblings deserve the same courtesy as the JPEGs: a
+        # half-written ARW passed every gate here (the size can match a stale
+        # listing) and looked like survey data forever after.
+        if ext == ".arw" and data[:4] not in (b"II*\x00", b"MM\x00*"):
+            return fail("error", "%s is not a complete ARW (bad TIFF header)"
+                        % name)
+        if ext in (".hif", ".heif", ".heic") and (len(data) < 12
+                                                  or data[4:8] != b"ftyp"):
+            return fail("error", "%s is not a complete HEIF (no ftyp box)"
+                        % name)
         # One shutter release, one name. When the body delivers RAW+JPEG the
         # second half is archived beside the first under the SAME stem instead
         # of being renamed to its own (later) resolved instant, so the pair
@@ -785,10 +847,35 @@ class PullWorker(threading.Thread):
         else:
             fname, dest = _uniq_dest(self.cam_dir,
                                      _fmt_fname(self.cam_num, epoch + off, ext))
+        # tmp + fsync + rename, then fsync the directory. Two findings meet
+        # here (audit 2026-08-27): a plain buffered write left the bytes in
+        # the page cache while the Pi's spool copy was deleted seconds later -
+        # host power loss then destroyed the only remaining rendition; and a
+        # failed write left a truncated file under the canonical name, pushing
+        # the retry to a _1 name with the flight_log row while the clean name
+        # kept the garbage. The .part name means an incomplete file can never
+        # be mistaken for a frame, and the fsyncs mean "verified on host disk"
+        # (the promise the spool delete below relies on) is actually true.
+        tmp = dest + ".part"
         try:
-            with open(dest, "wb") as fh:
+            with open(tmp, "wb") as fh:
                 fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, dest)
+            try:
+                dfd = os.open(self.cam_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
         except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             return fail("error", "write %s failed: %s" % (fname, e))
         self.pulled += 1
         # The first file of a release owns the row; siblings only get the name.
@@ -1201,8 +1288,19 @@ class PullWorker(threading.Thread):
                 "gz_dps": _r(imu.get("gz"), 3),
                 "imu_temp_c": _r(imu.get("temp"), 1),
             })
-        self._flight.writerow([row[k] for k in FLIGHT_HEADER])
-        self._flight_fh.flush()
+        if self._flight is not None:
+            try:
+                self._flight.writerow([row[k] for k in FLIGHT_HEADER])
+                self._flight_fh.flush()
+                os.fsync(self._flight_fh.fileno())
+            except (OSError, ValueError) as e:
+                self._flight = None
+                self._flight_fh = None
+                self.events.emit(
+                    "error", "pull",
+                    "[%s] flight_log.csv stopped accepting rows (%s) - "
+                    "frames continue, positions from here are LOST"
+                    % (self.mon.name_, e), node=self.mon.name_)
         claim = self.cmd_epoch.get(orig)
         # The end-of-exposure edge and the shot's strobe instant travel with
         # the frame into run.json's index: [fall, rise] is this camera's
@@ -1916,10 +2014,10 @@ class RunManager:
         run's run.json, destroying the only copy of its per-frame index and its
         renamed->original filename mapping. Never reuse an existing root."""
         base = time.strftime("%y%m%d_%H%M", time.gmtime(now)) + "_" + _slug(label)
-        os.makedirs(RUNS_DIR, exist_ok=True)
+        os.makedirs(rigcore.RUNS_DIR, exist_ok=True)
         for n in range(0, 27):
             rid = base if n == 0 else "%s_%s" % (base, chr(ord("a") + n))
-            root = os.path.join(RUNS_DIR, rid)
+            root = os.path.join(rigcore.RUNS_DIR, rid)
             try:
                 os.mkdir(root)
             except FileExistsError:
@@ -1932,7 +2030,7 @@ class RunManager:
                     "stay intact" % (base, rid), run_id=rid)
             return rid, root
         rid = "%s_%d" % (base, int(time.time()))
-        root = os.path.join(RUNS_DIR, rid)
+        root = os.path.join(rigcore.RUNS_DIR, rid)
         os.makedirs(root, exist_ok=True)
         return rid, root
 
@@ -2115,7 +2213,19 @@ class RunManager:
             run = self.active
             rid = run["run_id"]
             summary = {n: w.stats() for n, w in workers.items()}
-            self.events.emit("info", "run", "run stopped: %s" % rid,
+            # The counts go in the MESSAGE, not only the payload: the journal
+            # line is what the operator (and the Diagnostics log) reads, and
+            # "run stopped: <id>" answered the question everyone actually has
+            # - how many frames did each camera deliver, and did any fail -
+            # with silence.
+            per_cam = ", ".join(
+                "%s %d image%s%s" % (
+                    n.capitalize(), s.get("pulled", 0),
+                    "" if s.get("pulled", 0) == 1 else "s",
+                    (" (%d FAILED)" % s["failed"]) if s.get("failed") else "")
+                for n, s in sorted(summary.items()))
+            self.events.emit("info", "run",
+                             "run stopped: %s - %s" % (rid, per_cam or "no cameras"),
                              summary=summary,
                              time_source=run["time_src"],
                              gps_offset_s=round(run["time_off"], 3))
@@ -2634,6 +2744,20 @@ class RunManager:
                         % (m.name_, (r or {}).get("error"),
                            ", ".join(named) if named else "no new frame"),
                         node=m.name_, frames=named)
+                # The pulse is not the proof - the FRAME is. piagent answers
+                # ok:true whenever the trigger line was asserted, with no idea
+                # whether a camera exposed (its own contract says so), so a
+                # body that dropped off USB while its Pi stayed healthy passed
+                # every probe, resumed, failed three fires, re-paused - an
+                # oscillation that shot ~40% of the healthy camera's frames
+                # unpaired (audit 2026-08-27). A resume is earned only by the
+                # probe's own frame arriving in the spool: camera, exposure
+                # and delivery proven in one observation.
+                if ok and not named:
+                    ok = False
+                    r = {"error": "the fire was accepted but no frame "
+                                  "appeared - the camera is not exposing or "
+                                  "not delivering"}
             return ok, (r or {}).get("error")
         except Exception as e:  # noqa: BLE001
             return False, str(e)
@@ -2728,25 +2852,44 @@ class RunManager:
                         pf = run["paused_for"]
                         fresh = not pf or pf.get("node") != dead
                         if fresh:
+                            # If this same node resumed only moments ago, the
+                            # resume was evidently premature: inherit doubled
+                            # backoff instead of restarting at the floor, so a
+                            # flapping node converges to the 60 s ceiling
+                            # instead of oscillating at the 2 s floor.
+                            lr = run.get("last_resume") or {}
+                            b0 = self.RESUME_BACKOFF_S[0]
+                            if lr.get("node") == dead and                                     time.time() - lr.get("at", 0) < 120.0:
+                                b0 = min(lr.get("backoff_s", b0) * 2,
+                                         self.RESUME_BACKOFF_S[1])
                             pf = run["paused_for"] = {
                                 "node": dead, "since": time.time(),
                                 "after_shot": k,
-                                "backoff_s": self.RESUME_BACKOFF_S[0],
-                                "next_probe": (time.time()
-                                               + self.RESUME_BACKOFF_S[0])}
+                                "backoff_s": b0,
+                                "next_probe": time.time() + b0}
                     if fresh:
                         self.events.emit(
                             "error", "capture_paused",
-                            "%s stopped answering fires - capture paused "
-                            "until it is back (other camera NOT fired alone)"
-                            % dead, node=dead)
+                            "%s stopped answering fires - capture paused, "
+                            "other camera NOT fired alone. Resumes by itself "
+                            "when the camera reconnects AND a probe fire "
+                            "delivers a frame" % dead, node=dead)
                     # Resume needs TWO things, not one. A health answer newer
                     # than the pause says the node is reachable; only a fire
                     # that returns ok:true says it can still expose. Probing
                     # on reachability alone livelocked (see _probe_fire).
                     snap = m.snapshot() if m is not None else {}
                     seen = snap.get("last_seen") or 0
-                    back = bool(snap.get("health")) and seen > pf["since"]
+                    # Three conditions, each covering a distinct drop class:
+                    # health (the Pi answers), last_seen newer than the pause
+                    # (ilxctl answers - it is the only writer of last_seen),
+                    # and is_connected (the SDK actually holds the body). The
+                    # third is what keeps a camera-side drop - USB out, body
+                    # power lost, dead SDK handle - from being probed at all:
+                    # the probe cannot succeed without a body, and probing
+                    # anyway is how the pause/resume oscillation started.
+                    back = (bool(snap.get("health")) and seen > pf["since"]
+                            and m is not None and m.is_connected())
                     if back and time.time() >= pf["next_probe"]:
                         ok, err = self._probe_fire(m)
                         if ok:
@@ -2754,6 +2897,10 @@ class RunManager:
                                 run = self.active
                                 if run:
                                     run["fail_streak"][dead] = 0
+                                    run["last_resume"] = {
+                                        "node": dead, "at": time.time(),
+                                        "backoff_s": pf.get("backoff_s",
+                                                            self.RESUME_BACKOFF_S[0])}
                                     run["paused_for"] = None
                             self.events.emit(
                                 "info", "capture_resumed",
@@ -3851,6 +3998,7 @@ class RunManager:
                     try:
                         fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
                         fh.flush()
+                        os.fsync(fh.fileno())
                     except (OSError, ValueError, TypeError) as e:
                         self.active["index_fh"] = None
                         self.events.emit(

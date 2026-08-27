@@ -363,6 +363,7 @@ def _offset_by_time(rows, cards, expect=None, authoritative=False):
 
 
 def match_run(rows, cards, used, expect=None, number_only=False,
+              tol_s=None,
               authoritative=False):
     """rows: index entries for one camera. Returns (series, offset, how,
     matches, unmatched) where matches = [(row, card, residual_s)]; how is
@@ -385,7 +386,15 @@ def match_run(rows, cards, used, expect=None, number_only=False,
             if c["stem"] in used:
                 continue
             res = c["exif"] - off - r["epoch"]
-            if abs(res) <= TOL_S and (best is None or abs(res) < abs(best[1])):
+            # The global TOL_S (0.75 s) is WIDER than a 2 Hz survey's shot
+            # period (0.5 s): with one hole in the staged files, row k then
+            # claimed file k+1 at residual +period, and every later RAW
+            # cascaded onto the previous frame's identity - wrong names, wrong
+            # XMP instants, silently (audit 2026-08-27). The caller passes a
+            # tolerance derived from the run's own interval; a hole now yields
+            # an honest unmatched row instead of a shifted survey.
+            lim = TOL_S if tol_s is None else tol_s
+            if abs(res) <= lim and (best is None or abs(res) < abs(best[1])):
                 best = (c, res)
         if best:
             used.add(best[0]["stem"])
@@ -503,14 +512,34 @@ def place(src, dst, move, dry):
         stem, ext = os.path.splitext(dst)
         alt = "%s.conflict-%s%s" % (stem, _sha256_file(src)[:8], ext)
         if not os.path.exists(alt):
-            shutil.copy2(src, alt)
+            tmp = alt + ".part"
+            shutil.copy2(src, tmp)
+            with open(tmp, "rb+") as fh:
+                os.fsync(fh.fileno())
+            os.replace(tmp, alt)
         return "conflict:" + os.path.basename(alt)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     try:
-        os.link(src, dst)
+        os.link(src, dst)          # atomic by nature (same volume)
         how = "linked"
     except OSError:
-        shutil.copy2(src, dst)
+        # Cross-volume: copy to a .part name, fsync, then rename. A crash or
+        # ENOSPC mid-copy used to leave a truncated file under the final run
+        # name - indistinguishable from the RAW it pretends to be, and the
+        # re-run then filed the good copy as a "conflict" beside it instead
+        # of healing (audit 2026-08-27).
+        tmp = dst + ".part"
+        try:
+            shutil.copy2(src, tmp)
+            with open(tmp, "rb+") as fh:
+                os.fsync(fh.fileno())
+            os.replace(tmp, dst)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         how = "copied"
     if move:
         os.unlink(src)
@@ -552,6 +581,14 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                 "frames but only %d rows are readable (no index.jsonl?); "
                 "the earlier frames cannot be matched"
                 % (rid, doc["frames"], nidx))
+        # The run's own shot period bounds how far a time-match may reach:
+        # anything beyond ~45% of the period is closer to the NEIGHBOURING
+        # frame than to its own. Manual/unknown-interval runs keep the wide
+        # default.
+        iv = ((doc.get("config") or {}).get("interval_s")
+              if isinstance(doc.get("config"), dict) else None)
+        run_tol = min(TOL_S, 0.45 * iv) if isinstance(iv, (int, float)) \
+            and iv and iv > 0 else None
         # pair spreads by shot for the sidecar
         shots = {}
         for cam, rs in rows.items():
@@ -571,7 +608,8 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
             if dir_cam is not None and cam != dir_cam:
                 results[cam] = (None, None, "other-node", [], [])
                 continue
-            r = match_run(rows[cam], cards, used, number_only=True)
+            r = match_run(rows[cam], cards, used, number_only=True,
+                          tol_s=run_tol)
             if r[0] is not None:
                 results[cam] = r
             else:
@@ -580,9 +618,41 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
         for cam in pending:
             exp = expected_offset(offsets, "cam%d" % cam, started)
             results[cam] = match_run(rows[cam], cards, used, expect=exp,
-                                     authoritative=(dir_cam == cam))
+                                     authoritative=(dir_cam == cam),
+                                     tol_s=run_tol)
+        # The run's own ledger of frames it knowingly failed to keep: their
+        # card originals are exactly the "leftovers" this pass will refuse to
+        # attribute by time alone, so say what they were.
+        up_path = os.path.join(root, "unpulled.jsonl")
+        if os.path.exists(up_path):
+            try:
+                with open(up_path) as fh:
+                    n_up = sum(1 for ln in fh if ln.strip())
+                if n_up:
+                    log("  %s: %d frame(s) this run knowingly failed to keep "
+                        "(unpulled.jsonl) - expect that many staged card "
+                        "files to stay leftover for it" % (rid, n_up))
+            except OSError:
+                pass
         for cam in sorted(rows):
             series, off, how, matches, unmatched = results[cam]
+            # Every unmatched row gets its nearest unclaimed staged file named
+            # with the residual: a hole in the card files now refuses the
+            # cascade (tolerance is capped by the shot period), and this line
+            # is the operator's evidence for a manual attribution.
+            if series is not None and off is not None and unmatched:
+                pool = [c for c in cards
+                        if c["series"] == series and c["stem"] not in used
+                        and c["exif"] is not None]
+                for r0 in unmatched[:8]:
+                    best = min(pool,
+                               key=lambda c: abs(c["exif"] - off - r0["epoch"]),
+                               default=None)
+                    if best is not None:
+                        log("  %s cam%d: row %.2f unmatched; nearest staged "
+                            "file %s at %+.2f s - outside tolerance, left in "
+                            "staging" % (rid, cam, r0["epoch"], best["stem"],
+                                         best["exif"] - off - r0["epoch"]))
             summary[cam] = {"series": series, "offset_s": off, "how": how,
                             "matched": len(matches), "unmatched": len(unmatched),
                             "raw": 0, "conflicts": 0, "residual_ms": []}

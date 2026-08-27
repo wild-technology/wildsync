@@ -31,6 +31,7 @@ from rigcore import (NODES, EventLog, NodeMonitor, RunBrowser, RunsError,
                      SettingsManager, TimeSync, free_mb, http_json, http_bytes)
 from run import RunManager
 import drain as draindrv
+import project
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("RIGD_PORT", "9090"))
@@ -914,8 +915,9 @@ class Anomalies:
                 % (paused.get("node"), now - (paused.get("since") or now)),
                 {"since": paused.get("since"), "after_shot": paused.get("after_shot")},
                 "the run is holding so the other camera does not shoot "
-                "unpaired frames; it resumes by itself when the node answers "
-                "its health poll. If it rebooted, see node_rebooted",
+                "unpaired frames; it resumes by itself once the CAMERA is "
+                "connected again and a probe fire delivers a frame - a healthy "
+                "Pi alone is not enough. If it rebooted, see node_rebooted",
                 sev="bad"))
         # jitter from the active run
         if run.get("active"):
@@ -1094,6 +1096,14 @@ class Anomalies:
 class Rig:
     def __init__(self):
         self.events = EventLog()
+        # The project layer decides where runs/ and raw/ live. Applied FIRST:
+        # everything below (monitors are fine, but RunManager, RunBrowser and
+        # _recover_runs read rigcore.RUNS_DIR) must see the active project's
+        # tree, not the legacy default.
+        proj = project.startup()
+        self.events.emit("info", "project", "project '%s' active - runs in %s"
+                         % (proj["name"], proj["runs_dir"]),
+                         slug=proj["slug"])
         self.monitors = [NodeMonitor(n, self.events) for n in NODES]
         self.settings = SettingsManager(self.monitors, self.events)
         self.timesync = TimeSync(self.events)
@@ -1221,7 +1231,19 @@ class Rig:
                              % wrapped.static_label())
         return wrapped
 
-    DRAIN_DEST = os.path.expanduser("~/rig-raw")
+    # Where drained RAWs stage: the active project's raw/ tree. A property,
+    # not a constant - the operator can switch projects between drains. The
+    # setter keeps the pre-project contract that a test (or tool) can pin a
+    # Rig instance's drain destination by plain assignment.
+    @property
+    def DRAIN_DEST(self):
+        ov = getattr(self, "_drain_dest_override", None)
+        return ov if ov else project.raw_dir()
+
+    @DRAIN_DEST.setter
+    def DRAIN_DEST(self, value):
+        self._drain_dest_override = value
+
     DRAIN_FLAG = os.path.expanduser("~/rig/auto_drain")
 
     def auto_drain_default(self):
@@ -1235,6 +1257,123 @@ class Rig:
             st["wedged"] = {n: dict(v) for n, v in self._drain_wedged.items()}
         st["cancel_requested"] = self._drain_stop.is_set()
         return st
+
+    def export_run_zip(self, run_id):
+        """Build (or reuse) <project>/exports/<run_id>.zip and return its path.
+
+        Built on disk rather than streamed: the HTTP handler then serves it
+        with a real Content-Length (resumable, no chunked-encoding games), and
+        the operator gets a durable export artifact they can copy off the rig.
+        ZIP_STORED because the payload is JPEGs - zipping them again burns CPU
+        for ~0%. Reused only while fresher than everything in the run dir, so
+        a recovered/extended run invalidates a stale export."""
+        import zipfile
+        root = rigcore.RunBrowser.run_dir(run_id)
+        exp_dir = project.active().get("exports_dir") or \
+            os.path.join(os.path.dirname(project.runs_dir()), "exports")
+        os.makedirs(exp_dir, exist_ok=True)
+        out = os.path.join(exp_dir, run_id + ".zip")
+        newest = 0.0
+        members = []
+        for base, _dirs, files in os.walk(root):
+            for f in files:
+                p = os.path.join(base, f)
+                try:
+                    newest = max(newest, os.path.getmtime(p))
+                except OSError:
+                    continue
+                members.append(p)
+        if os.path.isfile(out) and os.path.getmtime(out) > newest and members:
+            return out
+        tmp = out + ".tmp"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED,
+                             allowZip64=True) as z:
+            for p in sorted(members):
+                z.write(p, os.path.join(run_id, os.path.relpath(p, root)))
+        os.replace(tmp, out)
+        self.events.emit("info", "export", "run %s exported: %s (%.1f MB)"
+                         % (run_id, out, os.path.getsize(out) / 1e6),
+                         run_id=run_id)
+        return out
+
+    def node_format(self, node_name, quick=True):
+        """Erase a camera's card, proxied to the node with every guard rigd
+        can supply. The UI double-confirms; this refuses regardless whenever
+        the rig is doing anything that touches cards."""
+        m = None
+        for mm in self.monitors:
+            if mm.name_ == node_name:
+                m = mm
+        if m is None:
+            raise BadRequest("unknown node %r" % node_name)
+        if self.runmgr.status().get("active"):
+            raise BadRequest("a run is active - a format now would erase the "
+                             "transect being recorded")
+        if self.drain_status().get("active"):
+            raise BadRequest("a card drain is running - formatting mid-drain "
+                             "would erase RAWs before they are pulled")
+        st = (m.snapshot().get("status") or {})
+        if not st.get("connected"):
+            raise BadRequest("%s is not connected" % node_name)
+        self.events.emit("warn", "format",
+                         "card format requested on %s (remaining was %s)"
+                         % (node_name, st.get("remainingShots")),
+                         node=node_name)
+        rep = rigcore.http_json(m.ilx + "/api/format",
+                                {"confirm": "format",
+                                 "quick": 1 if quick else 0}, timeout=95)
+        ok = bool(isinstance(rep, dict) and rep.get("ok"))
+        self.events.emit("info" if ok else "error", "format",
+                         "%s card format %s%s"
+                         % (node_name, "complete" if ok else "FAILED",
+                            "" if ok else (": %s" % (rep or {}).get("error")
+                                           if isinstance(rep, dict) else ": no answer")),
+                         node=node_name)
+        return {"ok": ok, "node": node_name,
+                "error": None if ok else (rep or {}).get("error")
+                if isinstance(rep, dict) else "no answer from node"}
+
+    def project_change(self, op, body):
+        """create/open/update the project layer, guarded against the two
+        writers. Switching runs_dir under an ACTIVE run would scatter one
+        transect across two trees; under a running drain it would split a
+        card's RAWs between two raw/ dirs - both are refused, not queued."""
+        if op in ("create", "open"):
+            if self.runmgr.status().get("active"):
+                raise BadRequest("a run is active - stop it before switching "
+                                 "projects")
+            if self.drain_status().get("active"):
+                raise BadRequest("a card drain is running - let it finish (or "
+                                 "cancel it) before switching projects")
+        try:
+            if op == "create":
+                doc = project.create(
+                    body.get("name", ""), vessel=body.get("vessel", ""),
+                    site=body.get("site", ""), operator=body.get("operator", ""),
+                    notes=body.get("notes", ""))
+            elif op == "open":
+                doc = project.open_(body.get("slug", ""))
+            else:
+                doc = project.update(body.get("slug", ""),
+                                     body.get("fields") or {})
+        except project.ProjectError as e:
+            raise BadRequest(str(e))
+        except FileNotFoundError:
+            raise BadRequest("no such project")
+        if op in ("create", "open"):
+            self.events.emit("info", "project",
+                             "project '%s' %s - runs now record to %s"
+                             % (doc["name"], "created" if op == "create"
+                                else "opened", doc["runs_dir"]),
+                             slug=doc["slug"])
+            # The new tree may hold a run a previous rigd left interrupted.
+            try:
+                self._recover_runs()
+            except Exception as e:  # noqa: BLE001
+                self.events.emit("warn", "project",
+                                 "run recovery on the opened project failed: "
+                                 "%s" % e)
+        return {"ok": True, "active": project.active()}
 
     def cancel_drain(self):
         """Ask the running drain to stop (contract C4).
@@ -1409,6 +1548,7 @@ class Rig:
                     import ingest
                     self._note_ingest(node, ingest.ingest(
                         os.path.join(self.DRAIN_DEST, node),
+                        runs_dir=rigcore.RUNS_DIR,
                         log=lambda *a: None))
                 except Exception as e:  # noqa: BLE001
                     self.events.emit("warn", "drain",
@@ -1591,6 +1731,8 @@ class Rig:
             # The volume the transects are written to — the one nothing
             # measured. `disk_free_mb` on a node is that Pi's PC-save spool.
             "storage": {"runs_dir": rigcore.RUNS_DIR,
+                        "project": {k: project.active().get(k) for k in
+                                    ("slug", "name", "raw_dir", "legacy")},
                         "jetson_free_mb": free_mb(rigcore.RUNS_DIR),
                         "low_threshold_mb": RUNS_DISK_LOW_MB},
             "anomaly_counts": self.events.recent_counts(),
@@ -1647,6 +1789,8 @@ class Rig:
             # Health fields ilxctl reports and nothing consumed until now.
             # slotWriting == WRITING persistently is a stuck card write, which
             # takes the whole body down while slotStatus still reads OK.
+            "remaining_shots": status.get("remainingShots"),
+            "program": status.get("program"),
             "slot_status": status.get("slotStatus"),
             "slot_writing": status.get("slotWriting"),
             "slot_writing_label": status.get("slotWritingLabel"),
@@ -2005,6 +2149,34 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _sendfile(self, path, ctype, download_name=None):
+        # Streamed in 1 MB slices with a real Content-Length: a run export can
+        # be a gigabyte, and _bytes' read-whole-file would hold it in memory
+        # per request.
+        try:
+            size = os.path.getsize(path)
+            fh = open(path, "rb")
+        except OSError as e:
+            self._json({"ok": False, "error": str(e)}, 404)
+            return
+        with fh:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            if download_name:
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="%s"' % download_name)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     def _read_body(self):
         """The POST body as a dict, or raise BadRequest.
 
@@ -2081,6 +2253,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.diag())
             elif p == "/api/anomalies":
                 self._json({"anomalies": RIG.anomalies.scan()})
+            elif p == "/api/project":
+                self._json({"active": project.active(),
+                            "explicit": project.explicit_active()})
+            elif p == "/api/projects":
+                self._json({"projects": project.list_projects(),
+                            "active": project.active()["slug"],
+                            "explicit": project.explicit_active()})
             elif p == "/api/events":
                 # ?since=abc used to reach int() and come back as a 500 with
                 # "invalid literal for int()" in the body, which reads as a
@@ -2108,6 +2287,14 @@ class Handler(BaseHTTPRequestHandler):
                     (q.get("id") or [""])[0],
                     (q.get("offset") or ["0"])[0],
                     (q.get("limit") or ["200"])[0]))
+            elif p == "/api/run/zip":
+                rid = (q.get("id") or [""])[0]
+                try:
+                    path = RIG.export_run_zip(rid)
+                except RunsError as e:
+                    self._json({"ok": False, "error": str(e)}, 404)
+                else:
+                    self._sendfile(path, "application/zip", rid + ".zip")
             elif p == "/api/run/frame":
                 self._run_frame((q.get("id") or [""])[0],
                                 (q.get("cam") or [""])[0],
@@ -2311,6 +2498,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(RIG.settings.preview(b, node=node))
             elif p == "/api/settings/commit":
                 self._json(RIG.settings.commit())
+            elif p in ("/api/project/create", "/api/project/open",
+                       "/api/project/update"):
+                self._json(RIG.project_change(p.rsplit("/", 1)[1], b))
+            elif p == "/api/node/format":
+                if b.get("confirm") != "format":
+                    raise BadRequest('refusing to format without '
+                                     '{"confirm":"format"}')
+                node = self._node(b.get("node"), '"node"').name_
+                self._json(RIG.node_format(node,
+                                           quick=bool(b.get("quick", 1))))
             elif p in ("/api/settings/discard", "/api/settings/revert"):
                 self._json(RIG.settings.discard())
             elif p == "/api/settings/auto":
@@ -2530,11 +2727,17 @@ class Handler(BaseHTTPRequestHandler):
                 # trying costs an SDK stall, so it is refused rather than sent.
                 status = m.snapshot().get("status") or {}
                 choices = status.get(rigcore.CHOICE_KEY.get(which) or "")
-                if isinstance(choices, list) and choices and value not in choices:
+                # ilxctl emits choices as [{v,l},...]; a raw `value not in
+                # choices` therefore refused EVERY value on real hardware
+                # (int never equals dict) while passing offline, where the
+                # fake node emitted bare ints (audit 2026-08-27). Normalise
+                # through the same helper the convergence engine trusts.
+                legal = rigcore.SettingsManager._choice_values(choices)
+                if legal and value not in legal:
                     raise BadRequest(
                         "%s does not offer %s=%d; it offers %s"
                         % (m.name_, which, value,
-                           ",".join(str(c) for c in choices[:16])))
+                           ",".join(str(c) for c in legal[:16])))
                 if not m.is_connected():
                     self._json({"ok": False, "error": "%s has no connected "
                                 "camera" % m.name_}, 409)

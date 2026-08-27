@@ -443,6 +443,11 @@ class FakeNode:
             nm = name or "ILX%05d.JPG" % self._shot_seq
             data = (make_jpeg(ep + self.clock_skew_s) if exif
                     else _fallback_jpeg(ep))
+            # The pull path validates magic per type (JPEG SOI/EOI, ARW TIFF
+            # header) - a stand-in RAW must therefore look like a TIFF, not a
+            # JPEG wearing a .ARW name.
+            if nm.upper().endswith(".ARW"):
+                data = b"II*\x00" + data
             if size_bytes:
                 data = (data * (size_bytes // len(data) + 1))[:size_bytes]
             self.shots.append({"name": nm, "size": len(data), "bytes": data,
@@ -546,7 +551,15 @@ class FakeNode:
                 "slotStatus": "OK",
                 "focusPosition": 500, "zoomPosition": 0,
                 "interval": {"running": False, "shots": 0},
-                "isoChoices": [100, 200, 400, 800, 1600, 3200, ISO_AUTO],
+                # Real ilxctl emits choices as [{v,l},...]; older builds emitted bare
+                # ints. iso carries the REAL shape so the host's normalisation
+                # is exercised by the suite (a raw `value in choices` gate
+                # passed offline against ints and refused everything on real
+                # hardware, audit 2026-08-27); the others keep the legacy shape
+                # so both decoders stay covered.
+                "isoChoices": [{"v": v, "l": "ISO %d" % v} if v != ISO_AUTO
+                               else {"v": v, "l": "ISO AUTO"}
+                               for v in (100, 200, 400, 800, 1600, 3200, ISO_AUTO)],
                 "apertureChoices": [400, 560, 800, 1100],
                 "shutterChoices": [SHUTTER_1_200, (1 << 16) | 60,
                                    (1 << 16) | 30],
