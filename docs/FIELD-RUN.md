@@ -234,3 +234,32 @@ launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd
 # un-wedge a camera daemon (on the Pi) — see HANDOFF §2.2
 # power-cycle the camera body to clear a stuck transfer/PTP session
 ```
+
+## 2026-08-27 additions — projects, Diag/Alerts/Map tabs
+
+- **Projects.** First load shows the project screen: create one per campaign
+  (name/vessel/site) or open an existing one. Everything a project records —
+  transects, drained RAWs, ZIP exports — lives under
+  `~/wildsync-projects/<name>/`. The pre-project surveys stay untouched in
+  `~/rig-runs`/`~/rig-raw` as the "Legacy" project. Switching is refused while
+  a run or drain is active. The header shows the open project; click it to
+  manage.
+- **Diag tab** is the engine-room page: formatted status log, project +
+  storage + disk, a cameras/cards table (the ≈left column converts each
+  body's remaining shots into GB so mismatched cards are obvious), drain
+  ("Download images") and **Format card** buttons — format asks facts-first
+  and then requires typing the camera's name — and per-run ZIP downloads.
+- **Alerts tab** carries only what needs a human: active anomalies plus the
+  warn/error history, red and bold.
+- **Map tab** plots every frame (cam1 dot, cam2 ring, one color per run) and
+  the boat's trail on an offline UTM canvas — wheel/drag to zoom/pan, Fit,
+  follow-live during a run, hover for the frame, click for its thumbnail.
+  Bench runs on a static fix plot as a single stacked point; that is the fix,
+  not a bug.
+- **Mid-run camera drop** now pauses the grid and SAYS so (Review header +
+  Diag + a red CAPTURE PAUSED line); it resumes only when the camera is back
+  and a probe fire delivers a frame. Run stop lines report per-camera image
+  counts.
+- **Known hardware fact:** cam1's card is ~64 GB class, cam2's ~512 GB class
+  (same settings, ~38 MB/frame both). Swap cam1 to a matching V60 512 GB for
+  long lines.
