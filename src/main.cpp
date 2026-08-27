@@ -634,6 +634,23 @@ int main(int argc, char** argv) {
         guarded(res, [&](std::string& e) { return g_cam.formatMedia(quick, e); });
     });
 
+    // SDK-issued body power off/on - the only remote path out of a body state
+    // that needs a power cycle (stale media table after a format, a wedged
+    // record pipeline). Same confirm discipline as format: "off" on a healthy
+    // body mid-survey stops the survey, so no automatic path may reach it.
+    g_srv.Post("/api/power", [](const httplib::Request& req, httplib::Response& res) {
+        const std::string op = jsonStr(req.body, "op");
+        if (op != "on" && op != "off") {
+            fail(res, "op must be \"on\" or \"off\"");
+            return;
+        }
+        if (jsonStr(req.body, "confirm") != "power") {
+            fail(res, "refusing to change body power without {\"confirm\":\"power\"}");
+            return;
+        }
+        guarded(res, [&](std::string& e) { return g_cam.power(op == "on", e); });
+    });
+
     g_srv.Post("/api/store", [](const httplib::Request& req, httplib::Response& res) {
         // Accept "dest" (what rigd/rigcore and the tools send) with "value" as a
         // fallback for the older UI. Reading the wrong key silently fell back to
