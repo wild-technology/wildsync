@@ -938,6 +938,25 @@ void Camera::OnWarning(CrInt32u warning) {
         case SDK::CrWarning_File_StorageFull:
             log("Storage is full");
             return;
+        // The only completion report a card format ever gets. No property,
+        // no error code, no return value from SendCommand carries it - if
+        // these are not caught, formatMedia cannot know whether the card was
+        // actually erased (and once did not: see formatMedia).
+        case SDK::CrWarning_Format_Complete:
+        case SDK::CrWarning_Format_Failed:
+        case SDK::CrWarning_Format_Invalid:
+        case SDK::CrWarning_Format_Canceled: {
+            const bool ok = (warning == SDK::CrWarning_Format_Complete);
+            log(ok ? "Card format complete"
+                   : "Card format did not complete: " + crErrorString(warning));
+            std::lock_guard<std::mutex> lk(m_fmtMutex);
+            if (m_fmtArmed) {
+                m_fmtOutcome = ok ? 1 : -1;
+                m_fmtWarning = warning;
+                m_fmtCv.notify_all();
+            }
+            return;
+        }
         default:
             log("SDK warning " + crErrorString(warning));
     }
@@ -2071,21 +2090,65 @@ bool Camera::liveViewJpeg(std::vector<unsigned char>& out, std::string& err) {
 
 // Erase the card. Destructive and not undoable, so it is never called from any
 // automatic path - only from an explicit operator request.
+//
+// Three things have to happen for this to be honest, and the original code did
+// none of them (observed live 2026-08-27: two calls, both {"ok":true}, neither
+// card touched):
+//   1. The body gates format behind MediaSLOT1_[Quick]FormatEnableStatus and
+//      silently ignores the command while the gate reads Disable (busy, card
+//      mid-write, menu open). Read the gate first and refuse with the reason.
+//   2. The command is a button: Down THEN Up, 35 ms apart, like Release and
+//      the interval sequence. A lone Down is a press that is never released
+//      and the body does nothing - while SendCommand still returns success.
+//   3. Completion arrives ONLY through OnWarning (CrWarning_Format_Complete /
+//      _Failed / _Invalid / _Canceled). SendCommand returning success means
+//      "dispatched", not "formatted" - so wait for the callback and report
+//      what it said, confirming against RemainingNumber.
 bool Camera::formatMedia(bool quick, std::string& err) {
     if (!isConnected()) {
         err = "not connected";
         return false;
     }
+
+    // 1. The gate. Unreadable is not a refusal (attempt anyway and let the
+    //    completion wait decide); a readable Disable is.
+    const CrInt32u gateCode = quick
+        ? SDK::CrDeviceProperty_MediaSLOT1_QuickFormatEnableStatus
+        : SDK::CrDeviceProperty_MediaSLOT1_FormatEnableStatus;
+    SDK::CrDeviceProperty gate;
+    if (getProp(gateCode, gate) &&
+        static_cast<long long>(gate.GetCurrentValue()) == SDK::CrMediaFormat_Disable) {
+        err = std::string(quick ? "quick format" : "format") +
+              " is not available right now - the body refuses it in this state (" +
+              modeSummary() + "); a card mid-write or an open menu does this";
+        log("Card format refused: " + err);
+        return false;
+    }
+
+    long long before = -1;
+    SDK::CrDeviceProperty rem;
+    if (getProp(SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber, rem))
+        before = static_cast<long long>(rem.GetCurrentValue());
+
+    // Arm the completion handshake before the command goes out - the warning
+    // can arrive faster than this thread gets back around.
+    {
+        std::lock_guard<std::mutex> lk(m_fmtMutex);
+        m_fmtArmed = true;
+        m_fmtOutcome = 0;
+        m_fmtWarning = 0;
+    }
+    struct Disarm {
+        Camera& c;
+        ~Disarm() {
+            std::lock_guard<std::mutex> lk(c.m_fmtMutex);
+            c.m_fmtArmed = false;
+        }
+    } disarm{*this};
+
+    // 2. Down, 35 ms, Up.
     const CrInt32u cmd = quick ? SDK::CrCommandId_MediaQuickFormat
                                : SDK::CrCommandId_MediaFormat;
-    // Down THEN Up, like every other command on this body. Sending only the
-    // Down half dispatches a button-press that is never released, so the body
-    // does nothing at all - and because sendCmd succeeded, /api/format answered
-    // {"ok":true} and the caller believed the card had been erased. Observed
-    // 2026-08-27: two quick-format calls both returned ok, and remainingShots
-    // did not move by a single frame on either body over 32 s. A destructive
-    // operation reporting success without doing anything is the worst possible
-    // direction for this particular lie to point.
     if (!sendCmd(cmd, SDK::CrCommandParam_Down, err)) {
         log("Card format failed: " + err);
         return false;
@@ -2096,6 +2159,54 @@ bool Camera::formatMedia(bool quick, std::string& err) {
         return false;
     }
     log(quick ? "Card quick format started" : "Card format started");
+
+    // 3. Wait for OnWarning's verdict. A quick format is seconds; a full
+    //    format of a large card can run minutes. Poll the progress property
+    //    while waiting so a long format is visibly alive in the log.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(quick ? 60 : 600);
+    int outcome = 0;
+    long long lastLogged = -1;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(m_fmtMutex);
+            m_fmtCv.wait_for(lk, std::chrono::seconds(2),
+                             [&] { return m_fmtOutcome != 0; });
+            outcome = m_fmtOutcome;
+        }
+        if (outcome != 0 || std::chrono::steady_clock::now() >= deadline) break;
+        SDK::CrDeviceProperty prog;
+        if (getProp(SDK::CrDeviceProperty_Media_FormatProgressRate, prog)) {
+            const long long pct = static_cast<long long>(prog.GetCurrentValue());
+            if (pct != lastLogged && pct > 0) {
+                log("Card format " + std::to_string(pct) + "%");
+                lastLogged = pct;
+            }
+        }
+    }
+
+    if (outcome < 0) {
+        CrInt32u w;
+        {
+            std::lock_guard<std::mutex> lk(m_fmtMutex);
+            w = m_fmtWarning;
+        }
+        err = "the body reported the format did not complete: " + crErrorString(w);
+        return false;
+    }
+    if (outcome == 0) {
+        err = "format command was accepted but the body never reported "
+              "completion; treat the card as NOT formatted until "
+              "remainingShots says otherwise";
+        log("Card format failed: " + err);
+        return false;
+    }
+
+    long long after = -1;
+    if (getProp(SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber, rem))
+        after = static_cast<long long>(rem.GetCurrentValue());
+    log("Card format verified: remainingShots " + std::to_string(before) +
+        " -> " + std::to_string(after));
     return true;
 }
 
