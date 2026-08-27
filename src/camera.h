@@ -184,6 +184,13 @@ public:
     // Erase the card. Destructive; only ever reached from an explicit request.
     bool formatMedia(bool quick, std::string& err);
 
+    // SDK-issued body power off / on (CrCommandId_PowerOff / _PowerOn). The
+    // remote path out of a body state that only a power cycle clears - on a
+    // harness-powered screenless body there is no other switch to reach.
+    // PowerOff drops the session (LED goes red); the body keeps its USB
+    // interface alive in standby, so a reconnect + power(on) wakes it.
+    bool power(bool on, std::string& err);
+
     // Set the body's clock from a UNIX epoch. EXIF timestamps are the only
     // common reference two cameras share, so they are worth disciplining to the
     // same master as the hosts.

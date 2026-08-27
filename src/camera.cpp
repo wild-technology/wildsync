@@ -1563,6 +1563,29 @@ bool Camera::ensureIntervalRecOff(std::string& err) {
     return false;
 }
 
+// SDK-issued body power off/on. Same button contract as everything else:
+// Down, 35 ms, Up. PowerOff drops the session moments later (the Disconnected
+// callback, LED red); the standby body keeps enumerating over USB, so the
+// auto-reconnect finds it again and power(on) wakes it.
+bool Camera::power(bool on, std::string& err) {
+    if (!isConnected()) {
+        err = "not connected";
+        return false;
+    }
+    const CrInt32u cmd = on ? SDK::CrCommandId_PowerOn : SDK::CrCommandId_PowerOff;
+    if (!sendCmd(cmd, SDK::CrCommandParam_Down, err)) {
+        log(std::string("Power ") + (on ? "on" : "off") + " failed: " + err);
+        return false;
+    }
+    std::this_thread::sleep_for(35ms);
+    if (!sendCmd(cmd, SDK::CrCommandParam_Up, err)) {
+        log(std::string("Power ") + (on ? "on" : "off") + " failed (release): " + err);
+        return false;
+    }
+    log(on ? "Body power ON requested" : "Body power OFF requested");
+    return true;
+}
+
 bool Camera::shutter(bool useAf, std::string& err) {
     if (!isConnected()) {
         err = "not connected";
