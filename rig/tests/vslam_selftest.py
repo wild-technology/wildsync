@@ -17,6 +17,12 @@ What it checks:
   * VslamRunner end to end against a temp run dir that GROWS while it runs:
     ordering, the half-written-file settle, duplicate names, an out-of-order
     straggler, a corrupt file, and a JSON-safe capped snapshot
+  * STEREO: two virtual cameras with a known 0.5 m baseline over the same
+    scene — the self-estimated extrinsics must recover the baseline
+    direction, the PnP chain must come out METRIC within 10%, the GPS
+    cross-check ratio must sit near 1.0, a single-plane (mono-degenerate)
+    scene must still track, and missing cam2 halves must fall back cleanly
+  * auto mode: a cam1+cam2 dir decides stereo, a cam1-only dir decides mono
   * the JSON/PLY writers
 
 If cv2 or numpy is absent the image-pipeline sections print SKIPPED and the
@@ -179,6 +185,46 @@ def _mk_engine():
     return vslam.VslamEngine(
         intrinsics=vslam.Intrinsics(width=640, height=480, focal_px=500.0),
         backend=vslam.make_backend("cpu", proc_scale=1.0, preprocess="none"))
+
+
+def _engine_kw():
+    return dict(intrinsics=vslam.Intrinsics(width=640, height=480,
+                                            focal_px=500.0),
+                backend=vslam.make_backend("cpu", proc_scale=1.0,
+                                           preprocess="none"))
+
+
+def _mk_stereo(calib_pairs=3, baseline_m=0.5):
+    return vslam.StereoVslamEngine(baseline_m=baseline_m,
+                                   calib_pairs=calib_pairs, **_engine_kw())
+
+
+# stereo geometry (all derived from fx=500 and the far plane at Z=25 m):
+#   1 px of far-plane shift = Z/fx = 0.05 m of camera motion
+#   step_px=12  -> the camera advances 0.60 m per frame
+#   base_px=10  -> cam2 sits 0.50 m to the right of cam1 (disparity fx*b/Z)
+#   the near plane at Z/2 moves/disparates at exactly twice the far rate
+STEP_M = 0.6
+BASE_M = 0.5
+
+
+def _stereo_frames(n=12, step_px=12, base_px=10, w=640, h=480, layers=True):
+    import cv2
+    bg, fg, fgm = _layers()
+    f1s, f2s = [], []
+    for i in range(n):
+        for lst, off in ((f1s, 0), (f2s, base_px)):
+            x0 = 40 + i * step_px + off
+            fx0 = 40 + i * 2 * step_px + 2 * off
+            crop = bg[200:200 + h, x0:x0 + w].copy()
+            if layers:
+                m = fgm[200:200 + h, fx0:fx0 + w] > 0
+                crop[m] = fg[200:200 + h, fx0:fx0 + w][m]
+            ok, buf = cv2.imencode(".jpg", crop,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 95])
+            assert ok
+            lst.append(bytes(buf))
+    return f1s, f2s
 
 
 def test_tracking():
@@ -368,6 +414,171 @@ def test_reinit(frames):
 
 
 # ---------------------------------------------------------------------------
+# stereo
+
+def _feed_stereo(eng, f1s, f2s, drop=(), gps_step=STEP_M):
+    ups = []
+    for i, f1 in enumerate(f1s):
+        f2 = None if i in drop else f2s[i]
+        meta = {"xutm": "%.3f" % (500000.0 + i * gps_step),
+                "yutm": "4588707.83"}
+        u = eng.feed_pair(f1, f2, meta=meta, t=float(i),
+                          name="st_%02d.jpg" % i)
+        if u is not None:
+            ups.append(u)
+    return ups
+
+
+def _path_len(ups):
+    pos = [(u.x, u.y, u.z) for u in ups]
+    return sum(math.dist(a, b) for a, b in zip(pos, pos[1:]))
+
+
+def test_stereo_metric(f1s, f2s):
+    sect("stereo: metric scale from the baseline (no GPS in the chain)")
+    eng = _mk_stereo()
+    ups = _feed_stereo(eng, f1s, f2s)
+    R12, t12 = eng._ext
+    check("extrinsics t direction ~ (-baseline, 0, 0)",
+          abs(t12[0] + BASE_M) < 0.05 and abs(t12[1]) < 0.05
+          and abs(t12[2]) < 0.05, "t12=(%.3f %.3f %.3f)" % tuple(t12))
+    check("extrinsics scatter small",
+          eng.stats["calib_scatter_deg"] is not None
+          and eng.stats["calib_scatter_deg"] < 5.0,
+          "%s deg" % eng.stats["calib_scatter_deg"])
+    n_expect = len(f1s) - eng.calib_pairs + 1     # calib eats the first pairs
+    check("keyframes after calibration", len(ups) >= n_expect - 1,
+          "%d updates (expect ~%d)" % (len(ups), n_expect))
+    exp = STEP_M * (len(ups) - 1)
+    got = _path_len(ups)
+    check("METRIC path length within 10%",
+          0.9 * exp < got < 1.1 * exp, "vo %.2f m vs true %.2f m" % (got, exp))
+    check("scale source is stereo", eng.scale_source == "stereo"
+          and all(u.scale_source == "stereo" for u in ups))
+    check("UNCALIBRATED baseline flagged loudly",
+          "UNCALIBRATED" in eng.calib_status and
+          "UNCALIBRATED" in eng.status, eng.calib_status)
+    check("gps demoted to cross-check, ratio ~1",
+          eng.stats["gps_ratio"] is not None
+          and 0.9 < eng.stats["gps_ratio"] < 1.1,
+          "ratio=%s" % eng.stats["gps_ratio"])
+    check("stereo cloud populated", eng.stats["stereo_points"] > 50,
+          "%d points" % eng.stats["stereo_points"])
+
+
+def test_stereo_planar():
+    sect("stereo: planar scene (the case where mono E is degenerate)")
+    # single fronto-parallel plane, uniform shift — the exact configuration
+    # that deterministically broke the mono essential-matrix chain before
+    # MAGSAC, and remains its knife edge. PnP against a metric cloud must
+    # not care at all.
+    f1s, f2s = _stereo_frames(n=10, layers=False)
+    eng = _mk_stereo()
+    ups = _feed_stereo(eng, f1s, f2s)
+    n_expect = len(f1s) - eng.calib_pairs + 1
+    check("planar scene tracks >80%", len(ups) >= 0.8 * n_expect,
+          "%d updates of ~%d (lost=%d)" % (len(ups), n_expect,
+                                           eng.stats["lost"]))
+    pos = [(u.x, u.y, u.z) for u in ups]
+    steps = [tuple(b[k] - a[k] for k in range(3))
+             for a, b in zip(pos, pos[1:])]
+    mean = [sum(s[k] for s in steps) / len(steps) for k in range(3)]
+    mlen = math.sqrt(sum(v * v for v in mean)) or 1.0
+    dots = [sum(s[k] * mean[k] for k in range(3)) /
+            ((math.sqrt(sum(v * v for v in s)) or 1e-12) * mlen)
+            for s in steps]
+    check("planar trajectory direction-consistent", min(dots) > 0.9,
+          "min cos %.3f" % min(dots))
+    exp = STEP_M * (len(ups) - 1)
+    got = _path_len(ups)
+    check("planar metric length within 15%",
+          0.85 * exp < got < 1.15 * exp,
+          "vo %.2f m vs true %.2f m" % (got, exp))
+
+
+def test_stereo_unpaired(f1s, f2s):
+    sect("stereo: missing cam2 halves fall back to PnP-vs-last-cloud")
+    eng = _mk_stereo()
+    ups = _feed_stereo(eng, f1s, f2s, drop=(6, 7))
+    check("unpaired frames counted", eng.stats["unpaired"] == 2,
+          str(eng.stats["unpaired"]))
+    check("chain continues through the gap",
+          len(ups) >= len(f1s) - eng.calib_pairs,
+          "%d updates" % len(ups))
+    exp = STEP_M * (len(ups) - 1)
+    got = _path_len(ups)
+    check("metric length still within 10%",
+          0.9 * exp < got < 1.1 * exp, "vo %.2f m vs true %.2f m" % (got, exp))
+    # corrupt cam2 half: demoted to unpaired, cam1 chain unharmed
+    eng.feed_pair(f1s[-1], b"\xff\xd8garbage", t=99.0, name="c2bad.jpg")
+    check("corrupt cam2 half dropped, not fatal",
+          eng.stats["cam2_dropped"] == 1 and eng.stats["corrupt"] == 0,
+          "cam2_dropped=%d" % eng.stats["cam2_dropped"])
+
+
+def test_runner_auto(f1s, f2s, mono_frames):
+    sect("VslamRunner auto mode")
+    # (a) cam1+cam2 with matching instants -> stereo
+    tmp = tempfile.mkdtemp(prefix="vslam_auto_")
+    try:
+        names1 = ["Cam1_20260827_0400%02d.00.jpg" % i for i in range(8)]
+        names2 = ["Cam2_20260827_0400%02d.00.jpg" % i for i in range(8)]
+        os.makedirs(os.path.join(tmp, "cam1"))
+        os.makedirs(os.path.join(tmp, "cam2"))
+        with open(os.path.join(tmp, "cam1", "flight_log.csv"), "w") as fh:
+            fh.write("filename,datetime,lat,long,xutm,yutm,utm_zone\n")
+            for i, n in enumerate(names1):
+                fh.write("%s,,41.42,-71.45,%.3f,4588707.83,19T\n"
+                         % (n, 294900.0 + i * STEP_M))
+        for i in range(8):
+            with open(os.path.join(tmp, "cam1", names1[i]), "wb") as fh:
+                fh.write(f1s[i])
+            with open(os.path.join(tmp, "cam2", names2[i]), "wb") as fh:
+                fh.write(f2s[i])
+        r = vslam.VslamRunner(mode="auto", baseline_m=BASE_M, calib_pairs=3,
+                              engine_kw=_engine_kw())
+        r.run_once(tmp)
+        snap = r.snapshot()
+        check("auto chose stereo", snap["mode"] == "stereo",
+              str(snap["stats"].get("mode_reason")))
+        check("pairing rate 100%", snap["pairing_rate"] == 1.0,
+              str(snap["pairing_rate"]))
+        check("stereo keyframes from run dir",
+              snap["stats"]["keyframes"] >= 4,
+              "keyframes=%d" % snap["stats"]["keyframes"])
+        check("snapshot carries baseline + calib flags",
+              snap["baseline_m"] == BASE_M
+              and snap["baseline_calibrated"] is False
+              and "UNCALIBRATED" in snap["calib"], snap["calib"])
+        check("gps cross-check in snapshot",
+              snap["stats"]["gps_ratio"] is not None
+              and 0.85 < snap["stats"]["gps_ratio"] < 1.15,
+              "ratio=%s" % snap["stats"]["gps_ratio"])
+        check("auto-stereo snapshot JSON-safe",
+              len(json.dumps(snap)) < 2_000_000)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # (b) cam1 only -> mono
+    tmp = tempfile.mkdtemp(prefix="vslam_auto_m_")
+    try:
+        os.makedirs(os.path.join(tmp, "cam1"))
+        for i in range(6):
+            with open(os.path.join(tmp, "cam1",
+                                   "Cam1_20260827_0500%02d.00.jpg" % i),
+                      "wb") as fh:
+                fh.write(mono_frames[i])
+        r = vslam.VslamRunner(mode="auto", engine_kw=_engine_kw())
+        r.run_once(tmp)
+        snap = r.snapshot()
+        check("auto chose mono (no cam2 dir)", snap["mode"] == "mono",
+              str(snap["stats"].get("mode_reason")))
+        check("mono tracked", snap["stats"]["keyframes"] >= 4,
+              "keyframes=%d" % snap["stats"]["keyframes"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     print("vslam selftest — %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -379,6 +590,11 @@ def main():
         test_corrupt(frames)
         test_reinit(frames)
         test_runner(frames)
+        f1s, f2s = _stereo_frames()
+        test_stereo_metric(f1s, f2s)
+        test_stereo_planar()
+        test_stereo_unpaired(f1s, f2s)
+        test_runner_auto(f1s, f2s, frames)
     else:
         print("\n== synthetic tracking .. runner: SKIPPED (cv2/numpy not "
               "installed on this host)")

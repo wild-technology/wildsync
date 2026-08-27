@@ -1115,3 +1115,57 @@ single-IMU protocol. See `docs/olive-imu.md` for bring-up and the fusion
 - A node service restart can leave a body in **Movie M** (still properties
   withdrawn, RemainingNumber=0, stills refused, formats still fine). The
   fleet vector now pins `program=1` and self-heals it within one reconcile.
+
+## Additions 2026-08-27 (later) — Olive IMU live, rig calibration
+
+### Olive olixVision X1 — how it actually connects (bring-up findings)
+
+The unit's USB-C is a CDC-Ethernet gadget: on cam2's Pi it is netplan-pinned
+as iface `olive0` (Pi 192.168.7.2/24, unit 192.168.7.100 — its own subnet, no
+collision with the rig's 192.168.1.0/24). Services on the unit: 80 (olixOS
+web UI, Blazor SPA — its /api/* paths are a router fallback, NOT a REST API),
+22 (ssh), 8888 (JupyterLab), 4200, and WebSocket streams on 5400/5500/5530/
+7070. **Port 5500 is the sensor stream**: protobuf-framed binary WS messages
+(~15 Hz) carrying quaternion, accel m/s², gyro rad/s, mag mG, and identity
+strings (AHRS, x1-pro). The advertised ROS 2/DDS path (RTPS on 239.255.0.1:
+7400) needs a DDS stack the Pi image cannot build - not used.
+
+`rig/olive_ws_bridge.py` (systemd `olive-bridge.service`, deployed on every
+node, idles harmlessly where no Olive exists) parses that stream schema-less
+and re-emits rig-unit JSON to udp://127.0.0.1:9901; piagent's imu2 slot
+(`PIAGENT_IMU2=olive:udp:9901` in /etc/default/piagent, installed by deploy)
+ingests it. The unit's own clock is ~2 years wrong - samples carry arrival
+epochs only.
+
+### Rig calibration (host, rig/rigcal.py, UI Calib tab)
+
+The pair shoots through corrected underwater optics: focal length is UNKNOWN
+until measured, so intrinsics come entirely from a checkerboard - no priors.
+
+- `POST /api/rigcal/stereo/start {cols,rows,square_mm,baseline_mm?}` -
+  inner-corner counts (non-square pattern enforced), measured square size,
+  optional tape baseline for cross-check.
+- `POST /api/rigcal/stereo/capture` - fires a genuine synchronized pair
+  (capture_once), reads both frames from the node spools, detects corners.
+  Detections are gated: full grid, not touching the frame edge, cell pitch
+  >= 18 px (smaller boards demonstrably yield phantom half-cell lattices),
+  180° corner-order canonicalized by row-direction dominance.
+- `GET /api/rigcal` / `POST .../discard {index}` - live session state: 3x3
+  coverage grids per camera, near/far/tilt diversity counts, and dynamic
+  guidance text ("move the board to the top-right of cam2's view", "tilt
+  ~30°...") until the set is sufficient.
+- `POST /api/rigcal/stereo/compute` - per-camera calibrateCamera (no guess)
+  + stereoCalibrate (FIX_INTRINSIC); reports fx/fy per cam, RMS, baseline,
+  agreement vs tape. Synthetic validation: baseline to 0.2%, focal to ~2%
+  with no prior, sub-pixel RMS (rig/tests/rigcal_selftest.py, 16 checks).
+- `POST /api/rigcal/stereo/save` - writes ~/rig/stereo_calibration.json;
+  vslam.load_stereo_calibration() freezes it into the stereo engine
+  (baseline_calibrated=true) from the next run.
+- `POST /api/rigcal/imu {target: cam1|cam2|both, seconds}` - still-window
+  sampling (refused if the rig moved: gyro/accel variance gates) recording
+  gyro bias, accel norm and the mounting attitude reference per camera IMU
+  (cam1 YB, cam2 Olive); "both" samples simultaneously and records the
+  cam1<->cam2 relative-orientation seed for the fusion filter. Saved to
+  ~/rig/imu_calibration.json. First live calibration recorded 2026-08-27
+  (cam1 gyro bias [-1.06,-1.27,0] dps; the Olive AHRS stream reports
+  zeroed gyro at rest - on-device bias correction, noted for fusion).

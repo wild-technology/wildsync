@@ -1728,6 +1728,13 @@ class Imu2(Imu):
     PROBE_BAND = (0.5, 20.0)
     FRAME_FLOOR_HZ = 10.0
 
+    # Measured on the real unit 2026-08-27: the olive-bridge relay of the
+    # port-5500 WebSocket stream delivers ~15 Hz. Floor below that so a
+    # healthy stream never rings imu_rate_low while a stalled one still does;
+    # revisit if the unit's Sensor Settings ever raises the stream rate.
+    def _attitude_floor_hz(self):
+        return 10.0
+
     def __init__(self, spec=None):
         raw = (IMU2_SPEC if spec is None else spec).strip()
         low = raw.lower()

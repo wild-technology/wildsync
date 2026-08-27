@@ -32,6 +32,7 @@ from rigcore import (NODES, EventLog, NodeMonitor, RunBrowser, RunsError,
 from run import RunManager
 import drain as draindrv
 import project
+import rigcal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("RIGD_PORT", "9090"))
@@ -2256,6 +2257,9 @@ class Handler(BaseHTTPRequestHandler):
             elif p == "/api/project":
                 self._json({"active": project.active(),
                             "explicit": project.explicit_active()})
+            elif p == "/api/rigcal":
+                self._json({"saved": rigcal.saved_summary(),
+                            "stereo": rigcal.stereo()})
             elif p == "/api/projects":
                 self._json({"projects": project.list_projects(),
                             "active": project.active()["slug"],
@@ -2501,6 +2505,51 @@ class Handler(BaseHTTPRequestHandler):
             elif p in ("/api/project/create", "/api/project/open",
                        "/api/project/update"):
                 self._json(RIG.project_change(p.rsplit("/", 1)[1], b))
+            elif p.startswith("/api/rigcal/"):
+                # Calibration verbs. Refusals (bad inputs, rig busy, board
+                # not found, the rig moved) are operator information, not
+                # server faults: they come back 200 {ok:false,error} so the
+                # tab can show them inline.
+                try:
+                    if p == "/api/rigcal/stereo/start":
+                        self._json({"ok": True, **rigcal.stereo_start(
+                            b.get("cols", 9), b.get("rows", 6),
+                            b.get("square_mm", 30),
+                            b.get("baseline_mm") or None,
+                            b.get("notes", ""))})
+                    elif p == "/api/rigcal/stereo/capture":
+                        pair = rigcal.stereo_session().capture(RIG)
+                        self._json({"ok": True, "pair": pair,
+                                    **rigcal.stereo()})
+                    elif p == "/api/rigcal/stereo/discard":
+                        rigcal.stereo_session().discard(int(b.get("index", -1)))
+                        self._json({"ok": True, **rigcal.stereo()})
+                    elif p == "/api/rigcal/stereo/compute":
+                        res = rigcal.stereo_session().compute()
+                        self._json({"ok": True, "result": res})
+                    elif p == "/api/rigcal/stereo/save":
+                        rep = rigcal.stereo_session().save()
+                        RIG.events.emit(
+                            "info", "rigcal",
+                            "stereo calibration saved: baseline %.1f mm, "
+                            "RMS %.2f px, %d pairs"
+                            % (rep["baseline_m"] * 1000,
+                               rigcal.stereo_session().result["rms_stereo_px"],
+                               rigcal.stereo_session().result["pairs_used"]))
+                        self._json({"ok": True, **rep})
+                    elif p == "/api/rigcal/imu":
+                        rep = rigcal.calibrate_imu(
+                            b.get("target", "both"),
+                            float(b.get("seconds", 10)))
+                        RIG.events.emit(
+                            "info", "rigcal",
+                            "IMU calibration saved for %s"
+                            % b.get("target", "both"))
+                        self._json(rep)
+                    else:
+                        raise BadRequest("unknown rigcal verb")
+                except (RuntimeError, ValueError) as e:
+                    self._json({"ok": False, "error": str(e)})
             elif p == "/api/node/format":
                 if b.get("confirm") != "format":
                     raise BadRequest('refusing to format without '
