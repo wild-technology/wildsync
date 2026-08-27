@@ -183,12 +183,13 @@ FACTORY = {
     "store_dest": 2,                      # card only — PC save off after boot
     "focus_mode": 2,                      # AF-S
     "expcomp": 0,
+    "program": 2,                         # P auto - the rig converges it to M
 }
 
 SURVEY = {                                # a body already set up for the transect
     "aperture": 800, "shutter": SHUTTER_1_200, "iso": 400, "drive": 1,
     "filetype": 1, "imagesize": 1, "transsize": 1, "store_dest": 3,
-    "focus_mode": 1, "expcomp": 0,
+    "focus_mode": 1, "expcomp": 0, "program": 1,
     # A fresh body boots in AWB (0); the rig converges it to fixed color
     # temperature (mode 256) per DEFAULT_DESIRED.
     "wb_mode": 0, "colortemp": 5500,
@@ -201,6 +202,7 @@ WHICH_TO_KEY = {
     "quality": "quality", "transsize": "transsize", "pcsave": "pcsave",
     "rawtype": "rawtype", "expcomp": "expcomp",
     "wb_mode": "wb_mode", "colortemp": "colortemp",
+    "program": "program",
 }
 
 
@@ -519,7 +521,11 @@ class FakeNode:
                 "aperture": _aperture_label(s["aperture"]),
                 "fnum": _aperture_label(s["aperture"]),
                 "drive": _drive_label(s["drive"]),
-                "program": "M",
+                # .get: like wb_mode below, older injected settings dicts
+                # predate the key; a real body always reports it.
+                "program": "Movie M" if s.get("program", 1) >= 0x8050
+                           else ("M" if s.get("program", 1) == 1 else "P"),
+                "programValue": s.get("program", 1),
                 # ... and raw Sony encodings alongside
                 "isoValue": s["iso"],
                 "shutterValue": s["shutter"],
