@@ -1270,6 +1270,46 @@ bool Camera::getProp(CrInt32u code, SDK::CrDeviceProperty& out) {
     return ok;
 }
 
+// Raw dump of the body's ENTIRE property table - every property the body is
+// currently offering, with code, value, and enable flag. Diagnostic only: when
+// two supposedly identical bodies behave differently, diffing their tables is
+// the systematic way to find out what the misbehaving one has withdrawn or
+// changed, instead of guessing one curated status field at a time.
+bool Camera::dumpProps(std::string& json, std::string& err) {
+    SdkHold hold(*this, "dumpProps", kSdkWait);
+    if (!hold) {
+        err = hold.error();
+        return false;
+    }
+    if (!m_handle) {
+        err = "not connected";
+        return false;
+    }
+    SDK::CrDeviceProperty* list = nullptr;
+    CrInt32 n = 0;
+    const SDK::CrError e = SDK::GetDeviceProperties(m_handle, &list, &n);
+    if (e != SDK::CrError_None || !list) {
+        err = "GetDeviceProperties: " + crErrorString(e);
+        return false;
+    }
+    std::ostringstream os;
+    os << "[";
+    for (CrInt32 i = 0; i < n; ++i) {
+        if (i) os << ",";
+        os << "{\"code\":\"0x" << std::hex << std::setw(4) << std::setfill('0')
+           << list[i].GetCode() << std::dec << "\""
+           << ",\"value\":" << static_cast<long long>(list[i].GetCurrentValue())
+           << ",\"enable\":" << static_cast<int>(list[i].GetPropertyEnableFlag())
+           << ",\"type\":" << static_cast<int>(list[i].GetValueType())
+           << ",\"nvalues\":" << (list[i].GetValueSize() ? list[i].GetValueSize() : 0)
+           << "}";
+    }
+    os << "]";
+    SDK::ReleaseDeviceProperties(m_handle, list);
+    json = os.str();
+    return true;
+}
+
 // Range triple of a property, extracted while the SDK still owns the value
 // buffer - the one thing getProp's returned copy cannot provide.
 bool Camera::getPropRange(CrInt32u code, PropRange& out) {

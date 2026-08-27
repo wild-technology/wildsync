@@ -634,6 +634,19 @@ int main(int argc, char** argv) {
         guarded(res, [&](std::string& e) { return g_cam.formatMedia(quick, e); });
     });
 
+    // Diagnostic: the body's raw property table. When two identical bodies
+    // disagree, diff this instead of guessing status fields one at a time.
+    g_srv.Get("/api/props", [](const httplib::Request&, httplib::Response& res) {
+        std::string json, err;
+        if (g_cam.dumpProps(json, err)) {
+            res.set_content("{\"ok\":true,\"props\":" + json + "}", "application/json");
+        } else if (Camera::isBusyError(err)) {
+            sdkBusy(res, err);
+        } else {
+            fail(res, err);
+        }
+    });
+
     // SDK-issued body power off/on - the only remote path out of a body state
     // that needs a power cycle (stale media table after a format, a wedged
     // record pipeline). Same confirm discipline as format: "off" on a healthy

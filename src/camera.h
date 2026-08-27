@@ -184,6 +184,9 @@ public:
     // Erase the card. Destructive; only ever reached from an explicit request.
     bool formatMedia(bool quick, std::string& err);
 
+    // Raw dump of the body's entire property table (diagnostic - /api/props).
+    bool dumpProps(std::string& json, std::string& err);
+
     // SDK-issued body power off / on (CrCommandId_PowerOff / _PowerOn). The
     // remote path out of a body state that only a power cycle clears - on a
     // harness-powered screenless body there is no other switch to reach.
