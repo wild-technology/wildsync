@@ -2265,9 +2265,18 @@ bool Camera::formatMedia(bool quick, std::string& err) {
         return false;
     }
 
+    // The body recomputes RemainingNumber a beat after Format_Complete; an
+    // immediate read catches a transient 0 (seen live: "10872 -> 0" logged on
+    // a format that actually left 10873). This line is the operator's
+    // evidence that the card was erased - wait for the recount.
     long long after = -1;
-    if (getProp(SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber, rem))
-        after = static_cast<long long>(rem.GetCurrentValue());
+    for (int i = 0; i < 10; ++i) {
+        if (getProp(SDK::CrDeviceProperty_MediaSLOT1_RemainingNumber, rem)) {
+            after = static_cast<long long>(rem.GetCurrentValue());
+            if (after > 0) break;
+        }
+        std::this_thread::sleep_for(500ms);
+    }
     log("Card format verified: remainingShots " + std::to_string(before) +
         " -> " + std::to_string(after));
     return true;
