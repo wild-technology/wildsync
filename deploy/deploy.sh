@@ -96,9 +96,10 @@ deploy_node() {
   # script is not `set -e` the build would silently proceed against stale sources.
   ssh ubuntu@"$ip" 'mkdir -p ~/wildsync/src ~/wildsync/rig'
   scp -q "$REPO"/src/*.cpp "$REPO"/src/*.h ubuntu@"$ip":/home/ubuntu/wildsync/src/
-  scp -q "$REPO"/rig/{piagent.py,imu_yb.py} ubuntu@"$ip":/home/ubuntu/wildsync/rig/
+  scp -q "$REPO"/rig/{piagent.py,imu_yb.py,imu_olive.py,olive_ws_bridge.py} ubuntu@"$ip":/home/ubuntu/wildsync/rig/
   scp -q "$REPO"/docs/PROTOCOL.md ubuntu@"$ip":/home/ubuntu/wildsync/rig/
   scp -q "$REPO"/deploy/piagent.service ubuntu@"$ip":/tmp/piagent.service
+  scp -q "$REPO"/deploy/olive-bridge.service ubuntu@"$ip":/tmp/olive-bridge.service
   ssh ubuntu@"$ip" 'bash -s' <<'REMOTE'
 set -uo pipefail
 cd ~/wildsync
@@ -111,7 +112,13 @@ echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | \
   sudo tee /etc/udev/rules.d/99-gpio.rules >/dev/null
 sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=gpio || true
 sudo cp /tmp/piagent.service /etc/systemd/system/piagent.service
+sudo cp /tmp/olive-bridge.service /etc/systemd/system/olive-bridge.service
+# Uniform fleet config: the imu2 slot listens on localhost UDP everywhere;
+# on a node with no Olive the bridge idles and the slot reports absent.
+echo 'PIAGENT_IMU2=olive:udp:9901' | sudo tee /etc/default/piagent >/dev/null
 sudo systemctl daemon-reload
+sudo systemctl enable olive-bridge >/dev/null 2>&1
+sudo systemctl restart olive-bridge
 sudo systemctl enable piagent
 sudo systemctl restart piagent   # enable --now is a no-op on a running unit: the new file was never loaded
 sudo systemctl restart ilxctl 2>/dev/null || \

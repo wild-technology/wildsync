@@ -203,6 +203,15 @@
             border-radius:10px;padding:8px;display:none;z-index:7;width:300px}
   #mapThumb img{width:100%;border-radius:6px;display:block}
   #mapThumb .cap{font:11px var(--mono);color:var(--muted);margin-top:5px;word-break:break-all}
+
+  .covgrid{display:grid;grid-template-columns:repeat(3,26px);grid-template-rows:repeat(3,20px);
+           gap:2px;margin-top:4px}
+  .covgrid div{background:var(--panel2);border-radius:3px;font:10px var(--mono);
+               display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .covgrid div.hit{background:#1d4630;color:var(--ok)}
+  .clguide{border:1px solid var(--warn);border-radius:8px;padding:8px 11px;color:var(--warn);
+           font-size:13px;line-height:1.5}
+  .clguide.ready{border-color:var(--ok);color:var(--ok)}
 </style>
 </head>
 <body>
@@ -231,6 +240,7 @@
   <button data-t="controls">Controls</button>
   <button data-t="nav">Nav</button>
   <button data-t="imu">IMU</button>
+  <button data-t="calib">Calib</button>
   <button data-t="diag">Diag</button>
   <button data-t="alerts">Alerts</button>
   <button data-t="events">Events</button>
@@ -532,6 +542,58 @@
       <div id="alHist"><span class="muted small">none</span></div>
     </div>
   </section>
+
+  <!-- CALIB — checkerboard stereo geometry + per-camera IMU references.
+       Shooting through corrected underwater optics means the focal length is
+       genuinely unknown until measured; the guidance engine tells the
+       operator exactly what data is still missing. -->
+  <section class="tab" id="tab-calib">
+    <div class="grid" style="grid-template-columns:minmax(380px,1.5fr) minmax(300px,1fr)">
+      <div class="card">
+        <h2>Stereo calibration — checkerboard</h2>
+        <div id="clSaved" class="small muted" style="margin-bottom:8px"></div>
+        <div class="row">
+          <label>Inner corners<input id="clCols" type="number" value="9" style="width:56px"> ×
+            <input id="clRows" type="number" value="6" style="width:56px"></label>
+          <label>Square mm<input id="clSquare" type="number" value="30" step="0.1" style="width:76px"></label>
+          <label>Baseline mm (tape)<input id="clBaseline" type="number" step="0.1" style="width:86px" placeholder="optional"></label>
+          <button class="act go" id="clStart">Start session</button>
+        </div>
+        <div id="clSession" style="margin-top:12px;display:none">
+          <div class="row">
+            <button class="act go" id="clCapture" style="font-size:15px;padding:10px 18px">📷 Capture pair</button>
+            <button class="act" id="clCompute">Compute</button>
+            <button class="act" id="clSave" disabled>Save calibration</button>
+            <span id="clCount" class="mono small"></span>
+          </div>
+          <div id="clGuide" style="margin-top:10px"></div>
+          <div class="row" style="margin-top:10px;gap:26px">
+            <div><div class="small muted">cam1 coverage</div><div id="clCov1" class="covgrid"></div></div>
+            <div><div class="small muted">cam2 coverage</div><div id="clCov2" class="covgrid"></div></div>
+            <div id="clDiversity" class="small"></div>
+          </div>
+          <div id="clPairs" class="small" style="margin-top:10px"></div>
+          <div id="clResult" style="margin-top:10px"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>IMU calibration</h2>
+        <div class="small muted" style="margin-bottom:8px">Each camera carries its own IMU
+          (cam1: YB · cam2: Olive). Set the rig STILL and LEVEL on a solid surface —
+          this records gyro bias and the mounting attitude reference every later
+          reading is judged against. Calibrating BOTH also records the cam1↔cam2
+          relative orientation the fusion filter needs.</div>
+        <div id="imuSaved" class="small muted" style="margin-bottom:8px"></div>
+        <div class="row">
+          <button class="act" id="imuCal1">Calibrate cam1</button>
+          <button class="act" id="imuCal2">Calibrate cam2</button>
+          <button class="act go" id="imuCalBoth">Calibrate both</button>
+        </div>
+        <div id="imuCalState" class="small" style="margin-top:10px"></div>
+        <div id="imuCalResult" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </section>
 </main>
 <!-- PROJECT PICKER / INTRO -->
 <div class="overlay" id="projOverlay">
@@ -600,6 +662,7 @@ function showTab(t){
   if(t==='review'){ renderPair(); pollPairs(true); pollDrain(true); }
   if(t==='transects') pollTransects(true);
   if(t==='diag'){ pollDiag(); pollDiagLog(); }
+  if(t==='calib') pollCalib();
   if(t==='alerts') pollAlerts();
   if(t==='map') mapShow();
 }
@@ -3196,6 +3259,111 @@ async function pollMapLive(){
       if(MAP.runs[run.run_id].on) mapLoadRun(run.run_id); }
   }
 }
+
+
+// ============================ CALIBRATION ==================================
+let CL_BUSY=false;
+async function pollCalib(){
+  const r=await api('/api/rigcal');
+  if(!r) return;
+  renderCalSaved(r.saved);
+  if(r.stereo&&r.stereo.active) renderCalSession(r.stereo);
+}
+function renderCalSaved(sv){
+  const st=sv&&sv.stereo, im=sv&&sv.imu;
+  $('#clSaved').innerHTML = st
+    ? `saved: baseline <b>${(st.baseline_m*1000).toFixed(1)} mm</b> · RMS ${st.rms_stereo_px} px · ${st.pairs_used} pairs · ${escapeHtml(st.date||'')}`+
+      (st.agreement_pct?` · tape agreement ${st.agreement_pct}%`:'')
+    : 'no stereo calibration saved yet — stereo VSLAM runs on a placeholder baseline until this is done';
+  $('#imuSaved').innerHTML = im
+    ? `saved: ${im.cams.join(' + ')} · ${escapeHtml(im.date||'')}${im.relative?' · relative orientation recorded':''}`
+    : 'no IMU calibration saved yet';
+}
+function covGrid(el, g){
+  let h='';
+  for(let r=0;r<3;r++)for(let c=0;c<3;c++){
+    const n=g?(g[r]||[])[c]||0:0;
+    h+=`<div class="${n?'hit':''}">${n||''}</div>`;
+  }
+  el.innerHTML=h;
+}
+function renderCalSession(st){
+  $('#clSession').style.display='block';
+  $('#clCount').textContent=`${st.pairs_good}/${st.targets.pairs} good pairs (${st.pairs} captured)`;
+  const g=$('#clGuide');
+  g.className='clguide'+(st.ready?' ready':'');
+  g.innerHTML=(st.guidance||[]).map(x=>'• '+escapeHtml(x)).join('<br>');
+  covGrid($('#clCov1'), (st.coverage||{}).cam1);
+  covGrid($('#clCov2'), (st.coverage||{}).cam2);
+  $('#clDiversity').innerHTML=
+    `near ${st.near}/${st.targets.near}<br>far ${st.far}/${st.targets.far}<br>tilted ${st.tilted}/${st.targets.tilted}`;
+  $('#clPairs').innerHTML=(st.last_pairs||[]).slice().reverse().map(p=>{
+    const c=p.cams||{};
+    const cell=n=>c[n]?(c[n].found?`<span style="color:var(--ok)">✓</span>`:`<span style="color:var(--bad)" title="${escapeHtml(c[n].error||'')}">✗</span>`):'—';
+    return `<div class="row" style="gap:8px">#${p.index+1} cam1 ${cell('cam1')} cam2 ${cell('cam2')}`+
+      `<button class="act" style="padding:2px 8px;font-size:11px" data-discard="${p.index}">discard</button></div>`;
+  }).join('');
+  $('#clPairs').querySelectorAll('button[data-discard]').forEach(b=>b.onclick=()=>calDiscard(+b.dataset.discard));
+  if(st.result) renderCalResult(st.result);
+  $('#clSave').disabled=!(st.result&&st.result.ok!==undefined);
+}
+function renderCalResult(res){
+  const v=(res.verdict||[]).map(x=>`<div style="color:${res.ok?'var(--ok)':'var(--warn)'}">${escapeHtml(x)}</div>`).join('');
+  $('#clResult').innerHTML=
+    `<table class="diagt"><tr><th></th><th>${res.cams[0]}</th><th>${res.cams[1]}</th></tr>`+
+    `<tr><td>fx px</td><td>${res.fx[res.cams[0]]}</td><td>${res.fx[res.cams[1]]}</td></tr>`+
+    `<tr><td>fy px</td><td>${res.fy[res.cams[0]]}</td><td>${res.fy[res.cams[1]]}</td></tr>`+
+    `<tr><td>RMS px</td><td>${res.rms_cam_px[res.cams[0]]}</td><td>${res.rms_cam_px[res.cams[1]]}</td></tr></table>`+
+    `<div style="margin-top:6px">stereo RMS <b>${res.rms_stereo_px} px</b> · baseline <b>${(res.baseline_m*1000).toFixed(1)} mm</b>`+
+    (res.agreement_pct?` · vs tape ${res.agreement_pct}%`:'')+`</div>`+v;
+}
+async function calDiscard(i){ await api('/api/rigcal/stereo/discard',{index:i}); pollCalib(); }
+$('#clStart').onclick=async()=>{
+  const r=await api('/api/rigcal/stereo/start',{cols:+$('#clCols').value,rows:+$('#clRows').value,
+    square_mm:+$('#clSquare').value, baseline_mm:+$('#clBaseline').value||null});
+  if(r&&r.ok===false){ $('#clSaved').innerHTML='<span style="color:var(--bad)">'+escapeHtml(r.error)+'</span>'; return; }
+  $('#clResult').innerHTML=''; pollCalib();
+};
+$('#clCapture').onclick=async()=>{
+  if(CL_BUSY) return; CL_BUSY=true;
+  $('#clCapture').disabled=true; $('#clCapture').textContent='firing…';
+  const r=await api('/api/rigcal/stereo/capture',{},30000);
+  $('#clCapture').disabled=false; $('#clCapture').textContent='📷 Capture pair'; CL_BUSY=false;
+  if(r&&r.ok===false){ $('#clGuide').className='clguide'; $('#clGuide').innerHTML='• '+escapeHtml(r.error); return; }
+  pollCalib();
+};
+$('#clCompute').onclick=async()=>{
+  $('#clCompute').disabled=true; $('#clCompute').textContent='solving…';
+  const r=await api('/api/rigcal/stereo/compute',{},120000);
+  $('#clCompute').disabled=false; $('#clCompute').textContent='Compute';
+  if(r&&r.ok===false){ $('#clGuide').className='clguide'; $('#clGuide').innerHTML='• '+escapeHtml(r.error); return; }
+  if(r&&r.result){ renderCalResult(r.result); $('#clSave').disabled=false; }
+};
+$('#clSave').onclick=async()=>{
+  const r=await api('/api/rigcal/stereo/save',{});
+  if(r&&r.ok) $('#clSaved').innerHTML='<b style="color:var(--ok)">saved ✓</b> — stereo VSLAM uses it from the next run';
+  else $('#clSaved').innerHTML='<span style="color:var(--bad)">'+escapeHtml((r&&r.error)||'save failed')+'</span>';
+  pollCalib();
+};
+async function imuCal(target){
+  $('#imuCalState').innerHTML='<b style="color:var(--warn)">sampling '+escapeHtml(target)+
+    ' for 10 s — DO NOT touch the rig…</b>';
+  ['#imuCal1','#imuCal2','#imuCalBoth'].forEach(x=>$(x).disabled=true);
+  const r=await api('/api/rigcal/imu',{target,seconds:10},40000);
+  ['#imuCal1','#imuCal2','#imuCalBoth'].forEach(x=>$(x).disabled=false);
+  if(!(r&&r.ok)){ $('#imuCalState').innerHTML='<span style="color:var(--bad)">'+escapeHtml((r&&r.error)||'failed')+'</span>'; return; }
+  $('#imuCalState').innerHTML='<span style="color:var(--ok)">saved ✓</span>';
+  const rows=[];
+  for(const n of ['cam1','cam2']) if(r[n]) rows.push(
+    `<b>${n}</b>: gyro bias [${r[n].gyro_bias_dps.join(', ')}] dps · |a| ${r[n].accel_norm_g} g · `+
+    `level ref pitch ${r[n].level_ref.pitch}° roll ${r[n].level_ref.roll}° (${r[n].n} samples)`);
+  if(r.relative) rows.push(`<b>relative</b> cam1→cam2: Δpitch ${r.relative.pitch}° Δroll ${r.relative.roll}° Δyaw ${r.relative.yaw}°`);
+  $('#imuCalResult').innerHTML=rows.map(x=>`<div class="small">${x}</div>`).join('');
+  pollCalib();
+}
+$('#imuCal1').onclick=()=>imuCal('cam1');
+$('#imuCal2').onclick=()=>imuCal('cam2');
+$('#imuCalBoth').onclick=()=>imuCal('both');
 
 // ---- helpers + loops --------------------------------------------------------
 function kvrow(k,v){return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;}

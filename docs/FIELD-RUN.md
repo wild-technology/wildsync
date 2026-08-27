@@ -263,3 +263,18 @@ launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd
 - **Known hardware fact:** cam1's card is ~64 GB class, cam2's ~512 GB class
   (same settings, ~38 MB/frame both). Swap cam1 to a matching V60 512 GB for
   long lines.
+
+## 2026-08-27 additions (later) — Calib tab, second IMU
+
+- **Calib tab.** Before survey work (ideally IN water, since the port changes
+  the focal length): print a checkerboard, enter its inner-corner counts and
+  measured square size (and the tape-measured camera spacing if you have it),
+  Start session, and follow the amber guidance - it tells you where to hold
+  the board, when to come closer, and when to tilt, until it turns green.
+  Compute, sanity-check the verdicts, Save. Stereo VSLAM switches from its
+  placeholder baseline to your calibration automatically.
+- **IMU calibrate**: set the rig still and level, press "Calibrate both".
+  Ten seconds, refused if anything moves.
+- **cam2's Olive IMU** rides the USB-C cable as a tiny ethernet device; it
+  needs no attention in the field. If /imu2 goes absent, check the cable and
+  `systemctl status olive-bridge` on cam2's Pi.

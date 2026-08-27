@@ -1,0 +1,13 @@
+[Unit]
+Description=Wild Sync olive-bridge - Olive IMU WebSocket -> piagent UDP relay
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/python3 -u /home/ubuntu/wildsync/rig/olive_ws_bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

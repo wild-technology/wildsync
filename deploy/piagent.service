@@ -9,6 +9,9 @@ User=ubuntu
 # The camera and this Pi share PoE, so at boot the camera is still powering up.
 # piagent has no camera dependency, but give the system a moment to settle.
 ExecStartPre=/bin/sleep 3
+# Optional per-node knobs (PIAGENT_IMU2=olive:udp:9901 arms the second IMU
+# slot fed by olive-bridge.service). Absent file, absent stream: no change.
+EnvironmentFile=-/etc/default/piagent
 ExecStart=/usr/bin/python3 -u /home/ubuntu/wildsync/rig/piagent.py
 Restart=always
 RestartSec=3

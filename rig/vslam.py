@@ -4,13 +4,25 @@
 During a survey the nodes trickle ~200 KB 1616x1080 review JPEGs onto the host
 (<run>/cam1/Cam1_YYYYMMDD_hhmmss.ss.jpg) at ~2 Hz, alongside a flight_log.csv
 row per frame with nav state (lat/long/xutm/yutm/heading/pitch/roll). This
-module turns that trickle into an incremental monocular visual-odometry
-trajectory the operator can see live: ORB features, ratio-tested Hamming
-matches against the previous keyframe, essential matrix + RANSAC, pose chain,
-and a sparse triangulated landmark cloud. Monocular VO has no scale; when the
-flight_log carries UTM the scale of each new trajectory segment is fitted to
-the GPS baseline over a sliding window, otherwise the chain is unit-norm and
-the status says so.
+module turns that trickle into an incremental visual-odometry trajectory the
+operator can see live, in one of two modes:
+
+  mono    ORB features, ratio-tested Hamming matches against the previous
+          keyframe, essential matrix + MAGSAC, pose chain, sparse landmark
+          cloud. Monocular VO has no scale; when the flight_log carries UTM
+          the scale of each segment is fitted to the GPS baseline over a
+          sliding window, otherwise the chain is unit-norm and says so.
+  stereo  the rig fires cam1+cam2 synchronized (~0.4 ms skew), so same-
+          instant pairs triangulate a METRIC cloud from the inter-camera
+          baseline and the chain is PnP (3D->2D) against the previous
+          pair's cloud — metric scale with no GPS, and no planar-scene
+          degeneracy. The inter-camera pose is self-estimated from the
+          first pairs; the baseline LENGTH is a rig constant that is
+          currently UNMEASURED (default 0.30 m placeholder, loudly flagged
+          until measured — docs/vslam-jetson.md). GPS demotes to a
+          cross-check: stats.gps_ratio = stereo length / GPS length.
+  auto    stereo when the pair dir exists and >50% of frames pair up by
+          capture instant; mono otherwise.
 
 Runs today on the macOS host (CPU); it is finalized on the Jetson Orin Nano,
 where the same VslamEngine can be handed a CUDA backend — everything that
@@ -23,7 +35,8 @@ point degrades to a clean "unavailable: <reason>" status instead of crashing.
 Install on the Mac with `pip3 install opencv-python-headless numpy`; the
 Jetson gets cv2 from JetPack/apt (python3-opencv), no pip build.
 
-    python3 rig/vslam.py <run_dir> [--cam cam1] [--follow]
+    python3 rig/vslam.py <run_dir> [--mode auto|mono|stereo] [--cam cam1]
+                         [--follow] [--baseline 0.30]
                          [--json out.json] [--ply out.ply]
 
 processes an existing run (or tails a growing one with --follow), printing one
@@ -64,8 +77,19 @@ class CpuOrbBackend:
       match(d1, d2)               -> [(i1, i2)...] ratio-tested index pairs
       rel_pose(p1, p2, K)         -> (R 3x3 lists, t unit 3-list,
                                       inlier index list) or None
-      triangulate(p1, p2, K, R, t)-> [[x, y, z]...] in the FIRST camera frame,
-                                      unit-|t| scale, cheirality-filtered
+      triangulate(p1, p2, K, R, t)-> list ALIGNED with the input pairs:
+                                      [x, y, z] in the FIRST camera frame at
+                                      the scale of |t|, or None where the
+                                      point fails cheirality/depth (stereo
+                                      needs the index mapping back to cam1
+                                      keypoints; mono just drops the Nones)
+      pnp(obj, img, K)            -> (R 3x3 lists, t 3-list, inlier index
+                                      list) or None; x_cam = R X + t
+      rel_pose_h(p1, p2, K)       -> like rel_pose but via homography
+                                      decomposition — the planar-scene
+                                      fallback the stereo extrinsics
+                                      bootstrap needs (flat sand is
+                                      homography-degenerate for rel_pose)
     """
 
     name = "cpu-orb"
@@ -178,9 +202,70 @@ class CpuOrbBackend:
         # Cheirality plus a depth ceiling: at unit |t| a survey step of ~0.5 m
         # over a 2-6 m seafloor puts real points at z ~ 4-12; z > 500 is a
         # near-infinity match (surface glare, particulate) that would fling
-        # the cloud kilometres out once scaled.
-        return [[float(x), float(y), float(z)] for x, y, z in X
-                if 0.05 < z < 500.0]
+        # the cloud kilometres out once scaled. Output stays aligned with the
+        # input correspondences (None holes) — see the interface contract.
+        return [[float(x), float(y), float(z)] if 0.05 < z < 500.0 else None
+                for x, y, z in X]
+
+    def rel_pose_h(self, p1, p2, K):
+        """Relative pose via homography decomposition, for scenes where the
+        5-point solver is degenerate (one dominant plane — flat seafloor,
+        our synthetic planar fixtures): measured on such a pair, MAGSAC E
+        kept 3 of 1011 matches while the homography kept 939. Of the up-to-4
+        (R, t, n) decompositions the physical one is picked by cheirality
+        (fraction of inliers triangulating in FRONT of both cameras: the
+        true candidate scores ~1.0, its mirror ~0.0, the spurious pair
+        ~0.5); anything below 0.7 support is refused rather than guessed.
+        Only the t DIRECTION is meaningful (|t| is scaled by the unknown
+        plane distance), same contract as rel_pose."""
+        cv2, np = self._cv2, self._np
+        if len(p1) < 8:
+            return None
+        a, b = np.float32(p1), np.float32(p2)
+        Km = np.float64(K)
+        H, mask = cv2.findHomography(a, b, cv2.RANSAC, 2.0)
+        if H is None or mask is None:
+            return None
+        inl = [i for i, v in enumerate(mask.ravel()) if v]
+        if len(inl) < 8:
+            return None
+        _, Rs, ts, _ = cv2.decomposeHomographyMat(H, Km)
+        ai = np.float64(a[inl]).T
+        bi = np.float64(b[inl]).T
+        P1 = Km @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        best = None
+        for R, t in zip(Rs, ts):
+            tn = float(np.linalg.norm(t))
+            if tn < 1e-9:
+                continue                      # pure-rotation: no baseline info
+            tu = (t / tn).reshape(3, 1)
+            X = cv2.triangulatePoints(P1, Km @ np.hstack([R, tu]), ai, bi)
+            w = X[3].copy()
+            w[w == 0] = 1e-12
+            X3 = X[:3] / w
+            front = float(((X3[2] > 0) & ((R @ X3 + tu)[2] > 0)).mean())
+            if best is None or front > best[0]:
+                best = (front, R.tolist(), [float(v) for v in tu.ravel()])
+        if best is None or best[0] < 0.7:
+            return None
+        return best[1], best[2], inl
+
+    def pnp(self, obj, img, K):
+        """3D->2D pose (x_cam = R X + t) via RANSAC PnP + iterative refine.
+        This is what makes the stereo chain immune to the planar-scene
+        degeneracy that bites the essential matrix: PnP against a metric
+        cloud is well-posed no matter how flat the seafloor is."""
+        cv2, np = self._cv2, self._np
+        if len(obj) < 6:
+            return None
+        ok, rvec, tvec, inl = cv2.solvePnPRansac(
+            np.float64(obj), np.float64(img), np.float64(K), None,
+            reprojectionError=2.0, iterationsCount=200)
+        if not ok or inl is None or len(inl) < 4:
+            return None
+        R = cv2.Rodrigues(rvec)[0]
+        return (R.tolist(), [float(v) for v in tvec.ravel()],
+                [int(i) for i in np.ravel(inl)])
 
 
 def make_backend(name="cpu", **kw):
@@ -309,6 +394,8 @@ class VslamEngine:
     (status says so). All state is single-threaded by design — VslamRunner
     serialises feed() and guards snapshots with its own lock.
     """
+
+    mode = "mono"
 
     def __init__(self, intrinsics=None, backend=None, min_matches=25,
                  min_inliers=15, min_inlier_frac=0.3, min_parallax_px=10.0,
@@ -490,6 +577,8 @@ class VslamEngine:
                                        [p_cur[i] for i in inl], K, R_rel,
                                        t_rel)
         for p in pts:
+            if p is None:                     # cheirality/depth-filtered hole
+                continue
             pw = _mat_vec(R_prev, [v * self.scale for v in p])
             self.landmarks.append([pw[0] + C_prev[0], pw[1] + C_prev[1],
                                    pw[2] + C_prev[2]])
@@ -545,6 +634,311 @@ class VslamEngine:
         ms = (time.monotonic() - t0) * 1000.0
         ema = self.stats["proc_ms"]
         self.stats["proc_ms"] = ms if ema == 0 else 0.8 * ema + 0.2 * ms
+
+
+class StereoVslamEngine(VslamEngine):
+    """Stereo VO over synchronized cam1+cam2 pairs (~0.4 ms measured skew).
+
+    Kills both monocular weaknesses at once: the pair triangulates a METRIC
+    point cloud from the inter-camera baseline (no GPS needed for scale),
+    and the frame-to-frame chain is PnP against the previous pair's cloud —
+    well-posed on planar scenes where the essential matrix degenerates.
+
+    Extrinsics: the relative pose cam1->cam2 is SELF-ESTIMATED once, from
+    the first `calib_pairs` good pairs (MAGSAC essential matrix per pair,
+    medoid over the candidates' translation directions). That fixes the
+    rotation and the translation DIRECTION from image evidence; the LENGTH
+    is `baseline_m` — a rig constant that is currently UNMEASURED (also see
+    docs/future-tests.md §1: lens/encoder parity unverified), so the 0.30 m
+    default is a placeholder and every status/snapshot flags it loudly until
+    baseline_calibrated=True. A checkerboard stereo calibration replaces the
+    whole estimate on Jetson day (docs/vslam-jetson.md). All trajectory
+    DISTANCES scale linearly with baseline error; SHAPE does not.
+
+    GPS is a cross-check here, not the scale source: stats.gps_ratio =
+    stereo-derived track length / GPS track length, once the boat has moved
+    a couple of metres. Ratio far from 1.0 = baseline (or pairing) is wrong.
+
+    feed_pair(f1, f2=None, ...) is the entry point; f2=None (a missing cam2
+    half) still advances the pose by PnP against the LAST paired cloud —
+    counted in stats.unpaired — but cannot refresh the cloud, so a long
+    unpaired streak eventually loses overlap and reinitializes.
+    """
+
+    mode = "stereo"
+
+    def __init__(self, intrinsics=None, backend=None, baseline_m=0.30,
+                 baseline_calibrated=False, calib_pairs=5, min_pnp_points=12,
+                 **kw):
+        super().__init__(intrinsics=intrinsics, backend=backend, **kw)
+        self.baseline_m = float(baseline_m)
+        self.baseline_calibrated = bool(baseline_calibrated)
+        self.calib_pairs = int(calib_pairs)
+        self.min_pnp_points = min_pnp_points
+        self._calib = []            # (R, t_unit, n_inliers) candidates
+        self._ext = None            # (R12, t12_metric): x_cam2 = R12 x_cam1 + t12
+        self.scale_source = "stereo"
+        self.stats.update({"pairs": 0, "unpaired": 0, "cam2_dropped": 0,
+                           "stereo_points": 0, "gps_ratio": None,
+                           "calib_scatter_deg": None})
+        self._vo_len = self._gps_len = 0.0
+
+    @property
+    def calib_status(self):
+        base = ("baseline %.3f m (measured)" % self.baseline_m
+                if self.baseline_calibrated else
+                "baseline %.3f m PLACEHOLDER — UNCALIBRATED" % self.baseline_m)
+        if self._ext is None:
+            return "extrinsics pending (%d/%d pairs); %s" % (
+                len(self._calib), self.calib_pairs, base)
+        return ("extrinsics self-estimated from %d pairs (t scatter %s deg); %s"
+                % (self.calib_pairs, self.stats["calib_scatter_deg"], base))
+
+    def feed(self, frame, meta=None, t=None, name=None):
+        # mono entry point degrades to an unpaired stereo feed, so a caller
+        # holding "an engine" never has to care which one it got.
+        return self.feed_pair(frame, None, meta=meta, t=t, name=name)
+
+    # -- feed --------------------------------------------------------------
+
+    def feed_pair(self, f1, f2=None, meta=None, t=None, name=None):
+        """One synchronized pair (f2=None when the cam2 half is missing).
+        Same None semantics as VslamEngine.feed."""
+        t0 = time.monotonic()
+        err = self.backend.ensure()
+        if err:
+            self._status = "unavailable: %s" % err
+            return None
+        data, name, t = self._read(f1, name, t)
+        self.stats["frames"] += 1
+        if data is None:
+            return None
+        if data[:2] == b"\xff\xd8" and not data.rstrip(b"\0").endswith(b"\xff\xd9"):
+            return self._corrupt(name, "truncated (no JPEG EOI)")
+        gray = self.backend.decode(data)
+        if gray is None:
+            return self._corrupt(name, "decode failed")
+        kps, desc = self.backend.detect(gray)
+        if desc is None or len(kps) < 12:
+            return self._lost2(name, "only %d features" % len(kps))
+        half = self._load_half(f2) if f2 is not None else None
+        self.stats["pairs" if half else "unpaired"] += 1
+        K = self.intrinsics.k33(getattr(self.backend, "proc_scale", 1.0))
+        # extrinsics: estimated ONCE from the first good pairs, then frozen —
+        # the rig is rigid; re-estimating every pair would just add noise.
+        if self._ext is None:
+            if half:
+                self._calib_step(kps, desc, half, K)
+            if self._ext is None:
+                self._status = ("calibrating stereo extrinsics (%d/%d pairs)"
+                                % (len(self._calib), self.calib_pairs))
+                return None
+        # metric cloud for THIS pair (empty when unpaired/cam2 dropped)
+        pts3d = self._pair_cloud(kps, desc, half, K) if half else {}
+        if half:
+            self.stats["stereo_points"] = len(pts3d)
+        if self._kf is None:
+            if not pts3d:
+                self._status = "waiting for a stereo pair to bootstrap"
+                return None
+            return self._bootstrap2(kps, desc, pts3d, t, name, meta)
+        m01 = self.backend.match(self._kf["desc"], desc)
+        self.stats["last_matches"] = len(m01)
+        if len(m01) < self.min_matches:
+            return self._lost2(name, "%d matches" % len(m01), kps=kps,
+                               desc=desc, pts3d=pts3d, t=t, meta=meta)
+        par = sorted(math.hypot(self._kf["kps"][i][0] - kps[j][0],
+                                self._kf["kps"][i][1] - kps[j][1])
+                     for i, j in m01)[len(m01) // 2]
+        if par < self.min_parallax_px:
+            self._lost_streak = 0
+            self.stats["still"] += 1
+            self._status = ("tracking — %d keyframes, still (parallax %.1f px)"
+                            % (self.stats["keyframes"], par))
+            self._tick(t0)
+            return None
+        # 3D-2D: previous cloud points seen again in the current cam1 image
+        obj, img = [], []
+        for i, j in m01:
+            P = self._kf["pts3d"].get(i)
+            if P is not None:
+                obj.append(P)
+                img.append(kps[j])
+        if len(obj) < self.min_pnp_points:
+            return self._lost2(name, "%d PnP points" % len(obj), kps=kps,
+                               desc=desc, pts3d=pts3d, t=t, meta=meta)
+        rp = self.backend.pnp(obj, img, K)
+        if rp is None:
+            return self._lost2(name, "PnP failed", kps=kps, desc=desc,
+                               pts3d=pts3d, t=t, meta=meta)
+        R_rel, t_rel, inl = rp
+        self.stats["last_inliers"] = len(inl)
+        if len(inl) < max(self.min_inliers,
+                          int(self.min_inlier_frac * len(obj))):
+            return self._lost2(name, "%d/%d PnP inliers" % (len(inl), len(obj)),
+                               kps=kps, desc=desc, pts3d=pts3d, t=t, meta=meta)
+        up = self._advance2(R_rel, t_rel, pts3d, kps, desc, t, name, meta,
+                            len(m01), len(inl))
+        self._tick(t0)
+        return up
+
+    # -- internals ---------------------------------------------------------
+
+    def _load_half(self, f2):
+        """cam2 half -> (kps2, desc2) or None. A bad cam2 frame (unreadable,
+        truncated, featureless) demotes the pair to unpaired rather than
+        poisoning the cam1 chain."""
+        try:
+            if isinstance(f2, (bytes, bytearray)):
+                d = bytes(f2)
+            else:
+                with open(os.fspath(f2), "rb") as fh:
+                    d = fh.read()
+        except OSError:
+            self.stats["cam2_dropped"] += 1
+            return None
+        if d[:2] == b"\xff\xd8" and not d.rstrip(b"\0").endswith(b"\xff\xd9"):
+            self.stats["cam2_dropped"] += 1
+            return None
+        g = self.backend.decode(d)
+        if g is None:
+            self.stats["cam2_dropped"] += 1
+            return None
+        kps2, desc2 = self.backend.detect(g)
+        if desc2 is None or len(kps2) < 12:
+            self.stats["cam2_dropped"] += 1
+            return None
+        return kps2, desc2
+
+    def _calib_step(self, kps, desc, half, K):
+        kps2, desc2 = half
+        m12 = self.backend.match(desc, desc2)
+        if len(m12) < self.min_matches:
+            return
+        p1 = [kps[i] for i, _ in m12]
+        p2 = [kps2[j] for _, j in m12]
+        need = max(self.min_inliers, int(self.min_inlier_frac * len(m12)))
+        rp = self.backend.rel_pose(p1, p2, K)
+        if rp is None or len(rp[2]) < need:
+            # a flat seafloor is homography-degenerate for the 5-point
+            # solver (measured: 3/1011 inliers on a planar pair) — fall back
+            # to homography decomposition, which is exact on such scenes.
+            rp = self.backend.rel_pose_h(p1, p2, K)
+        if rp is None or len(rp[2]) < need:
+            return
+        R, tu, inl = rp
+        self._calib.append((R, tu, len(inl)))
+        if len(self._calib) >= self.calib_pairs:
+            self._finalize_extrinsics()
+
+    def _finalize_extrinsics(self):
+        """Medoid over the candidates' translation directions: on a rigid rig
+        every same-instant pair must agree (stereo_check.py's whole premise),
+        so picking the candidate closest to all the others rejects one bad
+        estimate without averaging rotation matrices. The mean angular
+        distance is kept as calib_scatter_deg — a big number means the
+        pairing, the sync, or the rig is not what we think it is."""
+        def ang(u, v):
+            d = max(-1.0, min(1.0, sum(a * b for a, b in zip(u, v))))
+            return math.degrees(math.acos(d))
+        cost, k = min((sum(ang(c[1], o[1]) for o in self._calib), i)
+                      for i, c in enumerate(self._calib))
+        R, tu, _ = self._calib[k]
+        self.stats["calib_scatter_deg"] = round(
+            cost / max(1, len(self._calib) - 1), 2)
+        self._ext = (R, [v * self.baseline_m for v in tu])
+
+    def _pair_cloud(self, kps, desc, half, K):
+        """Metric 3D points in the CURRENT cam1 frame keyed by cam1 keypoint
+        index — the map the next frame's PnP consumes."""
+        kps2, desc2 = half
+        m12 = self.backend.match(desc, desc2)
+        if len(m12) < 8:
+            return {}
+        R12, t12 = self._ext
+        tri = self.backend.triangulate([kps[i] for i, _ in m12],
+                                       [kps2[j] for _, j in m12], K, R12, t12)
+        return {i: P for (i, _), P in zip(m12, tri) if P is not None}
+
+    def _set_skf(self, kps, desc, pts3d, t, name, meta):
+        # the kf carries its own pose: unpaired frames advance the RUNNING
+        # pose while the cloud (and its anchor pose) stays put, and PnP
+        # results are relative to the cloud's frame, not the running one.
+        self._kf = {"kps": kps, "desc": desc, "pts3d": pts3d, "t": t,
+                    "file": name, "gps": _meta_gps(meta),
+                    "pose_R": [row[:] for row in self._R],
+                    "pose_C": list(self._C)}
+
+    def _bootstrap2(self, kps, desc, pts3d, t, name, meta):
+        self._set_skf(kps, desc, pts3d, t, name, meta)
+        self.segments.append({"start_t": t, "start_file": name, "keyframes": 1})
+        self.stats["keyframes"] += 1
+        self._status = self._track_status("origin %s" % name)
+        return self._pose_update(t, name, 0, 0, meta)
+
+    def _lost2(self, name, why, kps=None, desc=None, pts3d=None, t=None,
+               meta=None):
+        self.stats["lost"] += 1
+        self._lost_streak += 1
+        # reinit needs a frame that can anchor a NEW cloud: without pts3d
+        # (unpaired, cam2 dropped) there is nothing for the next PnP to chain
+        # against, so keep counting until a paired frame comes by.
+        if (self._lost_streak >= self.reinit_after and pts3d
+                and self._kf is not None):
+            self.stats["reinits"] += 1
+            self._lost_streak = 0
+            self._set_skf(kps, desc, pts3d, t, name, meta)
+            self.segments.append({"start_t": t, "start_file": name,
+                                  "keyframes": 0})
+            self._status = ("tracking — %d keyframes, reinit segment %d at %s"
+                            % (self.stats["keyframes"], len(self.segments),
+                               name))
+            return None
+        self._status = "lost (%d since keyframe: %s)" % (self._lost_streak, why)
+        return None
+
+    def _advance2(self, R_rel, t_rel, pts3d, kps, desc, t, name, meta,
+                  n_matches, n_inl):
+        # PnP convention: x_cur = R X_kf + t, already METRIC. Compose off the
+        # KF's STORED pose, never the running pose — see _set_skf.
+        Rt = _mat_t(R_rel)
+        step_cam = [-v for v in _mat_vec(Rt, t_rel)]
+        kfR, kfC = self._kf["pose_R"], self._kf["pose_C"]
+        step_w = _mat_vec(kfR, step_cam)
+        self._C = [c + s for c, s in zip(kfC, step_w)]
+        self._R = _mat_mul(kfR, Rt)
+        gps_now = _meta_gps(meta)
+        if pts3d:
+            # landmarks: this pair's cloud is in the CURRENT cam1 frame
+            for P in pts3d.values():
+                pw = _mat_vec(self._R, P)
+                self.landmarks.append([pw[0] + self._C[0], pw[1] + self._C[1],
+                                       pw[2] + self._C[2]])
+            if len(self.landmarks) > LANDMARK_CAP:
+                self.landmarks = self.landmarks[::2]
+            # GPS cross-check between consecutive CLOUD keyframes: both are
+            # chord distances over the same instants, so the ratio is fair.
+            if gps_now is not None and self._kf["gps"] is not None:
+                self._gps_len += math.hypot(gps_now[0] - self._kf["gps"][0],
+                                            gps_now[1] - self._kf["gps"][1])
+                self._vo_len += math.sqrt(sum((a - b) ** 2
+                                              for a, b in zip(self._C, kfC)))
+                if self._gps_len >= 2.0:
+                    self.stats["gps_ratio"] = round(
+                        self._vo_len / self._gps_len, 3)
+            self._set_skf(kps, desc, pts3d, t, name, meta)
+        self._lost_streak = 0
+        self.segments[-1]["keyframes"] += 1
+        self.stats["keyframes"] += 1
+        self._status = self._track_status(None)
+        return self._pose_update(t, name, n_matches, n_inl, meta)
+
+    def _track_status(self, extra):
+        b = ("baseline %.3f m" % self.baseline_m if self.baseline_calibrated
+             else "baseline UNCALIBRATED %.2f m" % self.baseline_m)
+        s = ("tracking — %d keyframes, stereo metric (%s)"
+             % (self.stats["keyframes"], b))
+        return s + (", " + extra if extra else "")
 
 
 # ---------------------------------------------------------------------------
@@ -609,28 +1003,102 @@ def _fit_similarity_2d(src, dst):
             "rms_m": math.sqrt(rms / n), "n": n}
 
 
-class VslamRunner:
-    """Threaded watcher: feeds a run dir's review JPEGs to a VslamEngine in
-    timestamp order as they appear, and keeps the JSON-safe state a rigd
-    /api/vslam endpoint will serve (docs/vslam-jetson.md)."""
+STEREO_CAL_PATH = os.path.expanduser("~/rig/stereo_calibration.json")
 
-    def __init__(self, engine=None, poll_s=1.0, on_update=None):
-        self.engine = engine or VslamEngine()
+
+def load_stereo_calibration(path=STEREO_CAL_PATH):
+    """The Calib tab's saved checkerboard solution, or None.
+
+    Returns {"R": 3x3, "T": [3] metres, "baseline_m": float, "K1","d1","K2",
+    "d2", "rms_stereo_px", "date"} - the wire-in docs/vslam-jetson.md
+    specifies: construct the stereo engine with these extrinsics frozen
+    (baseline_calibrated=True) instead of the self-estimate."""
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+        if not (isinstance(doc, dict) and doc.get("R") and doc.get("T")
+                and doc.get("baseline_m")):
+            return None
+        return doc
+    except (OSError, ValueError):
+        return None
+
+
+class VslamRunner:
+    """Threaded watcher: feeds a run dir's review JPEGs to an engine in
+    timestamp order as they appear, and keeps the JSON-safe state a rigd
+    /api/vslam endpoint will serve (docs/vslam-jetson.md).
+
+    mode: 'mono' (cam only), 'stereo' (cam + pair_cam, frames associated by
+    capture instant from the filenames), or 'auto' — stereo when the pair
+    dir exists and >50% of the first frames find a same-instant partner,
+    mono otherwise. Pairing tolerance is half the median inter-frame gap
+    (the two halves of one fire land well inside that; the NEXT frame is a
+    full gap away), overridable with pair_tol_s. In follow mode a lone cam1
+    frame waits one grace period for its cam2 half before being fed
+    unpaired — the halves cross USB independently and rarely land together.
+    """
+
+    def __init__(self, engine=None, poll_s=1.0, on_update=None, mode="mono",
+                 pair_cam="cam2", pair_tol_s=None, baseline_m=0.30,
+                 baseline_calibrated=False, calib_pairs=5, engine_kw=None):
         self.poll_s = poll_s
         self.on_update = on_update            # callable(PoseUpdate) — CLI print
+        self.mode = mode                      # as requested
+        self.pair_cam = pair_cam
+        self.pair_tol_s = pair_tol_s
+        self.baseline_m = baseline_m
+        self.baseline_calibrated = baseline_calibrated
+        self.calib_pairs = calib_pairs
+        self.engine_kw = dict(engine_kw or {})
+        self.engine = engine
+        self.decided = None                   # 'mono'|'stereo' once chosen
+        if engine is not None:
+            # an injected engine is authoritative — its class IS the mode
+            self.decided = getattr(engine, "mode", "mono")
+        elif mode in ("mono", "stereo"):
+            self.decided = mode
+            self.engine = self._make_engine(mode)
         self.run_dir = self.cam = None
         self.trajectory = []
         self.watch = {"files_seen": 0, "fed": 0, "out_of_order": 0,
-                      "duplicates": 0, "pending": 0, "fps": 0.0}
+                      "duplicates": 0, "pending": 0, "fps": 0.0,
+                      "cam2_orphans": 0, "pairs_fed": 0}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
-        self._seen = set()
-        self._pending = {}                    # name -> size at last scan
+        self._seen = {}                       # cam -> set of names
+        self._pending = {}                    # cam -> {name: size last scan}
+        self._q1 = []                         # ready cam frames, name-sorted
+        self._ready_at = {}                   # cam name -> monotonic ready t
+        self._ready2 = {}                     # pair_cam name -> epoch
+        self._e1_hist = []                    # recent cam epochs (cadence)
         self._last_fed = ""                   # lexicographic == chronological
         self._flight = {}
         self._flight_sig = None
         self._fed_times = []
+
+    def _make_engine(self, mode):
+        if mode == "stereo":
+            # A saved checkerboard calibration (the UI's Calib tab writes
+            # ~/rig/stereo_calibration.json) beats both the placeholder
+            # baseline and the self-estimated extrinsics - freeze it in,
+            # unless the caller already supplied a calibrated baseline.
+            cal = None if self.baseline_calibrated else \
+                load_stereo_calibration()
+            if cal:
+                eng = StereoVslamEngine(baseline_m=float(cal["baseline_m"]),
+                                        baseline_calibrated=True,
+                                        calib_pairs=self.calib_pairs,
+                                        **self.engine_kw)
+                eng._ext = ([list(map(float, row)) for row in cal["R"]],
+                            [float(v) for v in cal["T"]])
+                return eng
+            return StereoVslamEngine(baseline_m=self.baseline_m,
+                                     baseline_calibrated=self.baseline_calibrated,
+                                     calib_pairs=self.calib_pairs,
+                                     **self.engine_kw)
+        return VslamEngine(**self.engine_kw)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -651,17 +1119,17 @@ class VslamRunner:
 
     def run_once(self, run_dir, cam="cam1"):
         """Process everything already on disk, in order, on the caller's
-        thread — the CLI's non-follow mode. No settle delay: a finished run's
-        files are complete by definition."""
+        thread — the CLI's non-follow mode. No settle delay and no pairing
+        grace: a finished run's files are complete by definition."""
         self.run_dir, self.cam = os.path.abspath(run_dir), cam
-        self._poll(settle=False)
+        self._poll(settle=False, follow=False)
 
     # -- watcher -----------------------------------------------------------
 
     def _loop(self):
         while not self._stop.is_set():
             try:
-                self._poll(settle=True)
+                self._poll(settle=True, follow=True)
             except Exception as e:  # noqa: BLE001 - a watcher that dies
                 # silently leaves the operator staring at a frozen track with
                 # no hint; surface the error in status instead and keep going.
@@ -669,14 +1137,11 @@ class VslamRunner:
                     self.watch["error"] = "%s: %s" % (type(e).__name__, e)
             self._stop.wait(self.poll_s)
 
-    def _cam_dir(self):
-        return os.path.join(self.run_dir, self.cam)
-
     def _refresh_flight(self):
-        """flight_log.csv grows during the run; re-parse when its size/mtime
-        move. Whole-file re-read: a full survey is a few thousand short rows,
-        well under the cost of one ORB pass."""
-        path = os.path.join(self._cam_dir(), "flight_log.csv")
+        """flight_log.csv (the primary cam's) grows during the run; re-parse
+        when its size/mtime move. Whole-file re-read: a full survey is a few
+        thousand short rows, well under the cost of one ORB pass."""
+        path = os.path.join(self.run_dir, self.cam, "flight_log.csv")
         try:
             st = os.stat(path)
         except OSError:
@@ -692,56 +1157,163 @@ class VslamRunner:
         self._flight_sig = sig
         self._flight = rows
 
-    def _poll(self, settle):
-        self._refresh_flight()
-        cam_num = "".join(c for c in self.cam if c.isdigit())
+    def _scan_cam(self, cam, settle):
+        """Newly READY files of one cam dir (None = dir absent, distinct
+        from empty). run.py writes straight to the final name, so a file
+        whose size still moves between polls is mid-write: ready = same
+        nonzero size on two consecutive scans (~one poll of extra latency;
+        the EOI check in feed() backstops the rest)."""
+        cam_num = "".join(c for c in cam if c.isdigit())
         prefix = "Cam%s_" % cam_num
+        seen = self._seen.setdefault(cam, set())
+        pend = self._pending.setdefault(cam, {})
         try:
-            names = os.listdir(self._cam_dir())
+            names = os.listdir(os.path.join(self.run_dir, cam))
         except OSError:
-            return                            # run dir not created yet
-        fresh = []
+            return None
+        out = []
         for n in names:
-            if not n.startswith(prefix) or n in self._seen or not FNAME_RE.match(n):
+            if not n.startswith(prefix) or n in seen or not FNAME_RE.match(n):
                 continue
-            path = os.path.join(self._cam_dir(), n)
             try:
-                size = os.path.getsize(path)
+                size = os.path.getsize(os.path.join(self.run_dir, cam, n))
             except OSError:
                 continue
             if settle:
-                # run.py writes straight to the final name, so a file whose
-                # size still moves between polls is mid-write. Ready = same
-                # nonzero size on two consecutive scans (~one poll of extra
-                # latency; the EOI check in feed() backstops the rest).
-                last = self._pending.get(n)
-                self._pending[n] = size
+                last = pend.get(n)
+                pend[n] = size
                 if last != size or size == 0:
                     continue
-                del self._pending[n]
-            fresh.append(n)
+                del pend[n]
+            seen.add(n)
+            out.append(n)
         with self._lock:
-            self.watch["pending"] = len(self._pending)
-        for n in sorted(fresh):
-            if self._stop.is_set() and settle:
-                return
-            self._ingest(n)
+            self.watch["files_seen"] += len(out)
+            self.watch["pending"] = sum(len(p) for p in self._pending.values())
+        return out
 
-    def _ingest(self, name):
-        self._seen.add(name)
-        with self._lock:
-            self.watch["files_seen"] += 1
-        if name <= self._last_fed:
-            # a straggler older than what the engine has already tracked
-            # cannot be inserted into an incremental chain — count it and
-            # move on (the settle delay makes this rare at 2 Hz).
-            with self._lock:
-                self.watch["out_of_order"] += 1
+    def _tol(self):
+        """Pairing tolerance: half the observed median inter-frame gap, so a
+        same-instant partner always qualifies and the NEXT frame never does.
+        0.25 s (half the 2 Hz default cadence) until enough gaps are seen."""
+        if self.pair_tol_s:
+            return self.pair_tol_s
+        es = sorted(self._e1_hist[-40:])
+        gaps = [b - a for a, b in zip(es, es[1:]) if 1e-3 < b - a < 30]
+        if not gaps:
+            return 0.25
+        return max(0.02, 0.5 * sorted(gaps)[len(gaps) // 2])
+
+    def _poll(self, settle, follow):
+        self._refresh_flight()
+        new1 = self._scan_cam(self.cam, settle)
+        if new1 is None:
+            return                            # run/cam dir not created yet
+        want2 = (self.decided == "stereo"
+                 or (self.decided is None and self.mode == "auto"))
+        new2 = self._scan_cam(self.pair_cam, settle) if want2 else None
+        now = time.monotonic()
+        for n in sorted(new1):
+            if n <= self._last_fed:
+                # a straggler older than what the engine already tracked
+                # cannot be inserted into an incremental chain — count it
+                # and move on (the settle delay makes this rare at 2 Hz).
+                with self._lock:
+                    self.watch["out_of_order"] += 1
+                continue
+            self._q1.append(n)
+            self._ready_at[n] = now
+            e = _fname_epoch(n)
+            if e is not None:
+                self._e1_hist.append(e)
+        self._q1.sort()
+        self._e1_hist = self._e1_hist[-60:]
+        for n in sorted(new2 or []):
+            e = _fname_epoch(n)
+            if e is not None:
+                self._ready2[n] = e
+        if self.decided is None:
+            self._decide(pair_dir_exists=new2 is not None, follow=follow)
+            if self.decided is None:
+                return                        # keep queueing until decidable
+        if self.decided == "mono":
+            for n in self._q1:
+                if self._stop.is_set() and follow:
+                    return
+                self._feed(n, None)
+            self._q1.clear()
+            self._ready_at.clear()
             return
-        path = os.path.join(self._cam_dir(), name)
-        meta = self._flight.get(name)
+        # stereo: pair each cam frame with the nearest-instant ready partner
+        tol = self._tol()
+        grace = max(1.0, 2 * self.poll_s) if follow else 0.0
+        while self._q1:
+            if self._stop.is_set() and follow:
+                return
+            n1 = self._q1[0]
+            e1 = _fname_epoch(n1) or 0.0
+            partner, best = None, tol + 1.0
+            for n2, e2 in self._ready2.items():
+                d = abs(e2 - e1)
+                if d <= tol and d < best:
+                    partner, best = n2, d
+            if partner is None and (now - self._ready_at.get(n1, now)) < grace:
+                break         # wait a beat for the other half; keep ORDER
+            self._q1.pop(0)
+            self._ready_at.pop(n1, None)
+            if partner is not None:
+                self._ready2.pop(partner)
+            self._feed(n1, partner)
+            # cam2 frames that can no longer pair with anything upcoming
+            dead = [n2 for n2, e2 in self._ready2.items() if e2 < e1 - tol]
+            for n2 in dead:
+                self._ready2.pop(n2)
+                with self._lock:
+                    self.watch["cam2_orphans"] += 1
+
+    def _decide(self, pair_dir_exists, follow):
+        """auto: stereo when the pair dir exists and >50% of the queued
+        frames have a same-instant partner. In follow mode wait for at least
+        4 frames so one straggler cannot flip the answer; a one-shot pass
+        has everything on disk already and decides immediately."""
+        if not pair_dir_exists:
+            if self._q1 or not follow:
+                self._choose("mono", "no %s dir" % self.pair_cam)
+            return
+        if follow and len(self._q1) < 4:
+            return
+        if not self._q1:
+            if not follow:
+                self._choose("mono", "no frames at all")
+            return
+        tol = self._tol()
+        paired = sum(1 for n1 in self._q1
+                     if any(abs(e2 - (_fname_epoch(n1) or 0.0)) <= tol
+                            for e2 in self._ready2.values()))
+        rate = paired / len(self._q1)
+        self._choose("stereo" if rate > 0.5 else "mono",
+                     "pairing %.0f%% over %d frames" % (100 * rate,
+                                                        len(self._q1)))
+
+    def _choose(self, mode, why):
+        self.decided = mode
         with self._lock:
-            up = self.engine.feed(path, meta=meta)
+            self.watch["mode_reason"] = why
+        if self.engine is None:
+            self.engine = self._make_engine(mode)
+
+    def _feed(self, name, partner):
+        meta = self._flight.get(name)
+        p1 = os.path.join(self.run_dir, self.cam, name)
+        p2 = (os.path.join(self.run_dir, self.pair_cam, partner)
+              if partner else None)
+        with self._lock:
+            if self.decided == "stereo":
+                up = self.engine.feed_pair(p1, p2, meta=meta)
+                if partner:
+                    self.watch["pairs_fed"] += 1
+            else:
+                up = self.engine.feed(p1, meta=meta)
             self._last_fed = name
             self.watch["fed"] += 1
             now = time.monotonic()
@@ -763,10 +1335,17 @@ class VslamRunner:
         json.dumps(snapshot()) stays well under a poll-friendly ~1 MB."""
         with self._lock:
             eng = self.engine
+            if eng is None:                   # auto, not enough frames yet
+                return {"status": "auto: undecided (waiting for frames)",
+                        "mode": None, "run_dir": self.run_dir,
+                        "cam": self.cam, "stats": dict(self.watch),
+                        "segments": [], "trajectory": [], "landmarks": [],
+                        "utm_align": None}
             traj = _decimate(self.trajectory, traj_cap)
             lms = _decimate(eng.landmarks, lm_cap)
             out = {
                 "status": eng.status,
+                "mode": self.decided,
                 "backend": getattr(eng.backend, "name", "?"),
                 "run_dir": self.run_dir, "cam": self.cam,
                 "scale": round(eng.scale, 4),
@@ -779,8 +1358,17 @@ class VslamRunner:
                     for e in traj],
                 "landmarks": [[round(v, 3) for v in p] for p in lms],
             }
+            if eng.mode == "stereo":
+                out["baseline_m"] = eng.baseline_m
+                out["baseline_calibrated"] = eng.baseline_calibrated
+                out["calib"] = eng.calib_status
+                p, u = eng.stats["pairs"], eng.stats["unpaired"]
+                out["pairing_rate"] = (round(p / (p + u), 3) if p + u
+                                       else None)
             # place VO (x, z) onto (xutm, yutm) when the boat has genuinely
             # moved; a dock run (single fix) never passes the spread gate.
+            # With stereo the fitted |a| doubles as a baseline check: it
+            # should sit near 1.0, and its deviation ~= the baseline error.
             pts = [(e["x"], e["z"], e["gps"]) for e in self.trajectory
                    if e.get("gps")]
         out["utm_align"] = None
@@ -822,6 +1410,15 @@ def main(argv=None):
         description="incremental VO over a run's review JPEGs")
     ap.add_argument("run_dir")
     ap.add_argument("--cam", default="cam1")
+    ap.add_argument("--mode", choices=["auto", "mono", "stereo"],
+                    default="auto",
+                    help="auto = stereo when cam2 frames pair up, else mono")
+    ap.add_argument("--baseline", type=float, default=0.30,
+                    help="stereo baseline in metres — a rig constant that is "
+                         "currently UNMEASURED; 0.30 is a placeholder and the "
+                         "output says so until --baseline-calibrated")
+    ap.add_argument("--baseline-calibrated", action="store_true",
+                    help="assert --baseline is a measured value")
     ap.add_argument("--follow", action="store_true",
                     help="keep tailing the dir for new frames (Ctrl-C to stop)")
     ap.add_argument("--json", help="write the final snapshot here")
@@ -836,21 +1433,31 @@ def main(argv=None):
                     help="'flat' = illumination flatten + CLAHE (turbid water)")
     ap.add_argument("--proc-scale", type=float, default=0.5,
                     help="feature-work downscale (0.5 proven in stereo_check)")
+    ap.add_argument("--features", type=int, default=1500,
+                    help="ORB feature budget; stereo cross-camera matching "
+                         "on real water frames roughly doubles per 2x here "
+                         "at near-zero CPU cost (measured 64->163 matches "
+                         "from 1500->5000 at +14 ms/pair)")
     a = ap.parse_args(argv)
 
     intr = Intrinsics(focal_px=a.focal, hfov_deg=a.hfov,
                       port_factor=a.port_factor)
-    eng = VslamEngine(intrinsics=intr,
-                      backend=make_backend("cpu", proc_scale=a.proc_scale,
-                                           preprocess=a.pre))
+    r = VslamRunner(poll_s=a.poll, mode=a.mode, baseline_m=a.baseline,
+                    baseline_calibrated=a.baseline_calibrated,
+                    engine_kw=dict(
+                        intrinsics=intr,
+                        backend=make_backend("cpu", n_features=a.features,
+                                             proc_scale=a.proc_scale,
+                                             preprocess=a.pre)))
 
     def show(u):
+        kf = r.engine.stats["keyframes"] if r.engine else 0
         print("kf %-4d %-32s matches %4d inliers %4d  "
               "pos (%+8.2f %+8.2f %+8.2f)  scale %s" %
-              (eng.stats["keyframes"], u.file, u.matches, u.inliers,
+              (kf, u.file, u.matches, u.inliers,
                u.x, u.y, u.z, u.scale_source))
 
-    r = VslamRunner(engine=eng, poll_s=a.poll, on_update=show)
+    r.on_update = show
     if a.follow:
         r.start(a.run_dir, cam=a.cam)
         print("following %s/%s (poll %.1fs, Ctrl-C to stop)"
@@ -866,11 +1473,22 @@ def main(argv=None):
 
     snap = r.snapshot(traj_cap=10 ** 6, lm_cap=10 ** 6)
     s = snap["stats"]
-    print("done: %d frames -> %d keyframes in %d segment(s); "
+    if "frames" not in s:                     # auto never decided (no frames)
+        print("done: %s" % snap["status"])
+        return 0
+    print("done: mode=%s, %d frames -> %d keyframes in %d segment(s); "
           "%d still, %d lost, %d corrupt, %d reinits; scale=%s; %s"
-          % (s["frames"], s["keyframes"], len(snap["segments"]), s["still"],
-             s["lost"], s["corrupt"], s["reinits"], snap["scale_source"],
-             snap["status"]))
+          % (snap.get("mode"), s["frames"], s["keyframes"],
+             len(snap["segments"]), s["still"], s["lost"], s["corrupt"],
+             s["reinits"], snap["scale_source"], snap["status"]))
+    if snap.get("mode") == "stereo":
+        print("stereo: pairing %s (%d pairs, %d unpaired, %d cam2 dropped, "
+              "%d orphans); %s"
+              % (snap.get("pairing_rate"), s["pairs"], s["unpaired"],
+                 s["cam2_dropped"], s.get("cam2_orphans", 0), snap["calib"]))
+        if s.get("gps_ratio") is not None:
+            print("gps cross-check: stereo/GPS track length ratio %.3f "
+                  "(1.0 = baseline correct)" % s["gps_ratio"])
     if a.json:
         with open(a.json, "w") as fh:
             json.dump(snap, fh)
