@@ -1460,13 +1460,31 @@ class Gpio:
 # lazily so nodes without it still run.
 # ---------------------------------------------------------------------------
 class Imu:
-    """Owns the IMU reader and keeps trying to (re)acquire it.
+    """Owns one IMU reader slot and keeps trying to (re)acquire it.
 
     The IMU is a USB-serial device; it may be plugged in after piagent starts,
     moved between ports, or drop out. So detection runs in a background loop
     that probes until a device answers, samples it, and re-probes if the reader
     ever dies — no service restart needed when the user reseats it.
+
+    This class is now a SLOT: everything below works for any driver module
+    speaking the imu_yb duck-type (module probe(); ImuReader with read/latest/
+    window/rate_hz/... — the getattr() fallbacks already assumed exactly
+    that), so the second physical unit (Imu2, the Olive at cam2) is a second
+    INSTANCE with different class attributes, not a second copy of this
+    machinery. The attributes exist because the two devices' normals differ:
+    a floor tuned to the YB's 50 Hz attitude cadence judged against a unit
+    whose healthy cadence is unknown until bring-up would alarm always or
+    never, and either way nobody reads it.
     """
+
+    MODULE = "imu_yb"                    # driver module this slot loads
+    TAG = "imu"                          # log tag; slot 2 logs as "imu2"
+    ABSENT_MSG = ("no IMU yet - will keep probing "
+                  "(USB-serial on /dev/ttyUSB*/ttyACM*)")
+    NOMINAL_HZ = IMU_ATTITUDE_HZ_NOMINAL
+    PROBE_BAND = (0.5, 4.0)              # sane band, multiples of NOMINAL_HZ
+    FRAME_FLOOR_HZ = IMU_MIN_FRAME_HZ
 
     def __init__(self):
         self.reader = None
@@ -1478,9 +1496,10 @@ class Imu:
 
     def _acquire_loop(self):
         try:
-            import imu_yb  # noqa: E402
+            import importlib
+            mod = importlib.import_module(self.MODULE)
         except Exception as e:  # noqa: BLE001
-            log("info", "imu", "imu_yb not available", err=str(e))
+            log("info", self.TAG, "%s not available" % self.MODULE, err=str(e))
             return
         announced_absent = False
         while self._run:
@@ -1492,18 +1511,18 @@ class Imu:
                 except Exception:  # noqa: BLE001
                     fresh = False
                 if not fresh:
-                    log("warn", "imu", "IMU sampler stalled - re-acquiring")
+                    log("warn", self.TAG, "IMU sampler stalled - re-acquiring")
                     self._drop()
                 else:
                     time.sleep(2)
                     continue
             try:
-                info = imu_yb.probe()
+                info = self._probe(mod)
             except Exception:  # noqa: BLE001
                 info = None
             if info and info.get("chip"):
                 try:
-                    reader = imu_yb.ImuReader(**{
+                    reader = mod.ImuReader(**{
                         k: info[k] for k in ("bus", "port", "addr", "baud")
                         if k in info and info[k] is not None})
                     reader.open()
@@ -1512,16 +1531,19 @@ class Imu:
                         self.reader = reader
                         self.info = {"present": True, **info}
                     announced_absent = False
-                    log("info", "imu", "IMU online", **{k: info.get(k) for k in
-                        ("chip", "bus", "port", "addr", "baud")})
+                    log("info", self.TAG, "IMU online", **{k: info.get(k)
+                        for k in ("chip", "bus", "port", "addr", "baud")})
                 except Exception as e:  # noqa: BLE001
-                    log("warn", "imu", "IMU start failed", err=str(e))
+                    log("warn", self.TAG, "IMU start failed", err=str(e))
                     self._drop()
             elif not announced_absent:
                 announced_absent = True
-                log("info", "imu", "no IMU yet - will keep probing "
-                    "(USB-serial on /dev/ttyUSB*/ttyACM*)")
+                log("info", self.TAG, self.ABSENT_MSG)
             time.sleep(4)
+
+    def _probe(self, mod):
+        """One probe pass. A hook so Imu2 can pass its configured spec."""
+        return mod.probe()
 
     @staticmethod
     def _reader_fresh(reader):
@@ -1552,13 +1574,13 @@ class Imu:
         figure is only trusted inside a sane band around the nominal cadence,
         so a probe taken while the device was already sick cannot lower the
         bar on itself for the rest of the session."""
-        base = IMU_ATTITUDE_HZ_NOMINAL
+        base = self.NOMINAL_HZ
         try:
             probed = float(self.info.get("sample_rate_hz") or 0.0)
         except (TypeError, ValueError):
             probed = 0.0
-        if 0.5 * IMU_ATTITUDE_HZ_NOMINAL <= probed \
-                <= 4.0 * IMU_ATTITUDE_HZ_NOMINAL:
+        if self.PROBE_BAND[0] * self.NOMINAL_HZ <= probed \
+                <= self.PROBE_BAND[1] * self.NOMINAL_HZ:
             base = probed
         return round(base * IMU_ATTITUDE_LOW_FRAC, 1)
 
@@ -1628,13 +1650,13 @@ class Imu:
                 # checked rather than trusted. None until measured, so the
                 # first second of streaming cannot false-alarm.
                 h["attitude_floor_hz"] = self._attitude_floor_hz()
-                h["frame_floor_hz"] = IMU_MIN_FRAME_HZ
+                h["frame_floor_hz"] = self.FRAME_FLOOR_HZ
                 if not measured:
                     h["imu_rate_low"] = None
                 else:
                     low = att is not None and att < h["attitude_floor_hz"]
                     if h["frame_hz"] is not None and \
-                            h["frame_hz"] < IMU_MIN_FRAME_HZ:
+                            h["frame_hz"] < self.FRAME_FLOOR_HZ:
                         low = True
                     h["imu_rate_low"] = low
                 # Frames the decoder refused (checksum mismatch, out-of-range
@@ -1671,8 +1693,86 @@ class Imu:
         self._drop()
 
 
+# Second-IMU slot configuration. Values (case kept for device paths):
+#   (unset) / "auto"        auto-probe: /dev/ttyACM* scan, then a UDP dwell
+#   "off"|"0"|"none"        disabled — no thread, /health answers present:false
+#   "olive"                 auto-probe, explicitly
+#   "olive:/dev/ttyACM0"    that serial device
+#   "olive:udp[:port]"      UDP listener (default port: imu_olive's 9901)
+#   "olive:sim"             synthetic stream (offline tests)
+IMU2_SPEC = os.environ.get("PIAGENT_IMU2", "")
+
+
+class Imu2(Imu):
+    """Second IMU slot — the Olive olixVision X1 at cam2 (rig/imu_olive.py).
+
+    A second Imu INSTANCE, not new machinery: only the driver module, the
+    config gate and the rate floors differ. Deliberately isolated from the
+    fire path the same way slot 1 always was — its reader runs its own
+    thread, every endpoint call is try/except'd in the base class, and the
+    acquire loop shares nothing with Gpio — so a wedged or absent olive can
+    stall neither a fire nor the YB sampler. When the unit is absent the slot
+    behaves exactly like slot 1 before an IMU was ever plugged in: probe,
+    find nothing, answer {present:false}. Zero change to any /imu/* payload.
+    """
+
+    MODULE = "imu_olive"
+    TAG = "imu2"
+    ABSENT_MSG = ("no second IMU yet - will keep probing "
+                  "(olixVision on /dev/ttyACM* or UDP)")
+    # The X1's healthy attitude cadence is UNKNOWN until bring-up (ROS-native
+    # units commonly run 100-400 Hz). Wide probe band so the measured normal
+    # can raise the bar honestly, and a frame floor low enough that a unit we
+    # have never measured cannot ring imu_rate_low all day; tighten both from
+    # the probe figures once the device is on the bench (docs/olive-imu.md).
+    PROBE_BAND = (0.5, 20.0)
+    FRAME_FLOOR_HZ = 10.0
+
+    def __init__(self, spec=None):
+        raw = (IMU2_SPEC if spec is None else spec).strip()
+        low = raw.lower()
+        self.enabled = low not in ("off", "0", "none", "disabled", "no")
+        self.spec = None                     # None = imu_olive autodetect
+        if low.startswith("olive"):
+            self.spec = raw[len("olive"):].lstrip(":") or None
+        elif raw and low != "auto" and self.enabled:
+            self.spec = raw                  # bare "/dev/ttyACM0" / "udp:9901"
+        self._last_probe = None
+        if not self.enabled:
+            # No acquire thread at all: disabled must cost nothing, and the
+            # query surface below still needs its fields to answer.
+            self.reader = None
+            self.info = {"present": False}
+            self._lock = threading.Lock()
+            self._run = False
+            return
+        super().__init__()
+
+    def _probe(self, mod):
+        info = mod.probe(self.spec)
+        # Keep the last probe verdict readable from /health even while
+        # absent: bring-up needs "the port exists but speaks 240 undecoded
+        # bytes (hex follows)" without a shell on the node — that raw tail is
+        # the whole point of the tolerant driver.
+        if isinstance(info, dict) and not info.get("present"):
+            self._last_probe = {k: info[k] for k in
+                                ("notes", "raw_tail_hex") if k in info}
+        else:
+            self._last_probe = None
+        return info
+
+    def health(self):
+        h = super().health()
+        h["enabled"] = self.enabled
+        lp = self._last_probe
+        if not h.get("present") and lp:
+            h["probe"] = lp
+        return h
+
+
 GPIO = Gpio()
 IMU = Imu()
+IMU2 = Imu2()
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +1793,24 @@ def _load1():
         return None
 
 
+def _imu_health():
+    """Slot-1 health with slot 2 nested INSIDE it as `imu2`.
+
+    Nested rather than a sibling top-level key because rigd's fleet snapshot
+    forwards h["imu"] verbatim ("imu": h.get("imu")), so the second unit
+    reaches the fleet view and the anomaly scan through plumbing that already
+    exists — a sibling would be silently dropped by every host until a host
+    release. Additive only: every pre-imu2 key of the section is untouched,
+    and a wedged slot-2 health can never take /health (and with it the
+    host's clock-offset sample) down."""
+    h = IMU.health()
+    try:
+        h["imu2"] = IMU2.health()
+    except Exception as e:  # noqa: BLE001
+        h["imu2"] = {"present": False, "error": str(e)}
+    return h
+
+
 def health():
     # Stamp the clock FIRST. The host derives this node's clock offset as
     # time.epoch minus the midpoint of its request round trip; the stamp used
@@ -1711,7 +1829,7 @@ def health():
         # deploy) must not read as a power loss on the host.
         "host_uptime_s": _host_uptime(),
         "gpio": GPIO.state(),
-        "imu": IMU.health(),
+        "imu": _imu_health(),
         "disk_free_mb": _disk_free_mb(CAM_SAVE_DIR),
         "cam_frames": _count_frames(),
         "load1": _load1(),
@@ -1777,6 +1895,15 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _body(self):
+        """POST body as a dict, or None for a body that FAILED to parse.
+
+        The two used to be the same answer, {} - so a truncated JSON body on a
+        state-changing endpoint proceeded on defaults: /gpio/fire with a
+        mangled at_epoch fired NOW instead of at the scheduled instant,
+        /gpio/focus dropped a hold it was asked to extend. A missing body is
+        an intentional "all defaults" call (several endpoints are used that
+        way); a PRESENT body that cannot be parsed is a client bug and must be
+        a 400, never a guess (audit 2026-08-27)."""
         try:
             n = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
@@ -1784,9 +1911,10 @@ class Handler(BaseHTTPRequestHandler):
         if n <= 0 or n > 1 << 20:
             return {}
         try:
-            return json.loads(self.rfile.read(n).decode() or "{}")
+            doc = json.loads(self.rfile.read(n).decode() or "{}")
+            return doc if isinstance(doc, dict) else None
         except (ValueError, OSError):
-            return {}
+            return None
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -1805,6 +1933,19 @@ class Handler(BaseHTTPRequestHandler):
                 t0 = float(q.get("t0", 0) or 0)
                 t1 = float(q.get("t1", time.time()) or time.time())
                 self._send(IMU.window(t0, t1))
+            # The second IMU gets its OWN endpoints, not an "imu2" key inside
+            # /imu/*: (a) /imu/latest's success payload IS the bare sample
+            # dict — there is no envelope to hang a sub-object on without
+            # polluting the key namespace flight_log reads by name; (b) rigd
+            # elects the MASTER orientation source by probing /imu/latest for
+            # an `epoch`, so the olive answering there would race the YB for
+            # master. Same shapes as /imu/*; runbook: docs/olive-imu.md.
+            elif path == "/imu2/latest":
+                self._send(IMU2.latest())
+            elif path == "/imu2/window":
+                t0 = float(q.get("t0", 0) or 0)
+                t1 = float(q.get("t1", time.time()) or time.time())
+                self._send(IMU2.window(t0, t1))
             elif path == "/gpio/exposure/events":
                 since = int(q.get("since", 0) or 0)
                 self._send(GPIO.exposure_events(since))
@@ -1819,6 +1960,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         b = self._body()
+        if b is None:
+            self._send({"ok": False,
+                        "error": "request body is not valid JSON"}, 400)
+            return
         try:
             if path == "/gpio/focus":
                 # Optional ttl_s: the hold lease length; absent means the
@@ -1858,13 +2003,15 @@ def main():
         log("info", "lifecycle", "piagent stopping")
         GPIO.shutdown()
         IMU.shutdown()
+        IMU2.shutdown()
         os._exit(0)
 
     signal.signal(signal.SIGINT, _bye)
     signal.signal(signal.SIGTERM, _bye)
 
     log("info", "lifecycle", "piagent up", port=PORT, chip=GPIOCHIP,
-        gpio=GPIO.available, imu=IMU.info.get("present", False))
+        gpio=GPIO.available, imu=IMU.info.get("present", False),
+        imu2=IMU2.info.get("present", False), imu2_enabled=IMU2.enabled)
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     try:
@@ -1872,6 +2019,7 @@ def main():
     finally:
         GPIO.shutdown()
         IMU.shutdown()
+        IMU2.shutdown()
 
 
 if __name__ == "__main__":

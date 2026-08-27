@@ -1,17 +1,31 @@
 [Unit]
-Description=Wild Sync rigd - Jetson fleet orchestrator + web UI
+Description=Wild Sync rigd - fleet orchestrator + web UI
 After=network-online.target chrony.service
 Wants=network-online.target
 
+# TEMPLATE - deploy/deploy.sh jetson renders __REPO__ and __USER__ from the
+# checkout it runs in and installs the result. The old unit hardcoded a
+# 'wildtech' user and a repo path that exists on no current machine, so a
+# fresh Jetson enabled a service that could never start (audit 2026-08-27).
+
 [Service]
 Type=simple
-User=wildtech
-WorkingDirectory=/home/wildtech/coyotethings/wildsync/rig
-ExecStart=/usr/bin/python3 -u /home/wildtech/coyotethings/wildsync/rig/rigd.py
+User=__USER__
+WorkingDirectory=__REPO__/rig
+ExecStart=/usr/bin/python3 -u __REPO__/rig/rigd.py
 Restart=always
 RestartSec=3
 # nav needs the iKonvert serial port
 SupplementaryGroups=dialout
+# The capture scheduler needs prompt wakeups; the macOS twin runs as
+# ProcessType Interactive for the same reason (measured there: default timer
+# coalescing made 99/141 shots late at a 2 s cadence). Modest priority, no
+# realtime - the fire path itself is sub-ms.
+Nice=-10
+# The stop path finalises an active run (manifest, flight logs); rigd caps its
+# own finalisation at 12 s, and the launchd twin carries the same 60 s budget
+# so a slow-but-healthy stop is never cut short.
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

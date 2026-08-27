@@ -1037,3 +1037,81 @@ steps applied live (manual → ISO step; auto → servo target shift).
 - `rig/piagent.py`, `rig/rigd.py`, `rig/rig_ui.html`, `rig/deploy.sh`,
   systemd units (core, written by the session lead). Python stdlib only in
   services; pyserial allowed (apt `python3-serial`).
+
+---
+
+## Additions 2026-08-27 — projects, diagnostics, second IMU, node recovery
+
+### Project layer (host)
+
+`rig/project.py` owns where data lands. A project is
+`~/wildsync-projects/<slug>/{project.json, runs/, raw/, exports/}`; the active
+slug lives in `~/wildsync-projects/active.json`. With no active.json the
+implicit **legacy** project wraps the pre-project layout (`~/rig-runs`,
+`~/rig-raw`) unchanged — nothing is migrated, ever. Switching projects
+reassigns `rigcore.RUNS_DIR` (the only sanctioned writer) and is REFUSED while
+a run or drain is active.
+
+- `GET  /api/project` → `{active, explicit}` (`explicit` = an operator has
+  ever chosen one; the UI shows the intro screen when false)
+- `GET  /api/projects` → `{projects:[{slug,name,runs,last_run,active,…}]}`
+- `POST /api/project/create {name, vessel?, site?, operator?, notes?}`
+- `POST /api/project/open {slug}` · `POST /api/project/update {slug, fields}`
+
+### Diagnostics / operations (host)
+
+- `GET  /api/run/zip?id=<run_id>` — builds (or reuses)
+  `<project>/exports/<run_id>.zip` (ZIP_STORED) and serves it with a real
+  Content-Length. The export is a durable artifact, not a stream.
+- `POST /api/node/format {node, confirm:"format", quick?}` — proxies the
+  node's card format with rigd's guards: refused during a run, during a
+  drain, and for a disconnected camera; journalled warn/info/error. The node
+  side (`ilxctl /api/format`) itself completes only on the body's
+  `CrWarning_Format_Complete` and re-reads RemainingNumber.
+- `POST /api/power` (node, ilxctl) `{op:"off"|"on", confirm:"power"}` — SDK
+  body power. **Over USB, PowerOff is one-way**: the standby body enumerates
+  as a generic gadget the SDK cannot claim; wake it with a harness full-press
+  (`/gpio/focus {hold:true}` then `/gpio/fire`).
+- `GET  /api/props` (node, ilxctl) — the body's raw property table
+  `[{code,value,enable,type,nvalues}]`; the diffing tool that found the
+  movie-mode flip.
+- `/api/fleet` node views now carry `remaining_shots` and `program`.
+
+### Run integrity (contract additions)
+
+- A mid-run camera drop **pauses** the grid; resume requires the camera
+  CONNECTED again *and* a probe fire whose own frame arrives in the spool.
+  A pulse alone is not proof (piagent cannot see exposures) — this is what
+  ended the pause/resume oscillation that shot unpaired frames.
+- Host frame writes are `.part` + fsync + rename, then the directory is
+  fsynced, **before** the Pi spool copy is deleted; index.jsonl and
+  flight_log.csv rows are fsynced per append. "Verified on host disk" is now
+  literally true at the moment of spool deletion.
+- Frames the run knowingly failed to keep are recorded in
+  `<run>/unpulled.jsonl` (`{ts,cam,orig,reason,cmd_epoch?}`); ingest reports
+  them and names each unmatched row's nearest staged file with its residual.
+- Ingest time-matching tolerance is capped at 0.45 × the run's own
+  `interval_s` (falls back to the global 0.75 s only for unknown intervals),
+  so a hole in the staged card files yields honest unmatched rows instead of
+  cascading every later RAW onto the previous frame's identity.
+- The pull path rejects: size-0/unsized listings (retry), truncated reads,
+  bad JPEG SOI/EOI, bad ARW TIFF magic, bad HEIF ftyp.
+
+### Second IMU (piagent)
+
+`PIAGENT_IMU2=off|olive[:device|udp[:port]|sim]` arms slot 2
+(`rig/imu_olive.py`, Olive olixVision X1). Endpoints `GET /imu2/latest` and
+`GET /imu2/window` mirror `/imu/*` shapes; `/health`'s `imu` section gains a
+nested `imu2`. With the slot absent every payload is byte-identical to the
+single-IMU protocol. See `docs/olive-imu.md` for bring-up and the fusion
+(ESKF) roadmap.
+
+### Known-physical facts recorded here so nobody re-debugs them
+
+- cam1's card is ~64 GB class, cam2's ~512 GB class (measured: both bodies
+  price a frame at ~38 MB — 33 MB LossLessL ARW + S-Fine JPEG — and report
+  1325 vs 10873 shots after a format). Same settings, different cards. Swap
+  cam1 to a matching V60 512 GB for long transects.
+- A node service restart can leave a body in **Movie M** (still properties
+  withdrawn, RemainingNumber=0, stills refused, formats still fine). The
+  fleet vector now pins `program=1` and self-heals it within one reconcile.
