@@ -340,6 +340,15 @@ private:
     int m_connectResult = 0;  // 0 pending, 1 ok, -1 failed
     CrInt32u m_lastError = 0;
 
+    // Format completion handshake. The SDK reports the end of a card format
+    // only through OnWarning (CrWarning_Format_Complete / _Failed / _Invalid /
+    // _Canceled); formatMedia arms this and waits for the callback.
+    std::mutex m_fmtMutex;
+    std::condition_variable m_fmtCv;
+    bool m_fmtArmed = false;
+    int m_fmtOutcome = 0;     // 0 pending, 1 complete, -1 failed/invalid/canceled
+    CrInt32u m_fmtWarning = 0;
+
     // Intervalometer. m_intervalThreadMutex guards join/assign of the thread
     // object itself (two HTTP threads may race stop against stop/start); it is
     // separate from m_intervalMutex because the loop takes that one to publish
