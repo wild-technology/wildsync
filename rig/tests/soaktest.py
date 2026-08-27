@@ -1499,8 +1499,11 @@ def suite_pull(opts):
         real_open = open
 
         def enospc(path, *a_, **k_):
+            # Frames are written via a .jpg.part temp then renamed (atomic
+            # write, audit 2026-08-27) - the injection must hit the temp name
+            # or the scenario silently stops testing anything.
             if isinstance(path, str) and path.startswith(cam) \
-                    and path.endswith(".jpg"):
+                    and path.endswith((".jpg", ".jpg.part")):
                 raise OSError(errno.ENOSPC, "No space left on device", path)
             return real_open(path, *a_, **k_)
 
