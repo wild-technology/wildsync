@@ -47,8 +47,17 @@ SCHEMA = 1
 
 # The implicit wrapper for the pre-project layout. Reserved slug.
 LEGACY_SLUG = "legacy"
-LEGACY_RUNS = os.path.expanduser("~/rig-runs")
 LEGACY_RAW = os.path.expanduser("~/rig-raw")
+
+
+def _legacy_runs():
+    # The CURRENT rigcore.RUNS_DIR, not a hardcoded ~/rig-runs: the offline
+    # suites point rigcore.RUNS_DIR at a temp tree and then construct Rig,
+    # whose project startup() must wrap THAT tree - stomping the patch wrote
+    # fixture runs into the real survey directory (observed 2026-08-27:
+    # audit-latch/audit-drain junk in ~/rig-runs). In production nothing has
+    # touched rigcore.RUNS_DIR before startup(), so this IS ~/rig-runs.
+    return rigcore.RUNS_DIR
 
 _lock = threading.RLock()
 _active = None            # cached active project doc, or None before startup()
@@ -80,7 +89,7 @@ def _legacy_doc():
     return {
         "slug": LEGACY_SLUG, "name": "Legacy (pre-project data)",
         "schema": SCHEMA, "created": None, "legacy": True,
-        "runs_dir": LEGACY_RUNS, "raw_dir": LEGACY_RAW,
+        "runs_dir": _legacy_runs(), "raw_dir": LEGACY_RAW,
         "exports_dir": os.path.join(PROJECTS_ROOT, LEGACY_SLUG + "-exports"),
         "vessel": "", "site": "", "operator": "", "notes": "",
     }
