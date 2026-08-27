@@ -751,6 +751,17 @@ CONVERGE_FIELDS = {
     "shutter": ("shutter", "shutterValue"),
     "iso": ("iso", "isoValue"),
     "drive": ("drive", "driveValue"),
+    # Still/movie is fleet policy, not a tunable: a body in a Movie_* program
+    # (0x8050+) withdraws every still property - RemainingNumber reads 0,
+    # DriveMode disappears, and both the SDK release and the harness TRIGGER
+    # are silently refused. Observed live 2026-08-27: a node service restart
+    # left cam2 in Movie M (the Pi's released GPIO lines fall to power-on
+    # bias and weakly assert the harness inputs; the body reads the long
+    # "press" as a movie-record gesture), and nothing reconciled or alarmed
+    # because program was not in the vector. With it here, a movie flip
+    # self-heals within one 3 s reconcile pass and diverges honestly if the
+    # write does not take.
+    "program": ("program", "programValue"),
     # The capture-format fields are readable on ilxctl builds that emit the
     # <name>Value keys (contract C2, 2026-08-23) and BLIND on older builds. A
     # blind field is converged optimistically against the last-pushed cache, so
@@ -859,6 +870,7 @@ DEFAULT_DESIRED = {
     "iso": 400,
     "expcomp": 0,
     "drive": DRIVE_SINGLE,
+    "program": 1,                    # still Manual - never a Movie_* program
     "focus_mode": 1,                 # MF for a fixed survey rig
     "filetype": 3,                   # RAW+JPEG (FIELD-RUN §4: full RAW on card)
     "imagesize": 3,                  # S — the JPEG is a review proxy, RAW is data
