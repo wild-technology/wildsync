@@ -2078,8 +2078,21 @@ bool Camera::formatMedia(bool quick, std::string& err) {
     }
     const CrInt32u cmd = quick ? SDK::CrCommandId_MediaQuickFormat
                                : SDK::CrCommandId_MediaFormat;
+    // Down THEN Up, like every other command on this body. Sending only the
+    // Down half dispatches a button-press that is never released, so the body
+    // does nothing at all - and because sendCmd succeeded, /api/format answered
+    // {"ok":true} and the caller believed the card had been erased. Observed
+    // 2026-08-27: two quick-format calls both returned ok, and remainingShots
+    // did not move by a single frame on either body over 32 s. A destructive
+    // operation reporting success without doing anything is the worst possible
+    // direction for this particular lie to point.
     if (!sendCmd(cmd, SDK::CrCommandParam_Down, err)) {
         log("Card format failed: " + err);
+        return false;
+    }
+    std::this_thread::sleep_for(35ms);
+    if (!sendCmd(cmd, SDK::CrCommandParam_Up, err)) {
+        log("Card format failed (release): " + err);
         return false;
     }
     log(quick ? "Card quick format started" : "Card format started");
