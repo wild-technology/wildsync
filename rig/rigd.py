@@ -605,7 +605,11 @@ class Anomalies:
         out = []
         now = time.time()
         run = self.runmgr.status()
-        for m in self.monitors:
+        # Only nodes actually in the fleet. A switched-off node, or an optional
+        # one that was never on the boat, must not raise node_offline - that
+        # permanent red badge is exactly why a third slot was removed from
+        # _DEFAULT_NODES in the first place (rigcore.py).
+        for m in [x for x in self.monitors if x.is_present()]:
             snap = m.snapshot()
             st = snap["state"]
             h = snap.get("health") or {}
@@ -615,13 +619,20 @@ class Anomalies:
                                    {"last_seen_s": snap.get("age_s")},
                                    "check power, network, and that ilxctl/"
                                    "piagent are running", sev="bad"))
-            elif st == NodeMonitor.REACHABLE:
+                continue
+            # A switched-off camera silences the CAMERA checks only. The box
+            # checks below - undervoltage, rebooted, disk_low, imu_stall - stay
+            # armed, and on a node kept alive purely to host the strobe they are
+            # the ONLY warning you get that it is in trouble. An earlier version
+            # of this guard was a bare `continue` here and silenced those too.
+            cam_ok = m.camera_enabled
+            if cam_ok and st == NodeMonitor.REACHABLE:
                 out.append(self._a("camera_absent", m.name_,
                                    "node up but camera not claimed",
                                    {"log": (status.get("log") or [])[-1:]},
                                    "check USB cable is a data cable, camera on, "
                                    "PC Remote mode", sev="bad"))
-            elif st == NodeMonitor.ILX_DOWN:
+            elif cam_ok and st == NodeMonitor.ILX_DOWN:
                 out.append(self._a(
                     "ilx_down", m.name_,
                     "ilxctl not answering (piagent is) - camera daemon wedged",
@@ -633,7 +644,7 @@ class Anomalies:
                     "sudo systemctl start ilxctl (or pull the Pi's PoE for "
                     "10 s). Fires still work; frames will NOT be delivered",
                     sev="bad"))
-            if st == NodeMonitor.CONNECTED and \
+            if cam_ok and st == NodeMonitor.CONNECTED and \
                     str(status.get("slotStatus", "")).lower() in ("no card", "nocard"):
                 out.append(self._a(
                     "card_missing", m.name_,
@@ -646,7 +657,7 @@ class Anomalies:
                     sev="bad"))
             ts = getattr(self, "timesync", None)
             off = ts.exif_offset.get(m.name_) if ts else None
-            if off is not None and abs(off) > 60:
+            if cam_ok and off is not None and abs(off) > 60:
                 days = abs(off) / 86400.0
                 out.append(self._a(
                     "camera_clock_wrong", m.name_,
@@ -665,7 +676,8 @@ class Anomalies:
             # stay small during a run. A climbing count means deletes are
             # failing (read-only spool, permission) and the Pi WILL fill.
             cf = h.get("cam_frames")
-            if isinstance(cf, (int, float)) and cf > 400 and run.get("active"):
+            if cam_ok and isinstance(cf, (int, float)) and cf > 400 \
+                    and run.get("active"):
                 out.append(self._a(
                     "spool_not_draining", m.name_,
                     "%s PC-save spool holds %d files during a run" % (m.name_, cf),
@@ -739,7 +751,7 @@ class Anomalies:
                        or bool(getattr(m, "suspend_control", False))
                        or status.get("controlMode") == "transfer")
             locked = bool(blind) and not excused
-            if locked:
+            if cam_ok and locked:
                 out.append(self._a(
                     "body_locked", m.name_,
                     "%s property table unavailable - body busy/locked"
@@ -753,7 +765,7 @@ class Anomalies:
                     "V60/UHS-II card. Frames will not deliver until then",
                     sev="bad"))
             conv = snap.get("convergence") or {}
-            if st == NodeMonitor.CONNECTED and not blind and not excused \
+            if cam_ok and st == NodeMonitor.CONNECTED and not blind and not excused \
                     and conv.get("synced") is False and conv.get("diverged"):
                 # Name the ilxctl error where there is one: for filetype /
                 # imagesize / transsize there is no readback, so the body's own
@@ -779,7 +791,7 @@ class Anomalies:
             # operator to reformat a card during a plain power loss (audit
             # 2026-08-23).
             oh = status.get("overheatingLabel") if st == NodeMonitor.CONNECTED else None
-            if oh in ("pre-overheat", "OVERHEATING"):
+            if cam_ok and oh in ("pre-overheat", "OVERHEATING"):
                 out.append(self._a("camera_overheating", m.name_,
                                    "body overheating (%s)" % oh,
                                    {"overheating": status.get("overheating"),
@@ -790,7 +802,7 @@ class Anomalies:
                                    "and cool it now",
                                    sev="bad" if oh == "OVERHEATING" else "warn"))
             sw = status.get("slotWritingLabel") if st == NodeMonitor.CONNECTED else None
-            if sw == "WRITING":
+            if cam_ok and sw == "WRITING":
                 since = self._writing_since.setdefault(m.name_, now)
                 held = now - since
                 if held > SLOT_WRITING_STUCK_S:
@@ -819,7 +831,7 @@ class Anomalies:
             # 2026-08-23). Same CONNECTED gate the card/overheat checks use.
             pk = status.get("priorityKeyLabel") if st == NodeMonitor.CONNECTED \
                 else None
-            if pk == "Camera position":
+            if cam_ok and pk == "Camera position":
                 out.append(self._a(
                     "pc_control_lost", m.name_,
                     "the body has taken control priority back",
@@ -829,7 +841,7 @@ class Anomalies:
                     "bug. Set the body's priority back to PC remote",
                     sev="bad"))
             batt = status.get("battery") if st == NodeMonitor.CONNECTED else None
-            if isinstance(batt, (int, float)) and 0 <= batt <= 15:
+            if cam_ok and isinstance(batt, (int, float)) and 0 <= batt <= 15:
                 out.append(self._a("battery_low", m.name_,
                                    "battery low (%s%%)" % batt, {"battery": batt},
                                    "bring the 12 V harness supply up or swap "
@@ -973,7 +985,8 @@ class Anomalies:
         # live journal shows what that costs: single-scan "82.9 ms" skew alarms
         # while chronyc had the two Pis 20 us apart.
         clocked, unmeasurable = [], []
-        for m in self.monitors:
+        # A node outside the fleet has no clock worth comparing.
+        for m in [x for x in self.monitors if x.is_present()]:
             if m.snapshot()["state"] == NodeMonitor.OFFLINE:
                 continue          # a node that is not answering has no clock
             info = m.clock_offset_info()
@@ -1106,6 +1119,17 @@ class Rig:
                          % (proj["name"], proj["runs_dir"]),
                          slug=proj["slug"])
         self.monitors = [NodeMonitor(n, self.events) for n in NODES]
+        # Restore the operator's on/off switch before anything reads the fleet.
+        self._camera_enabled = rigcore.load_camera_enabled()
+        for m in self.monitors:
+            m.camera_enabled = self._camera_enabled.get(m.name_, True)
+            if not m.camera_enabled:
+                self.events.emit("warn", "camera_disabled",
+                                 "%s's CAMERA is switched off by the operator "
+                                 "- it joins no runs and raises no camera "
+                                 "anomalies. The node itself stays in the "
+                                 "fleet and can still host the strobe."
+                                 % m.name_, node=m.name_)
         self.settings = SettingsManager(self.monitors, self.events)
         self.timesync = TimeSync(self.events)
         self.nav = self._start_nav()
@@ -1637,7 +1661,8 @@ class Rig:
         survey frames."""
         deadline = time.time() + 90
         while time.time() < deadline:
-            live = [m for m in self.monitors if m.is_connected()]
+            live = [m for m in self.monitors
+                    if m.is_connected() and m.is_capturing()]
             if len(live) >= 1:
                 time.sleep(3)          # let the property tables settle
                 # A run started during the boot window does its own
@@ -1740,8 +1765,53 @@ class Rig:
             "anomalies": self.anomalies.scan(),
         }
 
+    def active_monitors(self):
+        """Monitors the rig should actually reason about right now.
+
+        Drops nodes the operator switched off, and OPTIONAL nodes that have
+        never answered since start - "cam3 is not on the boat today" then reads
+        as a two-camera rig everywhere (header 2/2, no anomalies) instead of a
+        permanent fault. Everything operator-facing goes through here; the raw
+        self.monitors list stays available for the few places that must see a
+        disabled node (the toggle itself, and /api/nodes)."""
+        return [m for m in self.monitors if m.is_present()]
+
+    def capturing_monitors(self):
+        """Nodes whose CAMERA takes part. Narrower than active_monitors():
+        excludes a node the operator switched the camera off on, which is still
+        a live box in the fleet and still a candidate strobe host."""
+        return [m for m in self.monitors if m.is_capturing()]
+
+    def set_camera_enabled(self, name, on):
+        m = next((x for x in self.monitors if x.name_ == name), None)
+        if m is None:
+            raise ValueError("unknown node %s" % name)
+        on = bool(on)
+        if m.camera_enabled != on:
+            m.camera_enabled = on
+            self._camera_enabled[name] = on
+            try:
+                rigcore.save_camera_enabled(self._camera_enabled)
+            except OSError as e:
+                # The switch still takes effect for this session; say so rather
+                # than letting the operator believe it survived a restart.
+                self.events.emit("error", "camera_enabled_unsaved",
+                                 "%s camera switched %s but the setting could "
+                                 "not be saved (%s)"
+                                 % (name, "ON" if on else "OFF", e), node=name)
+            else:
+                self.events.emit("warn" if not on else "info", "camera_enabled",
+                                 "%s camera switched %s by the operator"
+                                 % (name, "ON" if on else "OFF"), node=name)
+        return {"ok": True, "node": name, "camera_enabled": m.camera_enabled,
+                "cameras": len(self.capturing_monitors()),
+                "nodes": len(self.active_monitors())}
+
     def fleet(self):
-        return {"nodes": [self._node_view(m) for m in self.monitors],
+        return {"nodes": [self._node_view(m) for m in self.active_monitors()],
+                "absent": [{"name": m.node["name"], "cam_num": m.node["cam_num"],
+                            "host": m.host, "reason": "optional, never seen"}
+                           for m in self.monitors if not m.is_present()],
                 "run": self.runmgr.status(),
                 "preview": self.settings.preview_state(),
                 "jetson_free_mb": free_mb(rigcore.RUNS_DIR),
@@ -1763,6 +1833,9 @@ class Rig:
         return {
             "name": m.name_, "cam_num": m.node["cam_num"], "host": m.host,
             "state": snap["state"], "age_s": snap.get("age_s"),
+            # False = the operator switched this CAMERA off. The node is still
+            # here (polled, clocked, strobe-capable); it just takes no frames.
+            "camera_enabled": m.camera_enabled,
             "connected": status.get("connected", False),
             "model": status.get("model"), "id": status.get("id"),
             "battery": status.get("battery"),
@@ -1864,6 +1937,13 @@ class Rig:
                 continue
             if not m.is_connected():
                 skipped[m.name_] = "node not connected"
+                continue
+            if not m.is_capturing():
+                # These endpoints DRIVE THE LENS MOTOR. A camera the operator
+                # switched off must not have its focus or zoom moved by a
+                # fleet-wide call - the rig is manual focus and a moved lens
+                # invalidates the calibration it was left on.
+                skipped[m.name_] = "camera switched off"
                 continue
             p = dict(payload)
             if field and field in p and range_key:
@@ -2500,6 +2580,17 @@ class Handler(BaseHTTPRequestHandler):
                 if node is not None:
                     node = self._node(node, '"node"').name_
                 self._json(RIG.settings.preview(b, node=node))
+            elif p == "/api/camera/enabled":
+                # {"node": "cam3", "enabled": false} - turns that node's CAMERA
+                # off, not the node. Deliberately NOT keyed on connectivity:
+                # the point is to stop a camera that is online and working from
+                # drawing power and spooling frames nobody wants on this dive.
+                # The Pi stays in the fleet and can still host the strobe.
+                # Persisted, so it survives a restart.
+                name = self._node(b.get("node"), '"node"').name_
+                if "enabled" not in b:
+                    raise BadRequest('"enabled" (true/false) is required')
+                self._json(RIG.set_camera_enabled(name, b["enabled"]))
             elif p == "/api/settings/commit":
                 self._json(RIG.settings.commit())
             elif p in ("/api/project/create", "/api/project/open",
@@ -2629,7 +2720,8 @@ class Handler(BaseHTTPRequestHandler):
                 # skip, so it clears the mark (see Rig.start_drain).
                 nodes = b.get("nodes")
                 if nodes is None:
-                    nodes = [m.name_ for m in RIG.monitors if m.is_connected()]
+                    nodes = [m.name_ for m in RIG.monitors
+                             if m.is_connected() and m.is_capturing()]
                 elif not isinstance(nodes, list):
                     raise BadRequest('"nodes" must be a list of node names')
                 else:

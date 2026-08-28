@@ -25,3 +25,11 @@ __pycache__/
 # Runtime state (rigd writes these outside the repo, but be explicit)
 *.jsonl
 .DS_Store
+
+# Vendor documentation trees (1.5 GB, keep local only)
+docs/basler-frame-grabber-documentation-v29-en/
+docs/basler-product-documentation-v133-en/
+
+# Linux aarch64 SDK staged for the Pi nodes (make sdk-linux). Same reason as
+# lib/: large, binary, proprietary, and staged from your own copy.
+lib-linux/
