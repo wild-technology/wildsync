@@ -47,7 +47,34 @@ import urllib.request
 RAW_FORMAT = 0xB101
 JPEG_FORMAT = 0x3801
 DEFAULT_DEST = os.path.expanduser("~/rig-raw")
-NODES = {"cam1": "192.168.1.201", "cam2": "192.168.1.202"}
+
+# Fleet addresses. rigcore is the authority: it holds _DEFAULT_NODES *and*
+# applies the ~/rig/nodes.json override, which is the only supported way a node
+# beyond the stereo pair joins (cam3, 192.168.1.203, joins that way). This file
+# used to carry its own {"cam1": ..., "cam2": ...} literal, so
+# `python3 rig/drain.py cam3` died with "unknown node cam3" on a fleet rigd was
+# driving perfectly well - a second copy of the fleet that nothing kept in step.
+#
+# The literal below survives only as a last resort, and the import is lazy and
+# guarded, because this module is documented as a STANDALONE drainer that runs
+# with rigd stopped and gets copied around on its own: without rigcore beside
+# it, it must still drain the two nodes it has always known. That path cannot
+# see anything joined via nodes.json, which is why the error message says which
+# source it consulted. --host overrides both.
+_FALLBACK_NODES = {"cam1": "192.168.1.201", "cam2": "192.168.1.202"}
+
+
+def _fleet():
+    """(name -> host, where it came from) for the whole fleet."""
+    try:
+        import rigcore
+        hosts = {n["name"]: n["host"] for n in rigcore.NODES
+                 if n.get("name") and n.get("host")}
+        if hosts:
+            return hosts, "rigcore (%s)" % rigcore.NODES_PATH
+    except Exception:  # noqa: BLE001 - no rigcore beside us, or it failed to load
+        pass
+    return dict(_FALLBACK_NODES), "drain.py's built-in fallback"
 
 
 def _req(url, body=None, timeout=200):
@@ -438,9 +465,13 @@ class Drainer:
 
 def drain_node(node, host=None, dest=DEFAULT_DEST, keep_card=False, log=print,
                limit=None):
-    host = host or NODES.get(node)
     if not host:
-        raise ValueError("unknown node %s" % node)
+        known, src = _fleet()
+        host = known.get(node)
+        if not host:
+            raise ValueError("unknown node %s - %s knows %s. Add it to "
+                             "~/rig/nodes.json, or pass --host."
+                             % (node, src, ", ".join(sorted(known)) or "nothing"))
     return Drainer(node, host, dest=dest, log=log).run(keep_card=keep_card,
                                                         limit=limit)
 

@@ -1,0 +1,147 @@
+# NOTE: this unit did not exist in this repo until cam3 (branch cam3-node).
+# cam1 and cam2 have been running HAND-INSTALLED units since they were built,
+# and nothing in the tree or in git history ever captured them - deploy.sh used
+# to `systemctl restart ilxctl || echo "not installed here"` and docs/HANDOFF.md
+# does not carry the unit either. So this file is a reconstruction from the
+# daemon's own behaviour, not a copy of what is on those nodes. Before assuming
+# the fleet is uniform, diff it against the real thing:
+#   ssh ubuntu@192.168.1.201 'systemctl cat ilxctl'
+# and reconcile any difference deliberately - especially User= and the USB
+# permission question noted at SupplementaryGroups= below.
+
+[Unit]
+Description=Wild Sync ilxctl - Sony ILX-LR1 camera daemon (USB/SDK, :8080)
+After=network-online.target
+Wants=network-online.target
+# There is no unit to order against for "the camera has enumerated on USB":
+# the body draws from the same PoE drop as the Pi and is still powering up
+# when systemd gets here. Nothing is lost by starting early - ilxctl binds
+# :8080 BEFORE its startup connect (HANDOFF 3.x / PROTOCOL "binds :8080
+# BEFORE the startup connect"), a failed startup connect is a log line and
+# not an exit, and rigcore re-POSTs /api/connect at any node it sees as
+# REACHABLE (camera not claimed).
+# A missing SDK or a failed build makes ilxctl exit non-zero at once; without
+# a start limit that is a hot loop against the USB stack and a journal full
+# of it. Note these two live in [Unit], not [Service] (systemd >= 229).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+# The SDK composes its transport-adapter path RELATIVELY and dlopen()s the
+# result - the shipped libCr_Core carries the literal string
+# "Contents/Frameworks/CrAdapter", not an absolute path - so CrAdapter/ has to
+# be findable from where the process runs. `make` stages libCr_Core.so and
+# CrAdapter/ next to the binary and links with -rpath '$ORIGIN', so the
+# LIBRARY loads from any cwd; the ADAPTERS are the part that does not, and the
+# failure is not a link error. SDK::Init() succeeds and EnumCameraObjects then
+# fails with CrError_Adaptor_Create (0x8703), which reads as "no camera found".
+# Starting in the binary's own directory makes cwd and exe-dir the same path -
+# the only layout Sony ships or tests, and the reason a hand-run binary works
+# where a unit without this line does not.
+# Whether the Linux libCr_Core.so resolves CrAdapter/ against the cwd or
+# against the exe dir is not provable from this checkout (lib/ holds macOS
+# dylibs; the Linux .so lives only on the nodes, staged by `deploy.sh
+# provision`). This line satisfies both readings. If the binary is ever moved,
+# the whole proof is one A/B on a node:
+#   cd / && /home/ubuntu/wildsync/build/ilxctl --list        # expect 0x8703
+#   cd /home/ubuntu/wildsync/build && ./ilxctl --list        # expect the body
+WorkingDirectory=/home/ubuntu/wildsync/build
+# Same PoE-settle reason piagent.service documents. Not load-bearing here:
+# see the note above on who re-drives the connect. The 3 s is piagent's value
+# reused, NOT a measurement of how long an ILX-LR1 takes to enumerate in PC
+# Remote mode after a cold PoE start. On cam3's first cold boot, confirm the
+# body is claimed with nobody touching it; if it is not, lengthen this rather
+# than adding a retry loop to main().
+ExecStartPre=/bin/sleep 3
+# main() creates the save dir with a single mkdir(), not mkdir -p, so on a
+# freshly provisioned node (no ~/Pictures at all) it only prints a warning.
+# Camera::setSaveDir does do mkdir -p at connect time - SetSaveInfo against a
+# missing directory fails 0x810c and the only symptom is that frames never
+# leave the body - but until the first connect there is no spool for
+# /api/shots to list.
+ExecStartPre=/bin/mkdir -p /home/ubuntu/Pictures/ILX-LR1
+# Bench/debug hatch only, and normally absent. If it exists it can carry
+# ILXCTL_ARGS (e.g. --match <id fragment>, --test-sdk-hold). It must NEVER
+# carry --allow-autofocus on a field node: the rig is manual focus always,
+# that flag is deliberately a start-up decision so nothing reachable over
+# :8080 can lift the rule, and a node started with it advertises
+# afAllowed:true to the whole fleet - that is the tell. No such file is
+# shipped and the leading '-' makes its absence a non-error; if the fleet ever
+# grows config management, assert this file ABSENT on field nodes and check
+# afAllowed in /api/status pre-dive rather than trusting it.
+EnvironmentFile=-/etc/default/ilxctl
+# --host: the daemon's default is 127.0.0.1 and rigd reaches this node over
+#   the LAN by IP, so the default binds a port nothing can talk to. 0.0.0.0
+#   rather than the node's own address, so a changed IP cannot strand it.
+# --port and --save-dir repeat the daemon's own defaults on purpose:
+#   PROTOCOL.md pins both as fleet contract (:8080, frames land in
+#   /home/ubuntu/Pictures/ILX-LR1), and the save-dir default is derived from
+#   $HOME - which under a unit is an artifact of User=, not a thing to depend
+#   on. /api/card/pull writes <save-dir>-raw and /api/spool/prune moves to
+#   <save-dir>-archive, so this one path fixes all three.
+# No --camera/--match: a node has exactly one body on its USB bus. Those two
+#   exist for the dev bench, where two cameras hang off one host. If cam3 ever
+#   shares a bus with a second Sony device, add --match through
+#   /etc/default/ilxctl rather than editing this unit.
+ExecStart=/home/ubuntu/wildsync/build/ilxctl --host 0.0.0.0 --port 8080 --save-dir /home/ubuntu/Pictures/ILX-LR1 $ILXCTL_ARGS
+Restart=always
+RestartSec=5
+# HANDOFF 2.2 (un-wedging a stuck PTP session) is `pkill -9 -x ilxctl`, then a
+# USB unbind/bind, then `systemctl start ilxctl`. Under a plain Restart=
+# policy systemd puts a new daemon back on the still-stuck bus inside those
+# few seconds and the recipe's final start is a no-op against it. Naming
+# SIGKILL here leaves a deliberately -9'd daemon DOWN, while a crash or any
+# non-zero exit still restarts. The recipe works as written.
+# The cost: an OOM kill (or any other external SIGKILL) also leaves the daemon
+# down until an operator or a redeploy starts it. rigd then reports ILX_DOWN
+# instead of a silent flap, which is arguably the better failure - but nobody
+# should expect self-healing from a -9.
+RestartPreventExitStatus=SIGKILL
+# The clean stop is bounded but not fast: on SIGTERM main() stops the server,
+# then stopInterval / zoomDrive(0) / focusDrive(0) / disconnect each wait up
+# to kSdkWait (8 s, camera.cpp) for the SDK mutex - and the lens must never be
+# left driving. Past that it can block for ever: main() joins the
+# startup-connect thread and a wedged SDK::Connect never returns, which is
+# exactly HANDOFF 2.2's "systemctl restart also hangs". 45 s clears the
+# bounded worst case with headroom and turns the unbounded one into a
+# systemd SIGKILL instead of a hang.
+# This is derived arithmetic (four bounded 8 s takes on the stop path), not a
+# measured shutdown - time one real `systemctl stop ilxctl` on a connected
+# node and tighten it. Deploy-time consequence: `deploy.sh node camN` against
+# a wedged daemon now sits up to 45 s at the restart step instead of hanging.
+TimeoutStopSec=45
+# USB access for the SDK's bundled libusb. /dev/bus/usb/* is root:root 0664 on
+# Ubuntu Server and the uaccess ACL only follows a seat login, which a system
+# service does not have - so the body needs a udev rule handing it to a group.
+# The node account is already in plugdev (deploy/pi-resync/user-data.template),
+# and SupplementaryGroups= extends the account's database groups rather than
+# replacing them, so this line is belt-and-braces - check `id ubuntu` first if
+# cam3 was imaged without that cloud-init user block.
+# UNSETTLED, and it is the one thing that lets this unit start cleanly and
+# still find no camera: there is NO udev rule for the Sony body anywhere in
+# this tree (deploy.sh installs only 99-gpio.rules; 054c/0e90 appears only in
+# HANDOFF 2.2's unbind/bind recipe). cam1/cam2 work today under hand-installed
+# units. On real hardware settle which of the two is true, on cam1, with the
+# body attached:
+#   systemctl show -p User -p SupplementaryGroups ilxctl
+#   ls -l /dev/bus/usb/*/* ; grep -ri 054c /etc/udev/rules.d /lib/udev/rules.d
+# If those units run as root, either drop User=/SupplementaryGroups= here too,
+# or have deploy.sh install a rule (IDs from the HANDOFF 2.2 recipe, not
+# invented):
+#   SUBSYSTEM=="usb", ATTR{idVendor}=="054c", ATTR{idProduct}=="0e90", GROUP="plugdev", MODE="0660"
+# Do not trust this unit on cam3 until that is settled: the failure is a
+# silent "no camera found", identical in the UI to a body in the wrong mode.
+SupplementaryGroups=plugdev
+# Paths are hardcoded to the cam1/cam2 layout (user `ubuntu`, checkout at
+# /home/ubuntu/wildsync, spool at /home/ubuntu/Pictures/ILX-LR1), exactly as
+# piagent.service does - there is no __REPO__/__USER__ templating in the node
+# units, only in rigd.service. A differently-imaged cam3 needs them re-rendered.
+# Deliberately no Nice=/priority: rigd carries Nice=-10 because it owns the
+# fire schedule, but the shutter is fired on GPIO by piagent. ilxctl is the
+# USB/settings path and is not in the sync-critical loop (HANDOFF 3.1: all
+# remaining skew is inside the camera bodies).
+
+[Install]
+WantedBy=multi-user.target
