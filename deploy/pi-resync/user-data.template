@@ -1,14 +1,23 @@
 #cloud-config
 # Wild Sync node re-provision (macOS host replaces the Jetson), 2026-08-23.
+# Chrony step generalized from two nodes to N, 2026-08-27 (cam3 joins the rig).
 #
 # Drop this on a node's system-boot partition as `user-data` together with a
 # NEW instance-id in `meta-data` (see install.sh). cloud-init re-runs its
 # per-instance modules on the next boot and:
 #   * adds the Mac host's SSH key alongside the Jetson's (password unchanged);
-#   * re-points chrony: the Jetson master (192.168.1.166) is gone, so the two
-#     nodes now peer each other in orphan mode — a sub-ms mutual lock with no
-#     upstream at sea, and the Ubuntu pool whenever internet is present.
+#   * writes the rig clock topology: the Jetson master (192.168.1.166) is gone
+#     and the Mac is deliberately not one (docs/PROTOCOL.md), so the nodes are
+#     their own time domain. Every node gets the SAME config — a full mesh of
+#     chrony peers plus an orphan local reference — and chrony elects one
+#     master by comparing NTP reference IDs. The Ubuntu pool in
+#     /etc/chrony/chrony.conf is untouched and still wins whenever the boat
+#     has internet.
 # Hostname is preserved and no packages are touched or upgraded.
+#
+# The chrony step is identical on every card: it derives its own slot from the
+# hostname (pi-camN) and needs no per-node editing. Adding cam4 is one entry in
+# SLOTS below.
 #
 # Placeholders (install.sh fills them from the card itself and ~/.ssh):
 #   __PASSWD_HASH__   the existing `passwd:` value on the card (unchanged)
@@ -31,5 +40,121 @@ ssh_pwauth: true
 chpasswd:
   expire: false
 runcmd:
-  # Peer the two nodes; whichever this is, the other is its server.
-  - [ bash, -c, "h=$(hostname); if [ \"$h\" = pi-cam1 ]; then peer=192.168.1.202; else peer=192.168.1.201; fi; printf 'server %s iburst minpoll 4 maxpoll 6\\nlocal stratum 10 orphan\\nallow 192.168.1.0/24\\nmakestep 1.0 3\\n' $peer > /etc/chrony/conf.d/10-jetson.conf; systemctl restart chrony; echo \"resync $(date -Is) peer=$peer\" >> /var/lib/wildsync/.provisioned" ]
+  # Clock topology for N nodes with no upstream at sea. Every node gets the
+  # SAME config — a full mesh of chrony peers plus an orphan local reference —
+  # and chrony elects one master by comparing NTP reference IDs (which are the
+  # nodes' own IPv4 addresses), so .201 holds it while it is up and the group
+  # re-elects the next-lowest address on its own if it is not. Nothing below
+  # names a camera: adding cam4 is one entry in SLOTS, no logic change.
+  #
+  # Replaces the two-node if/else ("peer = the other one"), which has no
+  # meaning with a third camera. The Jetson master (192.168.1.166) is retired
+  # and the Mac is deliberately not one (docs/PROTOCOL.md), so the nodes are
+  # their own time domain: free-running they measured 16.8 ms apart against a
+  # 10 ms pair budget; peered in orphan mode, 0.6 ms.
+  #
+  # The full mesh is what survives node loss. A star pointed at .201 leaves the
+  # survivors free-running when .201 drops — that is the 16.8 ms failure.
+  #
+  # Wrapped in ( … ): cloud-init concatenates every runcmd entry into ONE
+  # /bin/sh script, so a bare `set -eu` / `exit` here would silently truncate
+  # anything a later edit appends after it.
+  - |
+    ( set -eu
+      SUBNET=192.168.1
+      SLOTS="1 2 3"        # pi-camN <-> $SUBNET.$((200+N)).  cam4: add "4".
+      CONF=/etc/chrony/conf.d/10-wildsync.conf
+
+      n="$(hostname -s)"; n="${n#pi-cam}"
+      case "$n" in ''|*[!0-9]*)
+        # Card not named yet (preserve_hostname keeps the image default on a
+        # fresh node): fall back to this node's WIRED address, which is what
+        # the election compares anyway. en*/eth* only — the rig switch and the
+        # Starlink Wi-Fi both live on 192.168.1.0/24 and wlan0 is not the rig.
+        n="$(ip -4 -o addr show | awk -v s="$SUBNET." '$2 ~ /^(en|eth)/ {split($4,a,"/"); if (index(a[1],s)==1){split(a[1],b,"."); print b[4]-200; exit}}')" ;;
+      esac
+      case " $SLOTS " in
+        *" $n "*) : ;;
+        *) echo "wildsync: $(hostname -s) is not a rig node slot ($SLOTS) — chrony left as-is" >&2; exit 0 ;;
+      esac
+
+      mkdir -p /etc/chrony/conf.d
+      { echo "# wildsync clock topology — generated $(date -Is) on $(hostname -s)"
+        echo "# source: deploy/pi-resync/user-data.template — do not hand-edit"
+        for i in $SLOTS; do
+          [ "$i" = "$n" ] || printf 'peer %s.%s iburst minpoll 4 maxpoll 6\n' "$SUBNET" "$((200+i))"
+        done
+        echo 'local stratum 10 orphan'
+        echo "allow $SUBNET.0/24"
+        echo 'makestep 1.0 3'
+      } > "$CONF"
+
+      # Real time whenever the boat has internet: the Ubuntu pool lines live in
+      # /etc/chrony/chrony.conf (confdir pulls this drop-in in alongside them)
+      # and are deliberately NOT touched. Pool servers are stratum 2, they beat
+      # the stratum-10 orphan on every node at once, and when they go
+      # unreachable at sea the orphan takes back over. Re-add the pool only if
+      # an earlier hand-edit stripped the base config.
+      grep -qs '^[[:space:]]*\(pool\|server\)[[:space:]]' /etc/chrony/chrony.conf ||
+        echo 'pool ntp.ubuntu.com iburst maxsources 4' >> "$CONF"
+
+      # Supersede every drop-in that named ONE master: 10-jetson.conf (this
+      # file's two-node ancestor) and wildsync.conf, which deploy.sh:82
+      # provision_node points at the ssh client — i.e. the Mac, with `prefer`,
+      # and the Mac is explicitly not a chrony master.
+      rm -f /etc/chrony/conf.d/10-jetson.conf /etc/chrony/conf.d/wildsync.conf
+      # Bring the replacement up BEFORE surrendering the working clock, and
+      # bail out entirely if chrony is not installed. The old order - disable
+      # timesyncd, then restart chrony - left a node with NO time discipline at
+      # all whenever chrony was missing, on a rig whose whole value is a 10 ms
+      # pair budget. deploy.sh carries the same fix; they must not diverge.
+      command -v chronyd >/dev/null 2>&1 || {
+        echo "wildsync: chrony not installed - leaving systemd-timesyncd up" >&2
+        exit 0; }
+      systemctl restart chrony
+      if [ "$(systemctl is-active chrony)" = active ]; then
+        systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
+      else
+        echo "wildsync: chrony did not start - leaving systemd-timesyncd up" >&2
+      fi
+      mkdir -p /var/lib/wildsync
+      echo "clock $(date -Is) slot=$n slots=$SLOTS" >> /var/lib/wildsync/.provisioned
+    ) || echo "wildsync: chrony topology step FAILED" >&2
+
+# Verify per node — all three must print the SAME Reference ID, which is the
+# one-line proof the group has exactly one master (two distinct refids is a
+# split; rigd's node_clock_skew, not chronyc, is the detector for that):
+#   ssh ubuntu@192.168.1.201 chronyc tracking   # Ref ID C0A801C9 (.201)  Stratum 10
+#   ssh ubuntu@192.168.1.202 chronyc tracking   # Ref ID C0A801C9 (.201)  Stratum 11
+#   ssh ubuntu@192.168.1.203 chronyc tracking   # Ref ID C0A801C9 (.201)  Stratum 11
+#
+# Known gaps, in the order they will bite:
+#   * `deploy.sh provision <node>` RECREATES /etc/chrony/conf.d/wildsync.conf
+#     with `server <ssh client IP> iburst prefer` — the Mac. Inert today
+#     because nothing on the Mac answers NTP, but it is `prefer`red: the moment
+#     something does, every node abandons the peer group for the undisciplined
+#     host clock (the 187 ms / ~60 ppm failure) as a common-mode offset that
+#     node_clock_skew cannot see by construction. Re-run this card step, or fix
+#     deploy.sh, after any provision.
+#   * Slot identity is now a contract: hostname pi-camN implies 192.168.1.(200+N).
+#     A node must already hold its address before this runs; a never-named card
+#     whose address is not yet right falls through to the wired-IP fallback,
+#     bails out, and leaves chrony untouched. Re-run once the address settles.
+#   * Dockside with internet up, pair skew gets WORSE — three nodes can take
+#     three different pool servers over an asymmetric Starlink path, exactly
+#     what deploy.sh's own comment warns about. The survey design point is no
+#     upstream; if a survey must run with internet live, `chronyc offline
+#     192.168.1.0/0` drops the pool and leaves the LAN peers online.
+#   * The refid chrony compares comes from one of the host's own addresses, and
+#     the rig switch and Starlink Wi-Fi share 192.168.1.0/24 — a node that
+#     associates to the boat's AP has two addresses on that /24 and its refid
+#     can move. A node whose refid is not its wired .20x is the one to look at.
+#   * `allow 192.168.1.0/24` lets any host on that /24 query a node for time.
+#     It only serves time, never accepts it — noise, not exposure. Tighten to
+#     the three node addresses if that matters.
+#   * After a master handover the follower slews, not steps (makestep 1.0 3
+#     covers only the first three updates and these offsets are milliseconds).
+#     Give it a minute before trusting the 10 ms budget; rigd needs 3
+#     consecutive scans to raise or clear node_clock_skew anyway.
+#   * `orphan` needs chrony >= 3.5; noble ships 4.x, so this only matters if a
+#     node is ever imaged with something older.

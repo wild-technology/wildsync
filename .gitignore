@@ -28,3 +28,11 @@ __pycache__/
 
 # Claude Code session/tooling state
 .claude/
+
+# Vendor documentation trees (1.5 GB, keep local only)
+docs/basler-frame-grabber-documentation-v29-en/
+docs/basler-product-documentation-v133-en/
+
+# Linux aarch64 SDK staged for the Pi nodes (make sdk-linux). Same reason as
+# lib/: large, binary, proprietary, and staged from your own copy.
+lib-linux/

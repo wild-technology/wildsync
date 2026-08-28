@@ -17,10 +17,20 @@
 #   * PoE HAT fan only above 60 C — the fan is ~0.4 W at full speed and the
 #     capped SoC runs cooler anyway.
 # Nothing here touches the camera body's draw, which is the larger share.
+#
+# THIS IS OPT-IN, PER NODE, AND ALWAYS RUN BY HAND. deploy.sh does not call it
+# and must not start: the trim is a cost (capped clocks, no radios) paid only
+# where a node actually shares a strained PoE budget.
+#   * cam3 MUST NOT BE TRIMMED. It has its own dedicated PoE injector, and a
+#     dedicated injector - not capped clocks - is the actual fix for the
+#     2026-08-23 brown-out. Trimming cam3 would surrender performance to solve
+#     a problem it does not have. cam3 is listed below only so this tool can
+#     ADDRESS the box (e.g. to strip a trim someone applied by mistake); being
+#     addressable is not permission to trim it.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 name="${1:?usage: pi-power.sh <camN> [--no-reboot]}"
-case "$name" in cam1) ip=192.168.1.201;; cam2) ip=192.168.1.202;; *) echo "unknown node $name" >&2; exit 1;; esac
+case "$name" in cam1) ip=192.168.1.201;; cam2) ip=192.168.1.202;; cam3) ip=192.168.1.203;; *) echo "unknown node $name" >&2; exit 1;; esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$ip"
 
 $SSH 'bash -s' <<'REMOTE'

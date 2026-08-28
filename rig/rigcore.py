@@ -33,16 +33,29 @@ from collections import deque
 _DEFAULT_NODES = [
     {"name": "cam1", "cam_num": 1, "host": "192.168.1.201"},
     {"name": "cam2", "cam_num": 2, "host": "192.168.1.202"},
-    # cam3 (192.168.1.203) was an empty slot that fired a permanent
-    # node_offline anomaly and a forever-"2/3" header. A third camera joins
-    # via ~/rig/nodes.json in the field, not a code edit (see below).
+    # cam3 (192.168.1.203) is a REAL third survey camera now - and still not
+    # listed here, deliberately. It was removed on 2026-08-19 because an empty
+    # third slot fired a permanent node_offline anomaly and a forever-"2/3"
+    # header, and putting it back would do exactly that again on every host
+    # whose cam3 is not cabled (a spare Jetson, a bench, a laptop running the
+    # UI). A camera beyond the stereo pair joins PER HOST through
+    # ~/rig/nodes.json, not a code edit:
+    #     {"cam3": {"host": "192.168.1.203", "cam_num": 3}}
+    # The header then reads 3/3 on the boat and 2/2 on a host that has no such
+    # file, which is the truth in both places.
 ]
 
 # Hardcoding the addresses assumes every node holds its static lease, and a node
 # that comes up on DHCP instead then looks permanently OFFLINE while sitting
 # happily on the network. Allow an override so a field swap does not need a code
-# edit: ~/rig/nodes.json (or $WILDSYNC_NODES) may hold either a full node list or
-# just {"cam1": "192.168.1.171"} to move one host.
+# edit: ~/rig/nodes.json (or $WILDSYNC_NODES) may hold either a full node list
+# that REPLACES the fleet, or a dict keyed by node name that patches it:
+#   {"cam1": "192.168.1.171"}                        move an existing node
+#   {"cam3": {"host": "192.168.1.203", "cam_num": 3}}  add one (this is how
+#                                                      cam3 joins the fleet)
+# cam_num is what frames are renamed with (Cam3_*.jpg) and what the stereo pair
+# is identified by, so give it explicitly on any node you add; the positional
+# default below is only a floor, and it depends on JSON key order.
 NODES_PATH = os.environ.get("WILDSYNC_NODES",
                             os.path.expanduser("~/rig/nodes.json"))
 
@@ -55,7 +68,21 @@ def _load_nodes():
     except (OSError, ValueError):
         return nodes
     if isinstance(override, list):
-        return [dict(n) for n in override if n.get("name") and n.get("host")]
+        # A list REPLACES the fleet outright. cam_num is defaulted by position
+        # here exactly as the dict branch defaults it below: rigd's /api/fleet
+        # payload and run.py both subscript node["cam_num"] directly, so a
+        # hand-written list that omits it raises KeyError on the first
+        # /api/fleet poll, a crash that never names the file that caused it.
+        # Only devrig writes such a list today and it happens to set cam_num,
+        # which is why the gap stayed invisible.
+        out = []
+        for n in override:
+            if not (n.get("name") and n.get("host")):
+                continue
+            n = dict(n)
+            n.setdefault("cam_num", len(out) + 1)
+            out.append(n)
+        return out
     if isinstance(override, dict):
         by_name = {n["name"]: n for n in nodes}
         for name, val in override.items():
@@ -64,14 +91,75 @@ def _load_nodes():
                 continue
             if name in by_name:
                 by_name[name]["host"] = host
+                if isinstance(val, dict) and "optional" in val:
+                    by_name[name]["optional"] = bool(val["optional"])
             else:
+                # A node added through nodes.json defaults to OPTIONAL: the
+                # rig is a stereo pair plus whatever else is cabled today, and
+                # a third camera that is simply not on the boat must not fire a
+                # permanent node_offline or hold the header at "2/3" forever.
+                # That is the exact failure that got cam3 removed from
+                # _DEFAULT_NODES. Pass "optional": false to demand it be present.
                 nodes.append({"name": name, "host": host,
                               "cam_num": (val or {}).get("cam_num", len(nodes) + 1)
-                              if isinstance(val, dict) else len(nodes) + 1})
+                              if isinstance(val, dict) else len(nodes) + 1,
+                              "optional": (val or {}).get("optional", True)
+                              if isinstance(val, dict) else True})
     return nodes
 
 
 NODES = _load_nodes()
+
+# Per-camera on/off switch, persisted across restarts. Separate from nodes.json
+# because it is a RUNTIME decision ("not shooting cam3 on this dive"), not fleet
+# topology, and the operator changes it from the UI rather than by editing a
+# file. Shape: {"cam3": false}. A camera absent from the file is enabled.
+#
+# THIS TURNS OFF A CAMERA, NOT A NODE. A switched-off camera stops drawing
+# power and stops spooling frames nobody will use, and drops out of runs,
+# settings convergence and camera anomalies - but its Pi stays in the fleet,
+# stays polled, keeps its clock inside the pair budget, and remains available
+# as the strobe host. Turning a camera off must never cost you the box.
+#
+# Distinct from `optional`: optional says "this node may legitimately not be on
+# the boat at all", and such a node disappears entirely until it first answers.
+# Resolved at CALL time, not import time, and from RIG_HOME rather than a
+# literal ~/rig. devrig.py and the audit suites relocate rigcore.RIG_HOME to a
+# throwaway temp dir AFTER importing this module - devrig's docstring promises
+# "never ~/rig" - and an import-time constant silently ignores that. It did:
+# a devrig session on 2026-08-28 wrote a real camera-disable into the
+# operator's live ~/rig/camera_enabled.json, which on the next rigd start would
+# have switched a working camera off with nothing on screen explaining why.
+# $WILDSYNC_CAMERA_ENABLED still overrides, for a one-off.
+def camera_enabled_path():
+    return os.environ.get("WILDSYNC_CAMERA_ENABLED",
+                          os.path.join(RIG_HOME, "camera_enabled.json"))
+
+
+def load_camera_enabled():
+    """{name: bool}. Unreadable or malformed file = everything enabled."""
+    try:
+        with open(camera_enabled_path()) as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict):
+            return {str(k): bool(v) for k, v in raw.items()}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_camera_enabled(state):
+    """Atomic, like every other bit of rig state: .part -> fsync -> rename."""
+    path = camera_enabled_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "w") as fh:
+        json.dump({str(k): bool(v) for k, v in state.items()}, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 ILX_PORT = 8080
 PIAGENT_PORT = 8081
 
@@ -366,7 +454,48 @@ class NodeMonitor(threading.Thread):
         # block) statuses, or None. See the BUSY_HOLD_S comment above.
         self._busy_since = None
         self.last_seen = 0.0
+        # Has this node EVER answered anything - ilxctl or piagent? Distinct
+        # from last_seen, which is written only when ilxctl answers
+        # (_tick, "if reachable"). Presence must not require a camera daemon:
+        # a camera-less strobe host runs piagent and no ilxctl, and keying
+        # presence on last_seen would leave it invisible for ever, so it could
+        # never be selected as the strobe node.
+        self.ever_answered = False
         self.convergence = {"synced": None, "diverged": [], "last_check": 0}
+        # May this node legitimately be absent? (nodes.json "optional")
+        self.optional = bool(node.get("optional", False))
+        # Operator switch, set by rigd from camera_enabled.json. This turns the
+        # CAMERA off, NOT the node: the Pi keeps answering, keeps its clock
+        # disciplined, and stays available as the strobe host. Switching a
+        # camera off is how you stop a body drawing power and spooling frames
+        # nobody will use on this dive, without losing the box it hangs off.
+        self.camera_enabled = True
+
+    def is_present(self):
+        """Is this node part of the rig at all right now?
+
+        False only for an OPTIONAL node that has never once answered since rigd
+        started - which is how "cam3 is not on the boat today" stops being a
+        permanent node_offline and a header stuck at 2/3. An optional node that
+        HAS answered stays present even after it drops, because then its
+        silence is news.
+
+        A node whose CAMERA is switched off is still present: it is still a Pi
+        on the network, still a candidate strobe host, and its clock still has
+        to be inside the pair budget. Use is_capturing() for "does this node
+        contribute frames"."""
+        if self.optional and not self.ever_answered:
+            return False
+        return True
+
+    def is_capturing(self):
+        """Should this node's CAMERA take part in a run?
+
+        The narrower predicate. Everything about frames - run roster, settings
+        convergence, camera anomalies, the fleet's camera count - keys off this;
+        everything about the BOX - reachability, clock skew, strobe - keys off
+        is_present()."""
+        return self.is_present() and self.camera_enabled
 
     def stop(self):
         self._stopev.set()
@@ -495,6 +624,10 @@ class NodeMonitor(threading.Thread):
             # streak.
             self._busy_since = (self._busy_since or time.time()) \
                 if degraded else None
+            # Presence is "answered anything", so it is set for EITHER daemon -
+            # see the ever_answered comment in __init__.
+            if reachable or pia_ok:
+                self.ever_answered = True
             if reachable:
                 self.status = status
                 self.last_seen = time.time()
@@ -1521,6 +1654,12 @@ class SettingsManager:
             if getattr(m, "suspend_control", False) \
                     or st.get("controlMode") == "transfer" \
                     or _status_degraded(st):
+                continue
+            if not m.is_capturing():
+                # The convergence engine writes SetDeviceProperty over the same
+                # USB link the operator switched this camera off to quieten,
+                # every 3 s, for ever. It also keeps the body awake. A camera
+                # out of play takes no settings pushes.
                 continue
             if pinned == m.name_:
                 # The whole point of the pin: do not fight the preview.

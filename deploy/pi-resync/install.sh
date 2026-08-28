@@ -34,6 +34,11 @@ printf 'instance-id: wildsync-resync-%s\n' "$STAMP" > "$V/meta-data"
 # synchronized fires, 2026-08-23). The rig's loads are I/O-bound, so the
 # 2.4 GHz boost buys nothing; Wi-Fi/BT are unused (Ethernet only). ~2-3 W
 # off the peak. Appended under a [pi5] section so it is inert on a Pi 4.
+#
+# OPT-IN PER NODE, and NOT for cam3. cam3 runs on its own dedicated PoE
+# injector — the real fix for the brown-out — so it has the headroom and must
+# keep full clocks, Wi-Fi and BT. Do not pass this flag when writing cam3's
+# card. cam1 still shares its port and may still use it.
 if [ "${2:-}" = "--pi5-power-trim" ]; then
   cp "$V/config.txt" "$V/config.txt.bak-$STAMP"
   if ! grep -q "wildsync power trim" "$V/config.txt"; then
