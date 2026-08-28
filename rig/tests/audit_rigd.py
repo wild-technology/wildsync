@@ -1339,12 +1339,16 @@ def t_nonfinite(h):
 # ===========================================================================
 class _StubMon:
     """One monitor with exactly the status body a check needs. Anomalies reads
-    snapshot()/name_/clock_offset_info() and nothing else."""
+    snapshot()/name_/clock_offset_info()/is_present() and nothing else."""
 
-    def __init__(self, name, status, state=None, conv=None):
+    def __init__(self, name, status, state=None, conv=None, present=True,
+                 camera_enabled=True):
         self.name_ = name
         self.host = "127.0.0.9"
         self.suspend_control = False
+        self.camera_enabled = camera_enabled
+        self.optional = False
+        self._present = present
         self._snap = {"state": state or rigcore.NodeMonitor.CONNECTED,
                       "status": status, "health": {}, "age_s": 0.1,
                       "convergence": conv or {}}
@@ -1354,6 +1358,18 @@ class _StubMon:
 
     def clock_offset_info(self):
         return {"offset_s": None, "rtt_ms_best": None, "n": 0}
+
+    def is_present(self):
+        """Is the NODE in the fleet? False only for an optional node never
+        seen. A stub that omits this does not stand in for a NodeMonitor any
+        more, and the section dies with AttributeError rather than failing a
+        check - which is exactly what happened when is_present() was added."""
+        return self._present
+
+    def is_capturing(self):
+        """Does this node's CAMERA take part? Narrower: a camera switched off
+        leaves the runs and the camera alarms, but its Pi stays in the fleet."""
+        return self._present and self.camera_enabled
 
 
 def t_busy(h):

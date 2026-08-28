@@ -147,10 +147,20 @@ class StereoSession:
             raise RuntimeError("a run is recording - no calibration captures")
         if rig.drain_status().get("active"):
             raise RuntimeError("a drain is running - wait for it")
-        mons = {m.name_: m for m in rig.monitors if m.is_connected()}
+        # THE STEREO PAIR, explicitly - cam_num 1 and 2 - not "whatever is
+        # connected". With a third camera on the rig the old set-of-connected
+        # form gave len(mons) == 3, so every capture then waited the full
+        # deadline for a frame from a camera that is not part of the pair and
+        # the session reported "0 usable pairs" for ever. Stereo calibration is
+        # a property of the PAIR; a third survey camera is not half of a new one.
+        pair = {m.name_: m for m in rig.monitors
+                if m.is_capturing() and m.is_connected()
+                and m.node.get("cam_num") in (1, 2)}
+        mons = pair
         if len(mons) < 2:
-            raise RuntimeError("both cameras must be connected (%d are)"
-                               % len(mons))
+            raise RuntimeError(
+                "the stereo pair (cam_num 1 and 2) must both be connected and "
+                "switched on - %d of 2 are" % len(mons))
         before = {}
         for name, m in mons.items():
             names = m.shots()

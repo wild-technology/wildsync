@@ -56,7 +56,7 @@ endif
 SDK_LIBS := $(wildcard lib/*.$(DYLIB_EXT))
 STAGED   := $(patsubst lib/%,$(BUILD)/%,$(SDK_LIBS)) $(BUILD)/.adapters
 
-.PHONY: all run clean rebuild sdk sdk-check
+.PHONY: all run clean rebuild sdk sdk-linux sdk-check
 
 all: sdk-check $(BIN) $(STAGED)
 
@@ -72,11 +72,53 @@ sdk:
 	@mkdir -p include lib
 	@cp -R "$(CRSDK_DIR)/app/CRSDK" include/
 	@cp "$(CRSDK_DIR)"/external/crsdk/*.$(DYLIB_EXT) lib/
+	@rm -rf lib/CrAdapter
 	@cp -R "$(CRSDK_DIR)/external/crsdk/CrAdapter" lib/
 ifeq ($(UNAME_S),Darwin)
 	@xattr -dr com.apple.quarantine include lib 2>/dev/null || true
 endif
 	@echo "SDK staged from $(CRSDK_DIR)"
+
+# Stage the LINUX aarch64 SDK into lib-linux/, for pushing to the Pi nodes.
+#
+# `sdk` above stages for THIS host - on a Mac that means .dylib - and that is
+# the right thing for building ilxctl here. It is the wrong thing entirely for
+# a node: deploy.sh rsyncs lib/ to the Pi, and macOS dylibs bricked a node
+# build with a missing libCr_Core.so while looking like a successful provision
+# (audit 2026-08-27), which is why deploy.sh now refuses to provision unless it
+# can see a real .so.
+#
+# That refusal left no way to provision a node FROM the Mac at all - and since
+# the Jetson was retired the Mac is the only host there is. This target closes
+# that gap: it always copies .so, never $(DYLIB_EXT), and writes to a separate
+# directory so the host's own lib/ is untouched and `make` here keeps working.
+#
+# Sony ships PLATFORM-SPECIFIC packages: point CRSDK_DIR at the unpacked
+# Linux64ARMv8 one, not the Mac one. The headers are identical across both
+# (verified byte-for-byte, 2026-08-28) so this target does not touch include/.
+#
+#   make sdk-linux CRSDK_DIR=/path/to/unpacked/CrSDK_..._Linux64ARMv8
+#   deploy/deploy.sh provision cam3
+sdk-linux:
+	@test -d "$(CRSDK_DIR)/external/crsdk" || { \
+	  echo "Not found: $(CRSDK_DIR)/external/crsdk"; \
+	  echo "Unpack the LINUX ARMv8 Camera Remote SDK and re-run:"; \
+	  echo "  make sdk-linux CRSDK_DIR=/path/to/unpacked/CrSDK_..._Linux64ARMv8"; \
+	  exit 1; }
+	@test -f "$(CRSDK_DIR)/external/crsdk/libCr_Core.so" || { \
+	  echo "$(CRSDK_DIR) has no libCr_Core.so - that is the MAC or Windows"; \
+	  echo "package. The nodes are aarch64 Linux; get the Linux64ARMv8 package."; \
+	  exit 1; }
+	@mkdir -p lib-linux
+	# cp -R into an EXISTING directory recurses into it, so a second run
+	# produced lib-linux/CrAdapter/CrAdapter and deploy.sh then rsynced the
+	# nest to the node. Remove the destination first; the .so copies below
+	# overwrite in place and are already idempotent.
+	@cp "$(CRSDK_DIR)"/external/crsdk/*.so lib-linux/
+	@rm -rf lib-linux/CrAdapter
+	@cp -R "$(CRSDK_DIR)/external/crsdk/CrAdapter" lib-linux/
+	@echo "Linux aarch64 SDK staged in lib-linux/ from $(CRSDK_DIR)"
+	@echo "  $$(ls lib-linux/*.so lib-linux/CrAdapter/*.so 2>/dev/null | wc -l | tr -d ' ') shared objects"
 
 sdk-check:
 	@test -f include/CRSDK/CameraRemote_SDK.h && test -f lib/libCr_Core.$(DYLIB_EXT) || { \

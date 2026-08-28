@@ -215,11 +215,27 @@
 </style>
 </head>
 <body>
+<style>
+.fleetsw{display:inline-flex;gap:4px;vertical-align:middle}
+.fleetsw button{font:inherit;font-size:11px;line-height:1;padding:4px 8px;border-radius:999px;
+  border:1px solid currentColor;background:transparent;cursor:pointer;opacity:.75}
+.fleetsw button:hover{opacity:1}
+.fleetsw button:disabled{opacity:.4;cursor:default}
+.fleetsw .swoff{color:#4ea3ff}
+.fleetsw .swon{color:#8a9199}
+.fleetsw .swon.amber{color:#e0a032}
+</style>
 <div id="linkLost">RIG LINK LOST — data is <span id="llAge">?</span>s old, still retrying</div>
 <header>
   <h1>WILD SYNC</h1>
   <span id="hRun" class="pill">no run</span>
-  <span id="hNodes" class="pill">— nodes</span>
+  <span id="hNodes" class="pill" title="connected / expected CAMERAS. A camera switched off, and an optional node that has never appeared, are both excluded from the count.">— nodes</span>
+  <!-- Per-camera on/off. The rig is a stereo pair plus whatever else is
+       cabled today: a third camera that is not on the boat must read as a
+       two-camera rig, not as a permanent fault. Switching a camera off keeps
+       its Pi in the fleet - the box may be hosting the strobe. No nodes.json
+       edit, no rigd restart. -->
+  <span id="hFleetSw" class="fleetsw"></span>
   <span id="hTime" class="pill">time —</span>
   <span id="hNav" class="pill">nav —</span>
   <span id="hStrobe" class="pill" title="strobe">strobe off</span>
@@ -680,6 +696,62 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dat
 setInterval(()=>{ $('#hClock').textContent = new Date().toISOString().replace('T',' ').slice(0,19)+'Z'; },1000);
 function pill(el,txt,cls){ el.textContent=txt; el.className='pill'+(cls?(' '+cls):''); }
 
+// Per-CAMERA on/off switches in the header.
+//
+// Switching a camera off stops a body drawing power and spooling frames nobody
+// will use on this dive. It does NOT drop the node: the Pi stays in the fleet,
+// keeps its clock, and can still host the strobe. That distinction is the whole
+// point of the control, so the label says "cam" and the tooltip says the rest.
+//
+// A node rigd reports as absent is a different thing entirely - an optional
+// node that has never answered, i.e. not on the boat. Offered quietly, in case
+// it IS cabled and expected.
+let FLEET_SW_BUSY = false;
+function renderFleetSwitches(f){
+  const el = $('#hFleetSw'); if(!el) return;
+  const bits = [];
+  for(const n of (f.nodes||[])){
+    // Only offer this beyond the stereo pair. cam1/cam2 are the pair every
+    // stereo product depends on; hiding the switch is cheaper than explaining
+    // mid-dive why half a pair is a bad idea.
+    if((n.cam_num||0) <= 2) continue;
+    const on = n.camera_enabled !== false;
+    bits.push('<button class="'+(on?'swoff':'swon amber')+'" data-node="'+n.name+
+      '" data-on="'+(on?'0':'1')+'" title="'+
+      (on ? 'switch '+n.name+'\u2019s CAMERA off for this dive: it stops drawing '
+          + 'power and stops spooling frames, and leaves runs and camera alarms. '
+          + 'The Pi stays in the fleet and can still host the strobe.'
+          : n.name+'\u2019s camera is OFF. The node is still live. Click to shoot with it again.')
+      +'">'+n.name+' cam '+(on?'ON':'OFF')+'</button>');
+  }
+  for(const d of (f.absent||[])){
+    bits.push('<button class="swon" data-node="'+d.name+'" data-on="1" title="'+
+      d.name+' has never answered since rigd started ('+d.reason+
+      '), so it is not counted. Click only if it should be on the boat.">'+
+      d.name+' absent</button>');
+  }
+  el.innerHTML = bits.join('');
+  el.querySelectorAll('button').forEach(b=>b.onclick = async ()=>{
+    if(FLEET_SW_BUSY) return;
+    FLEET_SW_BUSY = true; b.disabled = true;
+    const on = b.dataset.on === '1';
+    const r = await api('/api/camera/enabled', {node:b.dataset.node, enabled:on});
+    FLEET_SW_BUSY = false;
+    // This UI has no global toast; every component reports its own failures in
+    // place. Say it on the button and let the next poll redraw it, rather than
+    // letting a failed switch look like it worked.
+    const bad = !r || r._err || r.ok === false;
+    if(bad){
+      b.disabled = false;
+      b.textContent = b.dataset.node + ' ?';
+      b.title = 'switch FAILED: ' + ((r && (r.error||r.detail)) || 'no answer from rigd');
+      b.classList.add('amber');
+      return;                      // leave it visible; next pollFleet redraws
+    }
+    pollFleet();
+  });
+}
+
 // ---- fleet ----------------------------------------------------------------
 let FLEET={nodes:[]};
 const spark = {}; // name -> [values]
@@ -744,8 +816,15 @@ async function pollFleet(){
     sb.title='a card drain is running on '+(DRAIN.node||'a camera')+
       ' — wait for it, or cancel it in Card drain below';
   }
-  const conn=f.nodes.filter(n=>n.connected).length;
-  pill($('#hNodes'), conn+'/'+f.nodes.length+' cameras', conn===f.nodes.length?'on':'bad');
+  // The header counts CAMERAS, not nodes. rigd has already dropped optional
+  // nodes that have never answered, and a node whose camera the operator
+  // switched off is still in f.nodes (it is a live box, possibly the strobe
+  // host) but must not be counted or missed here. Both cases read 2/2 on a
+  // two-camera day rather than a permanent 2/3.
+  const cams=f.nodes.filter(n=>n.camera_enabled!==false);
+  const conn=cams.filter(n=>n.connected).length;
+  pill($('#hNodes'), conn+'/'+cams.length+' cameras', conn===cams.length?'on':'bad');
+  renderFleetSwitches(f);
   pill($('#hTime'), 'time '+(f.time_source||'—'), f.time_source==='gps'?'on':'warn');
   const jf=f.jetson_free_mb, lo=f.jetson_disk_low_mb||5000;
   pill($('#hDisk'), jf==null?'disk —':('disk '+(jf>=1024?(jf/1024).toFixed(1)+' GB':jf+' MB')),
@@ -1622,7 +1701,10 @@ async function nodeExposure(node, which, value, noteEl){
 // diverges): the moment this holds, the Apply button's per-camera promise is
 // finished and its label reverts to the generic one.
 function bodiesMatch(){
-  const live=(FLEET.nodes||[]).filter(n=>n.connected);
+  // camera_enabled, not just connected: a camera the operator switched off is
+  // perfectly connected and will not shoot. Counting it here promises frames
+  // the run will not produce, and turns a deliberate choice into a red row.
+  const live=(FLEET.nodes||[]).filter(n=>n.connected && n.camera_enabled!==false);
   if(live.length<2) return false;
   const raws=['aperture_raw','shutter_raw','iso_raw'].every(k=>
     live.every(n=>n[k]!=null && n[k]===live[0][k]));
@@ -1961,7 +2043,10 @@ async function updateCtlCol(n){
 }
 // cross-body focus mismatch: visible warning, never an auto-correction
 function renderLensWarn(){
-  const live=(FLEET.nodes||[]).filter(n=>n.connected);
+  // camera_enabled, not just connected: a camera the operator switched off is
+  // perfectly connected and will not shoot. Counting it here promises frames
+  // the run will not produce, and turns a deliberate choice into a red row.
+  const live=(FLEET.nodes||[]).filter(n=>n.connected && n.camera_enabled!==false);
   const fp=live.map(n=>n.focus_pos), differ=live.length>1 &&
     fp.every(v=>v!=null) && new Set(fp).size>1;
   $('#lensWarn').textContent = differ

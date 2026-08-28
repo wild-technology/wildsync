@@ -8,6 +8,10 @@
 import argparse, json, statistics, sys, time, urllib.request
 
 B = "http://localhost:9090"
+# The rig statics (PROTOCOL.md: pi-camN = 192.168.1.200+N). A node that shows
+# up under any other address is on a stray DHCP lease and will vanish on
+# renewal - fail it here, before a field run depends on it.
+NODE_IPS = {"cam1": "192.168.1.201", "cam2": "192.168.1.202"}
 OK, WARN, FAIL = [], [], []
 
 
@@ -45,6 +49,10 @@ def main():
     check("2 cameras connected", sum(n["connected"] for n in nodes) == 2)
     for n in nodes:
         print("  --", n["name"], n["state"])
+        if n["name"] in NODE_IPS:
+            check("%s at %s" % (n["name"], NODE_IPS[n["name"]]),
+                  n.get("host") == NODE_IPS[n["name"]],
+                  "fleet reports %s" % n.get("host"))
         check("%s convergence synced" % n["name"], n["convergence"]["synced"],
               str(n["convergence"]["diverged"]))
         check("%s MF" % n["name"], n.get("focus_mode") == 1)

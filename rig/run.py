@@ -1669,7 +1669,8 @@ class RunManager:
         reads 0.0 and would pull the median toward this host's own clock."""
         run = self.active
         names = set((run or {}).get("nodes") or ())
-        offs = [(m, self._clock_offset_raw(m)) for m in self.monitors]
+        offs = [(m, self._clock_offset_raw(m)) for m in self.monitors
+                if m.is_present()]
         mine = [o for m, o in offs
                 if o is not None and (not names or m.name_ in names)]
         return mine or [o for _, o in offs if o is not None]
@@ -1925,7 +1926,8 @@ class RunManager:
                     "%.3f %s\n" % (ep, ln)) or nmea_fh.flush()
             if self.nav:
                 self.nav.set_raw_hook(raw_hook)
-            live = [m for m in self.monitors if m.is_connected()]
+            live = [m for m in self.monitors
+                    if m.is_connected() and m.is_capturing()]
             # run.json keeps only the LAST 2000 index entries, so a long
             # transect loses its head - and ingest and stereo_check read that
             # index to match card RAWs to frames. index.jsonl is the complete
@@ -2050,8 +2052,16 @@ class RunManager:
                 if not run:
                     return
                 root = run["root"]
+                # is_capturing(), not just is_connected(): a camera the
+                # operator switched off is perfectly connected - the Pi and
+                # ilxctl are fine, only the camera is out of play - so an
+                # is_connected() test here adopts it back within 3 s and
+                # silently undoes the roster filter at run start. A camera
+                # switched back ON mid-run is still adopted through this same
+                # path, which is the behaviour you want.
                 missing = [m for m in self.monitors
-                           if m.is_connected() and m.name_ not in self.workers]
+                           if m.is_connected() and m.is_capturing()
+                           and m.name_ not in self.workers]
                 for m in missing:
                     w = PullWorker(m, os.path.join(root, m.name_), self,
                                    adopted=True)
@@ -2387,7 +2397,8 @@ class RunManager:
         what may, so a camera that stopped firing altogether raised nothing."""
         run = self.active
         members = list((run or {}).get("nodes") or ())
-        live = [m for m in self.monitors if m.is_connected()]
+        live = [m for m in self.monitors
+                if m.is_connected() and m.is_capturing()]
         # EVERY run member is judged, not just the ones we can reach. A member
         # that has dropped to not-connected (body off USB, ilxctl wedged, the
         # Pi rebooted on the shared PoE feed) used to be silently absent from
@@ -2398,6 +2409,13 @@ class RunManager:
         # member is a FAILED FIRE. It is not contacted: there is nothing to
         # contact, and a doomed HTTP round trip per shot is what piled the
         # backlog up in the first place.
+        # A camera the operator switched off is NOT a failed fire: it is not
+        # contacted and it is not judged. Without this it lands in `offline`
+        # below, accumulates a failed fire every shot, drives fail_streak to 3
+        # and pauses the whole run - the rig stopping itself because it was
+        # told not to use a camera.
+        _off_by_switch = {m.name_ for m in self.monitors if not m.is_capturing()}
+        members = [n for n in members if n not in _off_by_switch]
         offline = [n for n in members
                    if n not in {m.name_ for m in live}]
         if not live and not offline:
@@ -3596,8 +3614,12 @@ class RunManager:
         calibration exposure so no pull worker writes it into the transect."""
         stopev = self._calib_stop
         run_at_entry = self.active
+        # Calibration FIRES the shutter. A camera switched off must not be in
+        # the pool on either path - the implicit fleet one or an explicitly
+        # passed list - or the operator's "do not use this camera" turns into
+        # shutter actuations on it at every program start and run start.
         pool = nodes if nodes is not None else self.monitors
-        live = [m for m in pool if m.is_connected()
+        live = [m for m in pool if m.is_connected() and m.is_capturing()
                 and (m.health.get("gpio", {}) or {}).get("available")]
         if not force:
             live = [m for m in live if not self._reuse_trig_latency(m)]
