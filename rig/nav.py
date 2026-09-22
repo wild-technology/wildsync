@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wild Sync nav agent — Digital Yacht iKonvert NMEA2000 gateway driver.
+"""Wild Sync nav driver — Digital Yacht iKonvert NMEA2000 gateway driver.
 
 Talks to the iKonvert NMEA2000<->USB gateway (FTDI FT232R, /dev/ttyUSB0 on the
 Jetson) using the ASCII "PDGY" RAW-mode protocol, decodes the navigation PGNs

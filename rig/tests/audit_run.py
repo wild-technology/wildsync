@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — run lane (findings R1-R10, rig/run.py).
+"""Audit regression suite — run (findings R1-R10, rig/run.py).
 
 Every check below FAILS on the pre-fix code and PASSES after. What each one
 reproduces, in the words of the defect it pins:

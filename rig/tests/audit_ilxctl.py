@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite - ilxctl lane (findings X2/X3/X5, tripwires X1/X4/X6).
+"""Audit regression suite - ilxctl (findings X2/X3/X5, tripwires X1/X4/X6).
 
 Unlike the other suites this one drives the REAL C++ daemon: it builds
 build/ilxctl with make and talks to it over 127.0.0.1 with NO camera attached.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite - ui lane (rig/rig_ui.html), findings U1-U15.
+"""Audit regression suite - ui (rig/rig_ui.html), findings U1-U15.
 
 rig_ui.html is browser JavaScript, so this suite does what soaktest does for
 the Python side: it runs the REAL file. The page's <script> is loaded into
@@ -214,7 +214,7 @@ function cancelAnimationFrame(){}
 
 DRIVER = r"""// ---------------------------------------------------------------------------
 // Drives the loaded rig_ui.html script. Every entry pushed onto __R becomes one
-// soaktest check. Names are prefixed with the lane finding they pin.
+// soaktest check. Names are prefixed with the finding they pin.
 // ---------------------------------------------------------------------------
 var __R = [];
 function T(name, ok, detail){ __R.push({name:name, ok:!!ok, detail:String(detail==null?'':detail)}); }
@@ -885,7 +885,7 @@ def _behaviour(opts):
     if not ok:
         note("skipped the executable half: %s. The structural checks below "
              "still run, but they are far weaker - re-run this suite on the "
-             "rigd host (macOS) before trusting a green ui lane." % why)
+             "rigd host (macOS) before trusting a green ui suite." % why)
         return
     html = open(UI_PATH, encoding="utf-8").read()
     results, err = _run_js(html)

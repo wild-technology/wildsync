@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — nav lane (findings N1/N2/N3).
+"""Audit regression suite — nav (findings N1/N2/N3).
 
 N1  TimeAuthority starvation: two trusted senders whose time words differ by
     more than CONFIRM_TOL_S (a GNSS 129029 next to a plotter's relayed

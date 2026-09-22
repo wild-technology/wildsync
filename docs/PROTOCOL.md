@@ -516,9 +516,9 @@ Every anomaly carries `sev: "bad"|"warn"` alongside `{kind, node, since,
 evidence, suggested_action}`; the UI renders that field rather than pattern-
 matching the kind's spelling.
 
-rigd exposes, for both humans and an autonomous agent:
+rigd exposes, for both humans and an automated watcher:
 - `GET /api/events?since=<seq>&sev=<min>` → `{next, events:[...]}` — cursor-based,
-  never blocks, bounded page. The AI watcher polls this.
+  never blocks, bounded page. An automated watcher polls this.
 - `GET /api/diag` → one self-describing snapshot: versions, every node's monitor
   state + convergence + last error, active run, disk, clock offsets, recent
   anomaly counts by kind, current desired vector. Enough to diagnose a field bug
@@ -615,7 +615,7 @@ enumerated (the counts stay exact), ≤64 MB per frame — and run details are
 cached on the mtimes of the files they were built from, because the UI polls
 this during a live survey on the host that is writing the frames.
 
-The intent: an AI agent (or the user) can poll `/api/diag` + `/api/anomalies`
+The intent: a watcher script (or the operator) can poll `/api/diag` + `/api/anomalies`
 in the field, see what's wrong with evidence, and correct — restart a node,
 re-push settings, adjust exposure — through the same API, in the background,
 without stopping the survey.
@@ -1027,15 +1027,15 @@ steps applied live (manual → ISO step; auto → servo target shift).
 
 ## Deliverables & boundaries
 
-- `rig/imu_yb.py` (IMU agent): `ImuReader` class + `probe()`; talks to the
+- `rig/imu_yb.py` (IMU driver): `ImuReader` class + `probe()`; talks to the
   device only; no HTTP.
-- `rig/nav.py` (nav agent): `NavReader` class (serial thread, ring buffers,
+- `rig/nav.py` (nav driver): `NavReader` class (serial thread, ring buffers,
   `snapshot()`, `raw_log_hook`), `latlon_to_utm()` pure function,
   `TimeAuthority`. No HTTP.
-- `src/*` (hardening agent): fixes only, no API shape changes beyond adding
+- `src/*` (camera daemon): fixes only, no API shape changes beyond adding
   `expcomp` + noted fields.
 - `rig/piagent.py`, `rig/rigd.py`, `rig/rig_ui.html`, `rig/deploy.sh`,
-  systemd units (core, written by the session lead). Python stdlib only in
+  systemd units (core). Python stdlib only in
   services; pyserial allowed (apt `python3-serial`).
 
 ---

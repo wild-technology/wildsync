@@ -77,7 +77,7 @@ def _alias_bindable():
 # One test process owns one contiguous BLOCK of ports on 127.0.0.1, and every
 # nominal 127.0.0.x:port maps into it at a fixed offset. The block used to be
 # picked as 20000 + (pid % 40) * 640 and used unchecked, which made the whole
-# gate flaky in a way no lane could see from its own suite: pid % 40 has only
+# gate flaky in a way no single suite could see on its own: pid % 40 has only
 # 40 values, so any long-lived process holding one block (a devrig_ctl.py left
 # running, an earlier soaktest that has not exited) collides with 1 in 40 of
 # all future soaktest processes, and the collision is a HARD abort — FakeNode

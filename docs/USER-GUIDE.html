@@ -236,8 +236,8 @@ footer{border-top:1px solid var(--line);margin-top:56px;padding-top:20px;
     <span class="tag">rig UI <b>http://localhost:9090</b></span>
     <span class="tag">cameras <b>2 × Sony ILX-LR1</b></span>
     <span class="tag">pair skew <b>&lt; 2 ms</b></span>
-    <span class="tag">build <b>audit-fixes</b></span>
-    <span class="tag">revised <b>2026-08-24</b></span>
+    <span class="tag">build <b>main</b></span>
+    <span class="tag">revised <b>2026-09-21</b></span>
   </div>
 </header>
 
@@ -288,6 +288,7 @@ specific to one of them.</p>
 <tbody>
 <tr><td class="mono">the Mac</td><td class="mono">rigd</td><td>the brain: settings, the shot schedule, pulling pictures, writing transect folders, serving this page</td></tr>
 <tr><td class="mono">cam1 / cam2</td><td class="mono">ilxctl + piagent</td><td>a Raspberry Pi beside each camera: talks to the body over USB, and fires it down a wire</td></tr>
+<tr><td class="mono">cam3 (optional)</td><td class="mono">baslerctl + piagent</td><td>a Pi 5 with a Basler machine-vision camera. It stays hidden until it first answers, so the header still reads <code>2/2</code> without it</td></tr>
 <tr><td class="mono">the bodies</td><td>—</td><td>the cameras themselves. The card holds the full-quality RAW; only a small review JPEG crosses to the Mac during a run</td></tr>
 </tbody></table></div>
 
@@ -338,9 +339,19 @@ Mac. Every number on screen is frozen from that moment, and the banner says how
 old it is. The rig itself may be shooting perfectly well — the page recovers on
 its own when the link comes back.</p></div>
 
-<p>Six tabs: <strong>Review</strong> (drive the survey), <strong>Transects</strong> (browse what
-you shot), <strong>Controls</strong> (camera settings), <strong>Nav</strong>, <strong>IMU</strong>,
-and <strong>Events</strong> (the rig's diary).</p>
+<p>Ten tabs: <strong>Review</strong> (drive the survey), <strong>Transects</strong> (browse what
+you shot), <strong>Map</strong> (every frame and the boat's track on an offline chart),
+<strong>Controls</strong> (camera settings), <strong>Nav</strong>, <strong>IMU</strong>,
+<strong>Calib</strong> (stereo and IMU calibration), <strong>Diag</strong> (storage, cards,
+drain, format and exports), <strong>Alerts</strong> (only what needs a human) and
+<strong>Events</strong> (the rig's diary).</p>
+
+<div class="note"><span class="lab">Projects</span>
+<p>The first screen asks for a project: one per campaign (name, vessel, site). Everything it
+records — transects, drained RAWs, ZIP exports — lives under
+<code>~/wildsync-projects/&lt;name&gt;/</code>. Surveys from before projects existed appear as the
+<em>Legacy</em> project. The header shows the open project; switching is refused while a run or
+drain is active.</p></div>
 </section>
 
 
@@ -377,11 +388,16 @@ and <strong>Events</strong> (the rig's diary).</p>
 </div></li>
 
 <li><b>Disk</b><div class="d">
-  <p>The disk pill covers the Mac's transect volume. A review JPEG is ~200 KB; the RAW that stays on the card is ~32 MB and needs room in <code>~/rig-raw</code> when you drain it.</p>
+  <p>The disk pill covers the Mac's transect volume. A review JPEG is ~200 KB; the RAW that stays on the card is ~32 MB and needs room in the project folder when you drain it.</p>
 </div></li>
 
 <li><b>Focus</b><div class="d">
   <p>Focus each camera by eye in Controls, then leave it. The two bodies will show different focus numbers — that is expected and correct.</p>
+</div></li>
+
+<li><b>Calibrate</b><div class="d">
+  <p>Calib tab, ideally in the water (the port changes the focal length). Enter the checkerboard's inner-corner counts and square size, start a session and follow the amber guidance until it turns green, then Compute and Save. Stereo VSLAM picks up the new calibration automatically.</p>
+  <p>For the IMU: set the rig still and level and press <b>Calibrate both</b>. It takes ten seconds and refuses if anything moves.</p>
 </div></li>
 </ol>
 </section>
@@ -464,6 +480,11 @@ a drain, and Start will tell you so rather than just bouncing.</p>
 a sidecar beside each one carrying the true capture time, position and attitude —
 so the RAWs carry their metadata into whatever you process them with.</p>
 
+<p>The <strong>Diag</strong> tab has the same drain as <em>Download images</em>, plus a
+cameras/cards table that converts each body's remaining shots into GB, so a mismatched
+card stands out. <strong>Format card</strong> lives there too: it shows the card's state
+first, then asks you to type the camera's name before it does anything.</p>
+
 <div class="note warn"><span class="lab">"Card index not ready"</span>
 <p>That body's transfer subsystem is wedged — it happens after many mode switches
 in a session. <strong>Power-cycle that camera</strong> and drain again. The card is
@@ -531,7 +552,7 @@ lens's own position count. Lens details live in each section's header.</p>
 <p>File type, image size, what gets sent to the Mac, RAW compression, white balance.
 Each camera then <em>reports back what it actually accepted</em>, so you can see both
 bodies really are recording the same thing rather than trusting the message got
-through. Before this pass those fields were write-only and the rig was guessing.</p>
+through.</p>
 
 <p>White balance is pinned to a fixed colour temperature deliberately: auto white
 balance renders the two bodies differently shot to shot, which fights both stereo
@@ -669,6 +690,6 @@ curl -s -X POST 192.168.1.201:8080/api/spool/prune -d '{"confirm":"prune"}'</cod
 
 <footer>
   <span>Wild Sync</span><span>rigd · ilxctl · piagent</span>
-  <span>manual revised 2026-08-24</span><span>documents the audit-fixes build</span>
+  <span>manual revised 2026-09-21</span><span>documents the main branch</span>
 </footer>
 </div>

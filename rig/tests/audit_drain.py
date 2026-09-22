@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — drain / ingest / stereo_check lane (G1..G7).
+"""Audit regression suite — drain / ingest / stereo_check (G1..G7).
 
 G1  The drain pulled only the RAW of each RAW+JPEG content and then deleted
     the CONTENT, destroying the never-pulled card JPEG of every shot; ingest

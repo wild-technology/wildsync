@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — rigcore lane (findings K1-K10).
+"""Audit regression suite — rigcore (findings K1-K10).
 
 K1  NodeMonitor.clock_offset_s()/clock_offset_info() (contract C1): the host
     Mac's clock is not disciplined (187 ms behind NTP, ~60 ppm) while the two
@@ -86,7 +86,7 @@ from fakenode import FakeNode                    # noqa: E402
 # ---------------------------------------------------------------------------
 # A minimal fleet: fakes + monitors + SettingsManager on a throwaway RIG_HOME.
 # Deliberately NOT soaktest.Env — nothing here needs a RunManager, and staying
-# off run.py keeps the suite fast and independent of that lane.
+# off run.py keeps the suite fast and independent of it.
 # ---------------------------------------------------------------------------
 _GLOBALS = ("RIG_HOME", "DESIRED_PATH", "RUNS_DIR", "RIGD_LOG")
 

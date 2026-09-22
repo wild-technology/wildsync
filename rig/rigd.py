@@ -192,7 +192,7 @@ def _clamp_to_range(v, rng):
 
 # ---------------------------------------------------------------------------
 # Anomaly detectors — cheap checks over current fleet state, each with the
-# evidence and a suggested action an operator (or agent) can act on.
+# evidence and a suggested action an operator (or a watcher script) can act on.
 # ---------------------------------------------------------------------------
 STATIC_FIX_PATH = os.path.expanduser("~/rig/static_fix.json")
 # Host-vs-node clock offset that starts costing sync. The whole stereo budget
@@ -2745,7 +2745,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "Set focus with /api/focus/position"}, 400)
                     return
                 # capture_once's result is passed through VERBATIM: it carries
-                # per-node late_ms/skew and (run lane, 2026-08-23) host_offset_s,
+                # per-node late_ms/skew and (since 2026-08-23) host_offset_s,
                 # the node-minus-host offset the fire was scheduled against.
                 # Nothing here may reshape or round it.
                 self._json(RIG.runmgr.capture_once(af=False))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — rigd lane (findings D1..D8).
+"""Audit regression suite — rigd (findings D1..D8).
 
 Every check here FAILS on the pre-fix rigd.py and passes after.
 
@@ -408,7 +408,7 @@ def t_inputs(h):
     # STOP as delivered.
     # Staged WITHOUT taking the listener down: fakenode.loopback_map gives
     # every process the same ports for a given os.getpid() % 40, so releasing
-    # a port mid-suite lets a second soaktest process (three lanes share this
+    # a port mid-suite lets a second soaktest process (parallel suites share this
     # worktree) bind it and answer our monitor as a live camera — see the
     # staging note in t_drain. An unclaimed body is the real "not connected"
     # anyway; connect_lies keeps the monitor from re-claiming it.
@@ -468,8 +468,8 @@ def t_inputs(h):
 # ===========================================================================
 def _drifted_http_json(offsets):
     """Wrap rigcore.http_json so a fake's /health reports a clock `offset`
-    seconds off the host's. The fakes have no clock knob and are not this
-    lane's file, so the drift is injected on the wire instead."""
+    seconds off the host's. The fakes have no clock knob and are not under
+    test here, so the drift is injected on the wire instead."""
     orig = rigcore.http_json
 
     def w(url, *a, **kw):
@@ -764,7 +764,7 @@ def t_drain(h):
         # flaked in a FULL soaktest run while passing standalone. down()
         # RELEASES the fake's loopback listener, and fakenode.loopback_map
         # hands every process the same ports for a given os.getpid() % 40: a
-        # second soaktest process (three lanes share this worktree) sitting in
+        # second soaktest process (parallel suites share this worktree) sitting in
         # _mkserver's 5 s bind-retry loop takes the port the moment we let go
         # and answers OUR monitor as a live camera. The node then reads
         # CAM_CONNECTED, the auto-drain runs, and both checks below fail —

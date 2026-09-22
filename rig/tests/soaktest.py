@@ -1229,7 +1229,7 @@ def suite_runmgr(opts):
         # gate run: edge 3 at ...695.9549 (rounds to .95) came back indexed at
         # ...695.955x (rounds to .96), so a SUB-MILLISECOND difference was
         # reported as a wrong capture instant. It is load-dependent — 8/8 clean
-        # here on an idle machine, failing on the gate run that had three lanes
+        # here on an idle machine, failing on the gate run that had three suites
         # testing at once — which is exactly what a flaky gate looks like.
         # The defect this exists to catch is 0.10 s (frame 2 taking frame 3's
         # edge) to 0.20 s (frame 1 taking frame 3's), i.e. 5-10x the tolerance
@@ -2294,34 +2294,34 @@ def soak(seconds, opts):
 
 
 # ===========================================================================
-# The per-lane audit suites (rig/tests/audit_<lane>.py, contract C5) live in
+# The per-file audit suites (rig/tests/audit_<name>.py, contract C5) live in
 # their own files and are imported LAZILY — at call time, not at import time.
-# A syntax error or a bad top-level import in one lane's audit file would
+# A syntax error or a bad top-level import in one audit file would
 # otherwise take the whole gate down at `import soaktest`, which is exactly
-# backwards: the gate exists to report that lane as broken, not to vanish with
+# backwards: the gate exists to report that suite as broken, not to vanish with
 # it. So an import failure becomes one FAILing check named after the suite and
 # every other suite still runs.
-AUDIT_LANES = ["run", "rigcore", "rigd", "drain", "ui", "piagent", "ilxctl",
-               "nav", "verify"]
+AUDIT_SUITES = ["run", "rigcore", "rigd", "drain", "ui", "piagent", "ilxctl",
+                "nav", "verify"]
 
 
-def _audit_suite(lane):
+def _audit_suite(name):
     def runner(opts):
-        sect("audit-%s (rig/tests/audit_%s.py)" % (lane, lane))
+        sect("audit-%s (rig/tests/audit_%s.py)" % (name, name))
         try:
-            mod = __import__("audit_%s" % lane)
+            mod = __import__("audit_%s" % name)
         except Exception as e:                                # noqa: BLE001
             import traceback
             traceback.print_exc()
-            check("audit_%s.py imports" % lane, False, repr(e))
+            check("audit_%s.py imports" % name, False, repr(e))
             return
         fn = getattr(mod, "suite", None)
         if not callable(fn):
-            check("audit_%s.py exposes suite(opts)" % lane, False,
+            check("audit_%s.py exposes suite(opts)" % name, False,
                   "no callable `suite`")
             return
         fn(opts)
-    runner.__name__ = "suite_audit_%s" % lane
+    runner.__name__ = "suite_audit_%s" % name
     return runner
 
 
@@ -2330,7 +2330,7 @@ SUITES = [("fake", suite_fake), ("monitor", suite_monitor),
           ("settings", suite_settings), ("runmgr", suite_runmgr),
           ("pull", suite_pull), ("drain", suite_drain),
           ("resource", suite_resource)]
-SUITES += [("audit-" + lane, _audit_suite(lane)) for lane in AUDIT_LANES]
+SUITES += [("audit-" + name, _audit_suite(name)) for name in AUDIT_SUITES]
 
 
 def main():
@@ -2403,7 +2403,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # The audit_<lane> suites do `from soaktest import check, sect, ...`. Run as
+    # The audit_<name> suites do `from soaktest import check, sect, ...`. Run as
     # a script this file is sys.modules["__main__"], so that import loaded a
     # SECOND copy of it — with its own PASS/FAIL lists and a second netguard
     # wrapped around rigcore.http_json. Every audit result went into a module

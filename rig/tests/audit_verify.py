@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Audit regression suite — VERIFY lane (cross-lane contracts).
+"""Audit regression suite — cross-file contracts.
 
-The six audit-fix lanes each owned one file. This suite pins the seams
-BETWEEN them: the places where one lane changed a wire contract and the lane
-that consumes it had to change to match. A lane suite cannot catch these,
+The other audit suites each cover one file. This suite pins the seams
+BETWEEN them: the places where one file changed a wire contract and the file
+that consumes it had to change to match. A per-file suite cannot catch these,
 because each half passes its own tests in isolation.
 
 V1 (2026-08-24) THE epoch_hw CONTRACT, host half.
-    The piagent lane fixed the node half of the epoch_hw blocker: a kernel
+    The piagent fix closed the node half of the epoch_hw blocker: a kernel
     edge stamp is no longer thrown away during the pipe-read excursions it
     exists to correct (the band was 0.25 s, cutting INSIDE a distribution
     whose documented excursions reach the hundreds of ms, and discarding the
@@ -19,8 +19,8 @@ V1 (2026-08-24) THE epoch_hw CONTRACT, host half.
         hw_lag_ms the measured pipe-read latency
         hw_reject why the stamp was refused: no_stamp | stamp_ahead | domain
 
-    and stated in its handoff that the HOST must act on it, which no lane
-    then did. Without the host half the blocker is only half dead: an edge
+    and documented that the HOST must act on it, which the host did not
+    yet do. Without the host half the blocker is only half dead: an edge
     the node openly refused to stamp was still written
     capture_source=gpio_edge with the fleet clock error as its whole error
     bar - a row asserting sub-millisecond hardware timing on a stamp that
@@ -28,7 +28,7 @@ V1 (2026-08-24) THE epoch_hw CONTRACT, host half.
     `hw_meta` being absent were also indistinguishable to the host (both
     read as "no epoch_hw"), and they need OPPOSITE treatment.
 
-    These checks fail on the code as the six lanes left it and pass after.
+    These checks fail on the code before the host-side fix and pass after.
 
 Hermetic: in-process fakes on loopback only, temp run roots. ~35 s.
 
