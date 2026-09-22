@@ -1260,7 +1260,7 @@ class PullWorker(threading.Thread):
         if clk_off is None:
             clk_off = self.provider.fleet_clock_offset()
         nav = self.provider.nav_snapshot(epoch)
-        imu = self.provider.imu_snapshot(epoch, off=clk_off)
+        imu = self.provider.imu_snapshot(epoch, off=clk_off, node=self.mon)
         row = {k: "" for k in FLIGHT_HEADER}
         row.update({
             "filename": fname,
@@ -3072,7 +3072,7 @@ class RunManager:
         self._imu_node_cache = None
         return None
 
-    def imu_snapshot(self, epoch, off=None):
+    def imu_snapshot(self, epoch, off=None, node=None):
         """Attitude at a HOST capture instant.
 
         The IMU ring is stamped by piagent on the IMU NODE's clock, and the
@@ -3091,8 +3091,22 @@ class RunManager:
         where it was looked for. The fleet median is also the RIGHT number
         here: the IMU node is chrony-locked to the camera nodes, so its ring
         and their edges are one domain, and it is the host that has drifted
-        away from all of them."""
-        imu_mon = self.imu_monitor()
+        away from all of them.
+
+        `node` is the monitor of the camera that took the frame. With one IMU
+        per camera (the Olive on each node), that camera's OWN IMU is the
+        attitude of that frame; the fleet-wide IMU node is only the fallback
+        for a camera whose node has none."""
+        imu_mon = None
+        if node is not None and not self.imu_node:
+            try:
+                if node.is_connected() and \
+                        (node.health.get("imu") or {}).get("present"):
+                    imu_mon = node
+            except Exception:  # noqa: BLE001 - a fake without health
+                imu_mon = None
+        if imu_mon is None:
+            imu_mon = self.imu_monitor()
         if not imu_mon:
             return None
         if off is None:

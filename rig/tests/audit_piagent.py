@@ -830,6 +830,131 @@ def suite(opts):
           bool(sto.get("raw_tail_hex")) and sto.get("dormant") is True,
           "%r" % (sto,))
 
+    # ---- P11: strobe role, strobe polarity, Olive as the primary IMU ------
+    # Module-level config (env read at import), so these run piagent in a
+    # child process on an ephemeral port, exactly as systemd would.
+    sect("audit piagent: strobe role + polarity + Olive primary IMU (P11)")
+    import socket
+    import subprocess
+
+    def _try_get(url):
+        try:
+            return _get(url)
+        except Exception:  # noqa: BLE001 - child still starting
+            return None
+
+    def _spawn(env_extra):
+        with socket.socket() as so:
+            so.bind(("127.0.0.1", 0))
+            port = so.getsockname()[1]
+        env = dict(os.environ, HOME=_TMP, PIAGENT_PORT=str(port), **env_extra)
+        pr = subprocess.Popen([sys.executable, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "piagent.py")],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        url = "http://127.0.0.1:%d" % port
+        wait_for(lambda: "gpio" in (_try_get(url + "/health") or {}), timeout=15.0,
+                 interval=0.3)
+        return pr, url
+
+    ps, us = _spawn({"PIAGENT_ROLE": "strobe", "WILDSYNC_STROBE_LINE": "5",
+                     "WILDSYNC_STROBE_ACTIVE": "high"})
+    try:
+        h = _try_get(us + "/health") or {}
+        g = h.get("gpio") or {}
+        check("strobe role reports role=strobe and the configured line",
+              g.get("role") == "strobe"
+              and (g.get("strobe") or {}).get("bcm") == 5
+              and (g.get("strobe") or {}).get("active") == "high", "%r" % g)
+        check("strobe role runs no IMU slot (no serial probing on the host)",
+              (h.get("imu") or {}).get("present") is False
+              and (h.get("imu") or {}).get("enabled") is False)
+        for path in ("/gpio/fire", "/gpio/focus"):
+            try:
+                r = _post(us + path, {"hold": True})
+            except Exception as e:  # noqa: BLE001 - urllib raises on 409
+                try:
+                    r = json.loads(e.read().decode())
+                except Exception:  # noqa: BLE001
+                    r = {"error": repr(e)}
+            check("strobe role refuses %s (no camera harness here)" % path,
+                  r.get("ok") is False and r.get("code") == 409, "%r" % r)
+    finally:
+        ps.terminate()
+        ps.wait(timeout=10)
+
+    po, uo = _spawn({"PIAGENT_IMU": "olive:sim"})
+    try:
+        ok = wait_for(lambda: ((_try_get(uo + "/health") or {}).get("imu")
+                               or {}).get("present") is True, timeout=15.0,
+                      interval=0.3)
+        h = (_try_get(uo + "/health") or {}).get("imu") or {}
+        check("PIAGENT_IMU=olive puts the Olive on the primary /imu slot",
+              bool(ok), "%r" % h)
+        check("...and switches slot 2 off",
+              (h.get("imu2") or {}).get("enabled") is False)
+        lt = {}
+        for _ in range(30):
+            lt = _try_get(uo + "/imu/latest") or {}
+            lt = lt.get("sample") if isinstance(lt.get("sample"), dict) else lt
+            if "roll" in lt:
+                break
+            time.sleep(0.2)
+        check("/imu/latest serves the Olive's samples",
+              "roll" in lt and "epoch" in lt, "%r" % sorted(lt)[:8])
+    finally:
+        po.terminate()
+        po.wait(timeout=10)
+
+    # Polarity at the driver: the XR256 board wants a rising edge at the
+    # strobe instant, the contact-closure flash a falling one.
+    import types
+    events = []
+    fake = types.ModuleType("gpiod")
+    fake.LINE_REQ_FLAG_OPEN_DRAIN, fake.LINE_REQ_FLAG_BIAS_PULL_UP = 1, 2
+    fake.LINE_REQ_DIR_OUT = 3
+
+    class _L(object):
+        def __init__(self, n):
+            self.n = n
+
+        def request(self, **k):
+            events.append(("req", self.n, k["flags"], k["default_vals"][0]))
+
+        def set_value(self, v):
+            events.append(("set", self.n, v))
+
+        def release(self):
+            pass
+
+    class _C(object):
+        def __init__(self, name):
+            pass
+
+        def get_line(self, n):
+            return _L(n)
+
+        def close(self):
+            pass
+
+    fake.Chip = _C
+    real = sys.modules.get("gpiod")
+    sys.modules["gpiod"] = fake
+    try:
+        piagent._LineDriver("gpiochip0", (5,), pull_up=False,
+                            active_high=True).pulse(5, 0.001)
+        piagent._LineDriver("gpiochip0", (26,), pull_up=False).pulse(26, 0.001)
+    finally:
+        if real is None:
+            sys.modules.pop("gpiod", None)
+        else:
+            sys.modules["gpiod"] = real
+    hi = [e for e in events if e[1] == 5]
+    lo = [e for e in events if e[1] == 26]
+    check("active-high strobe: push-pull, idles LOW, pulse rises then falls",
+          hi == [("req", 5, 0, 0), ("set", 5, 1), ("set", 5, 0)], "%r" % hi)
+    check("active-low strobe unchanged: open-drain, idles high-Z, pulls low",
+          lo == [("req", 26, 1, 1), ("set", 26, 0), ("set", 26, 1)], "%r" % lo)
+
     # ---- teardown ---------------------------------------------------------
     for g in cleanup:
         g._watchdog_run = False

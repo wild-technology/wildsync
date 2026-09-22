@@ -1635,9 +1635,9 @@ def _r12g_card_review_imu_window(opts):
         asked = []
         real_imu = env.runmgr.imu_snapshot
 
-        def recording_imu(epoch, off=None):
+        def recording_imu(epoch, off=None, node=None):
             asked.append((epoch, off))
-            return real_imu(epoch, off=off)
+            return real_imu(epoch, off=off, node=node)
 
         env.runmgr.imu_snapshot = recording_imu
         node.add_frame(epoch=time.time(), name="ILXCARD01.JPG", exif=False)

@@ -4,7 +4,7 @@
 #   deploy/pi-resync/install.sh /Volumes/system-boot
 #
 # Fills the template from the card's own existing user-data (password hash and
-# the Jetson key are carried over unchanged) plus this Mac's ~/.ssh/id_ed25519.pub,
+# the Jetson key are carried over unchanged) plus this host's ~/.ssh/id_ed25519.pub,
 # backs up the originals, and bumps the cloud-init instance-id so the node
 # re-runs the users + chrony steps on its next boot. Run once per card.
 set -euo pipefail
@@ -13,7 +13,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 [ -f "$V/user-data" ] || { echo "no user-data under $V — is the card mounted?"; exit 1; }
-[ -f "$HOME/.ssh/id_ed25519.pub" ] || { echo "no ~/.ssh/id_ed25519.pub on this Mac"; exit 1; }
+[ -f "$HOME/.ssh/id_ed25519.pub" ] || { echo "no ~/.ssh/id_ed25519.pub on this host - run ssh-keygen -t ed25519"; exit 1; }
 
 HASH="$(grep -m1 '^[[:space:]]*passwd:' "$V/user-data" | sed 's/^[[:space:]]*passwd:[[:space:]]*//')"
 JKEY="$(grep -m1 'ssh-ed25519' "$V/user-data" | sed 's/^[[:space:]]*-[[:space:]]*//')"
@@ -57,4 +57,4 @@ fi
 
 echo "written: $V/user-data ($(grep -c ssh-ed25519 "$V/user-data") keys), $V/meta-data ($(cat "$V/meta-data"))"
 echo "originals: user-data.bak-$STAMP, meta-data.bak-$STAMP"
-echo "next: eject the card, boot the Pi, then from this Mac:  ssh ubuntu@<pi-ip>"
+echo "next: eject the card, boot the Pi, then from this host:  ssh ubuntu@<pi-ip>"

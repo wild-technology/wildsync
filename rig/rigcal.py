@@ -23,9 +23,10 @@ VSLAM documents (docs/vslam-jetson.md): K/dist per camera, R, T, baseline.
 vslam.load_stereo_calibration() consumes it.
 
 IMU CALIBRATION
-    Each camera now carries its own IMU (cam1: YB on /imu, cam2: Olive on
-    /imu2). calibrate_imu() samples a still window, refuses if the rig moved,
-    and records gyro bias, accel norm, and the mounting attitude reference
+    Each camera carries its own IMU (an Olive per camera, served on /imu;
+    IMU_SOURCES() falls back to /imu2 for a node configured the older way).
+    calibrate_imu() samples a still window, refuses if the rig moved, and
+    records gyro bias, accel norm, and the mounting attitude reference
     (the pitch/roll the IMU reports when the rig is level - the number every
     later attitude is read against). "both" also records the relative
     cam1->cam2 orientation seed the fusion filter needs (docs/olive-imu.md).
@@ -486,13 +487,29 @@ def stereo_session():
 # ---------------------------------------------------------------------------
 # IMU calibration
 # ---------------------------------------------------------------------------
-# Which IMU endpoint each camera's Pi serves: cam1 carries the YB on slot 1,
-# cam2 the Olive on slot 2. Hosts come from the live node table so a field
-# re-address (~/rig/nodes.json) carries over.
+# Which IMU endpoint each camera's Pi serves. The rig's IMUs are Olives, one
+# per camera, on the PRIMARY slot (/imu, PIAGENT_IMU=olive:... - see
+# deploy.sh); a node still configured the older way carries its Olive on slot
+# 2 (/imu2). Resolved per node from its own /health at call time rather than
+# hard-coded, so either layout calibrates. Hosts come from the live node table
+# so a field re-address (~/rig/nodes.json) carries over.
+STEREO_PAIR = ("cam1", "cam2")
+
+
+def _imu_path(host):
+    h = http_json("http://%s:8081/health" % host, timeout=3)
+    imu = (h or {}).get("imu") if isinstance(h, dict) else None
+    if isinstance(imu, dict):
+        if imu.get("present"):
+            return "/imu/latest"
+        if (imu.get("imu2") or {}).get("present"):
+            return "/imu2/latest"
+    return "/imu/latest"
+
+
 def IMU_SOURCES():
-    paths = {"cam1": "/imu/latest", "cam2": "/imu2/latest"}
-    return {n["name"]: (n["host"], paths.get(n["name"], "/imu/latest"))
-            for n in rigcore.NODES if n["name"] in paths}
+    return {n["name"]: (n["host"], _imu_path(n["host"]))
+            for n in rigcore.NODES if n["name"] in STEREO_PAIR}
 STILL_GYRO_DPS = 2.0        # allowed |gyro| std while "still"
 STILL_ACC_G = 0.02          # allowed |accel| std
 

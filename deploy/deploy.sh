@@ -3,7 +3,9 @@
 #
 #   ./deploy.sh provision cam2   first-time setup of a bare node (SDK + build)
 #   ./deploy.sh node cam1        update sources, rebuild ilxctl, restart services
-#   ./deploy.sh jetson           install rigd on this Jetson
+#   ./deploy.sh jetson           install rigd on this Jetson (the rig's clock master)
+#   ./deploy.sh strobe           install the XR256 strobe agent on this Jetson
+#   ./deploy.sh trust cam1       push this host's ssh key to a node (once per node)
 #   ./deploy.sh all              every reachable camera node + the Jetson
 #
 # ilxctl is ALWAYS built on the target. Nodes and the Jetson are all aarch64 but
@@ -13,7 +15,7 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # The fleet, in deploy order. A space-separated string, not an array and not
-# `declare -A`: the rigd host is a Mac now, and macOS ships bash 3.2, which has
+# `declare -A`: this script must also run from a macOS host, whose bash 3.2 has
 # neither (the old associative form died with "cam1: unbound variable" under
 # set -u). `all` iterates this, so a new node is one edit here plus one line in
 # _ip() - previously `all` carried its own literal "cam1 cam2" pair and adding
@@ -52,10 +54,10 @@ provision_node() {
   # rsyncing those bricked the node build with a missing libCr_Core.so while
   # looking like a successful provision (audit 2026-08-27).
   #
-  # lib-linux/ is the way out of that on a Mac host, and since the Jetson was
-  # retired the Mac is the only host there is - so `make sdk` (which stages for
-  # THIS platform) could never provision a node, and the refusal below had no
-  # remedy on the machine actually running it. `make sdk-linux` fills
+  # lib-linux/ is the way out of that on a Mac host: `make sdk` (which stages
+  # for THIS platform) could never provision a node from there, and the
+  # refusal below had no remedy on that machine. On the Jetson (Linux aarch64)
+  # plain `make sdk` stages .so and lib/ works directly. `make sdk-linux` fills
   # lib-linux/ from the Linux64ARMv8 package, leaving lib/ alone so ilxctl
   # still builds here. Prefer it when present; fall back to lib/ so a genuinely
   # Linux host (a node, or the old Jetson) keeps working unchanged.
@@ -172,6 +174,8 @@ else
   # Mac answers NTP; the moment something does, every node abandons the peer
   # group for the undisciplined host clock, as a common-mode offset that
   # rigd's node_clock_skew cannot see by construction.
+  # The one deliberate master is a Jetson host that ran `deploy.sh jetson`:
+  # `deploy.sh node` from THAT host writes 20-wildsync-host.conf pointing at it.
   sudo rm -f /etc/chrony/conf.d/wildsync.conf
   if [ ! -f /etc/chrony/conf.d/10-wildsync.conf ]; then
     echo "  WARNING: no 10-wildsync.conf on this node - it has no rig peer mesh." >&2
@@ -205,7 +209,27 @@ deploy_node() {
   scp -q "$REPO"/deploy/piagent.service ubuntu@"$ip":/tmp/piagent.service
   scp -q "$REPO"/deploy/olive-bridge.service ubuntu@"$ip":/tmp/olive-bridge.service
   scp -q "$REPO"/deploy/ilxctl.service ubuntu@"$ip":/tmp/ilxctl.service
-  ssh ubuntu@"$ip" 'bash -s' <<'REMOTE'
+  # Which IMU serves this node's /imu/* (and so its flight-log attitude). The
+  # rig's IMUs are Olive olixVision units, one per camera, relayed by
+  # olive-bridge to localhost UDP. Override per run for a Yahboom node:
+  #   WILDSYNC_NODE_IMU=yb deploy/deploy.sh node cam1
+  local imu="${WILDSYNC_NODE_IMU:-olive:udp:9901}"
+  if [ "$imu" = yb ]; then
+    printf 'PIAGENT_IMU2=olive:udp:9901\n' > /tmp/wildsync-piagent.env
+  else
+    printf 'PIAGENT_IMU=%s\nPIAGENT_IMU2=off\n' "$imu" > /tmp/wildsync-piagent.env
+  fi
+  scp -q /tmp/wildsync-piagent.env ubuntu@"$ip":/tmp/wildsync-piagent.env
+  rm -f /tmp/wildsync-piagent.env
+  # When this host is the rig's clock master (deploy.sh jetson has run here),
+  # point the node at it. The strobe fires on THIS host's clock and the
+  # cameras on the nodes' clocks, so one reference keeps delta honest; the
+  # node's peer mesh (10-wildsync.conf) stays as the fallback.
+  local master=""
+  if [ -f /etc/chrony/conf.d/wildsync-host.conf ] && command -v ip >/dev/null 2>&1; then
+    master="$(ip route get "$ip" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  fi
+  ssh ubuntu@"$ip" "WILDSYNC_MASTER='$master' bash -s" <<'REMOTE'
 set -uo pipefail
 cd ~/wildsync
 if [ ! -f lib/libCr_Core.so ]; then
@@ -219,6 +243,16 @@ fi
 echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | \
   sudo tee /etc/udev/rules.d/99-gpio.rules >/dev/null
 sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=gpio || true
+# USB access for ilxctl, which runs as `ubuntu` (deploy/ilxctl.service), not
+# root. /dev/bus/usb/* is root-only for writes on Ubuntu Server and a system
+# service gets no seat ACL, so without this a fresh node starts ilxctl cleanly
+# and then finds no camera. Sony's vendor ID (054c, from the HANDOFF 2.2
+# unbind recipe) is matched without a product ID because the body enumerates
+# with a different product ID per USB mode.
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="054c", GROUP="plugdev", MODE="0660"' | \
+  sudo tee /etc/udev/rules.d/99-wildsync-sony.rules >/dev/null
+sudo usermod -aG plugdev ubuntu
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb || true
 sudo cp /tmp/piagent.service /etc/systemd/system/piagent.service
 sudo cp /tmp/olive-bridge.service /etc/systemd/system/olive-bridge.service
 # ilxctl.service ships from the repo as of cam3. Until then this step was a
@@ -234,9 +268,34 @@ sudo cp /tmp/ilxctl.service /etc/systemd/system/ilxctl.service
 # "start-limit-hit" - which breaks this deploy and, worse, the last step of
 # HANDOFF 2.2's un-wedge recipe. Clear the counter before every restart.
 sudo systemctl reset-failed ilxctl 2>/dev/null || true
-# Uniform fleet config: the imu2 slot listens on localhost UDP everywhere;
-# on a node with no Olive the bridge idles and the slot reports absent.
-echo 'PIAGENT_IMU2=olive:udp:9901' | sudo tee /etc/default/piagent >/dev/null
+# IMU selection, rendered on the deploying host (see WILDSYNC_NODE_IMU above).
+sudo cp /tmp/wildsync-piagent.env /etc/default/piagent
+# The Olive's USB-C is a CDC-Ethernet gadget. Pin it as olive0 on its own
+# subnet (Pi .2, unit .100) so olive-bridge finds it at 192.168.7.100:5500.
+# Written only when it differs, so a routine deploy never re-applies netplan.
+OLIVE_NP=/etc/netplan/60-wildsync-olive.yaml
+cat > /tmp/60-wildsync-olive.yaml <<'NP'
+network:
+  version: 2
+  ethernets:
+    olive0:
+      match:
+        driver: cdc_ether
+      set-name: olive0
+      addresses: [192.168.7.2/24]
+      dhcp4: false
+      optional: true
+NP
+if ! sudo cmp -s /tmp/60-wildsync-olive.yaml "$OLIVE_NP"; then
+  sudo install -m 600 /tmp/60-wildsync-olive.yaml "$OLIVE_NP"
+  sudo netplan generate && sudo netplan apply && echo "  olive0 link configured (192.168.7.2/24)"
+fi
+# Clock master: the rigd host, when it is one (see the caller).
+if [ -n "$WILDSYNC_MASTER" ]; then
+  printf 'server %s iburst minpoll 4 maxpoll 6 prefer\n' "$WILDSYNC_MASTER" | \
+    sudo tee /etc/chrony/conf.d/20-wildsync-host.conf >/dev/null
+  sudo systemctl restart chrony 2>/dev/null || true
+fi
 sudo systemctl daemon-reload
 sudo systemctl enable olive-bridge >/dev/null 2>&1
 sudo systemctl restart olive-bridge
@@ -260,7 +319,7 @@ deploy_jetson() {
   # discipline while being the Pis' chrony master - the exact failure the
   # field guide warns about on the Mac (audit 2026-08-27).
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-    python3-serial python3-pil python3-numpy python3-opencv chrony \
+    python3-serial python3-pil python3-numpy python3-opencv chrony rsync \
     >/dev/null 2>&1 || echo "  WARNING: apt install failed - check network"
   # The host is the rig's clock master: serve the LAN, keep a local stratum
   # so the rig stays coherent with no upstream at sea, and let GPS-derived
@@ -283,6 +342,67 @@ deploy_jetson() {
   echo "  if the nodes are unreachable over ssh from this host, run '$0 trust <camN>' for each of: $NODES"
 }
 
+# The XR256 strobe agent on THIS host (the Jetson): piagent in its strobe
+# role, claiming one GPIO line and nothing else, registered with rigd as the
+# camera-less node "jetson". Required: which line drives the trigger board.
+#   WILDSYNC_STROBE_LINE=<offset> [WILDSYNC_GPIOCHIP=gpiochip0] \
+#   [WILDSYNC_STROBE_ACTIVE=high] deploy/deploy.sh strobe
+# Find the offset with `gpioinfo` after setting the header pin to GPIO with
+# jetson-io; docs/xr256-jetson-trigger.md section 2.2 has the pin rules.
+deploy_strobe() {
+  echo "=== strobe agent (local) ==="
+  local line="${WILDSYNC_STROBE_LINE:-}"
+  local chip="${WILDSYNC_GPIOCHIP:-gpiochip0}"
+  local active="${WILDSYNC_STROBE_ACTIVE:-high}"
+  if [ -z "$line" ]; then
+    echo "  set WILDSYNC_STROBE_LINE to the trigger pin's line offset on $chip" >&2
+    echo "  (gpioinfo $chip lists them; see docs/xr256-jetson-trigger.md 2.2)" >&2
+    return 1
+  fi
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-libgpiod gpiod \
+    >/dev/null 2>&1 || echo "  WARNING: apt install failed - check network"
+  sudo groupadd -f gpio
+  sudo usermod -aG gpio "$(id -un)"
+  echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | \
+    sudo tee /etc/udev/rules.d/99-gpio.rules >/dev/null
+  sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=gpio || true
+  printf 'PIAGENT_ROLE=strobe\nWILDSYNC_GPIOCHIP=%s\nWILDSYNC_STROBE_LINE=%s\nWILDSYNC_STROBE_ACTIVE=%s\n' \
+    "$chip" "$line" "$active" | sudo tee /etc/default/piagent-strobe >/dev/null
+  sed "s|__REPO__|$REPO|g; s|__USER__|$(id -un)|g" \
+    "$REPO"/deploy/piagent-strobe.service | \
+    sudo tee /etc/systemd/system/piagent-strobe.service >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl enable piagent-strobe >/dev/null 2>&1
+  sudo systemctl restart piagent-strobe
+  # Register with rigd: node "jetson" on localhost, camera switched off, so it
+  # is a strobe host and never a camera (no ilxctl runs here).
+  mkdir -p ~/rig
+  python3 - <<'PY'
+import json, os
+home = os.path.expanduser("~/rig")
+def merge(name, patch):
+    path = os.path.join(home, name)
+    try:
+        with open(path) as fh:
+            cur = json.load(fh)
+    except (OSError, ValueError):
+        cur = {}
+    if not isinstance(cur, dict):
+        print("  %s is a list - add the jetson entry by hand" % path)
+        return
+    cur.update(patch)
+    with open(path, "w") as fh:
+        json.dump(cur, fh, indent=1)
+merge("nodes.json", {"jetson": {"host": "127.0.0.1", "cam_num": 9,
+                                "optional": True}})
+merge("camera_enabled.json", {"jetson": False})
+PY
+  systemctl is-active --quiet rigd && sudo systemctl restart rigd
+  sleep 3
+  echo "  piagent-strobe: $(systemctl is-active piagent-strobe)  ($chip line $line, active-$active)"
+  echo "  in the UI: Controls > Strobe > Node = jetson"
+}
+
 # First contact from a NEW host (the Jetson): the Pis only trust keys that
 # were pushed to them, and every node/provision/power script assumes
 # passwordless ssh. Run once per node; asks for the Pi's password.
@@ -300,6 +420,7 @@ case "${1:-}" in
   trust)     trust_node "${2:?usage: deploy.sh trust <camN>}";;
   node)      deploy_node "${2:?usage: deploy.sh node <camN>}";;
   jetson)    deploy_jetson;;
+  strobe)    deploy_strobe;;
   all)       for n in $NODES; do deploy_node "$n"; done; deploy_jetson;;
-  *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|jetson|all}"; exit 1;;
+  *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|jetson|strobe|all}"; exit 1;;
 esac

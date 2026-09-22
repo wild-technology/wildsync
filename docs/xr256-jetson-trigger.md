@@ -1,7 +1,7 @@
 # XR256 from the Jetson — hardware requirements and testing plan
 
 Research brief for triggering the **Smart Vision Lights XR256** strobe from a
-**Jetson Orin Nano** acting as the rig's command/control computer, so that one
+**Jetson Orin NX** acting as the rig's command/control computer, so that one
 flash exposes both ILX-LR1 bodies on sync.
 
 > **Scope change.** `docs/harness-and-strobe.md` and `docs/strobe-trigger.md`
@@ -11,7 +11,11 @@ flash exposes both ILX-LR1 bodies on sync.
 > VB-22 analysis is not wasted: the *topology* it settled carries over intact.
 > Datasheet: `docs/XR256_Datasheet.pdf` (SVL, Rev 2020/06/15).
 
-**Status 2026-08-26:** research only. Nothing wired, nothing coded. The two
+**Status 2026-09-21:** software in place — `piagent` runs on the Jetson in its
+strobe role (`PIAGENT_ROLE=strobe`, active-high line for this board), installed
+by `deploy/deploy.sh strobe`, which registers the Jetson with rigd as the
+camera-less node `jetson` (README, Install §3). The bench tests in §6 still
+gate field use. Originally (2026-08-26) research only. The two
 mandatory hardware items are a **trigger interface board** (a bare Jetson GPIO
 cannot trigger this light) and a **regulated 24 V supply** sized for the
 light's recharge bursts.
@@ -74,7 +78,7 @@ wavelength/lens variant is on hand (part number on the light body).
 Two facts make a bare Jetson pin a non-starter:
 
 1. **Amplitude.** The PI input wants ≥4 V sourced; the header is 3.3 V logic.
-2. **Drive.** The Orin Nano devkit's 40-pin header sits behind level shifters
+2. **Drive.** The Orin devkit carrier's 40-pin header sits behind level shifters
    good for roughly **1 mA** — signal-only pins. Even an opto LED (5–10 mA) is
    too much load; buffer everything.
 
@@ -118,7 +122,7 @@ comes back.
 Same discipline as `strobe-trigger.md` §3, new silicon:
 
 - Pick a plain header GPIO with no competing alt function; set it as GPIO in
-  the pinmux (`jetson-io` / pinmux spreadsheet for the Orin Nano devkit).
+  the pinmux (`jetson-io` / the pinmux spreadsheet for the module and carrier).
 - **Measure the boot-time state of the candidate pin** across a power cycle
   before wiring — the FOCUS incident rule: *unconfigured and off must be the
   same state*. Stakes are lower here (a boot glitch through the opto fires one
@@ -195,23 +199,32 @@ second light, not a longer pulse.
 
 ## 5. Software work list
 
-From the code as it stands on `jetson-port` (which, despite the name, contains
-no Jetson-specific code — the branch predates the Mac port):
+Status as of 2026-09-21 — items 1–4 and 6 are done; 5 is a bench measurement
+(§6 test 7):
 
-1. **Strobe node concept.** `set_strobe` validates `node` against the camera
+1. **Strobe node concept.** *Done:* `deploy.sh strobe` adds `jetson` to
+   `~/rig/nodes.json` with its camera off. `set_strobe` validates `node` against the camera
    fleet (`rig/run.py:1384-1390`). Register the Jetson as a camera-less node in
    `~/rig/nodes.json` (`rig/rigcore.py:44-74`) or add a `role: strobe` concept.
-2. **A `/gpio/strobe`-compatible endpoint on the Jetson.** A minimal
+2. **A `/gpio/strobe`-compatible endpoint on the Jetson.** *Done:* piagent's
+   strobe role claims only the strobe line, with `WILDSYNC_GPIOCHIP`,
+   `WILDSYNC_STROBE_LINE` and `WILDSYNC_STROBE_ACTIVE=high` (push-pull, idle
+   low, rising edge at the strobe instant), and refuses every harness endpoint.
+   Originally: a minimal
    piagent subset satisfies the existing contract with zero host-side protocol
    changes. `BCM_STROBE` is already env-configurable (`rig/piagent.py:76`),
    but `_LineDriver` resolves its chip by "pinctrl chip with ≥40 lines" —
    Tegra's gpiochip enumeration differs and needs a port.
-3. **Health gating for a camera-less node.** The standalone strobe path is
+3. **Health gating for a camera-less node.** *Done:* rigd's two-predicate
+   fleet keeps a camera-off node present (strobe-capable) while dropping its
+   camera anomalies. The standalone strobe path is
    suppressed when the strobe node is OFFLINE (`rig/run.py:2425-2438`), and
    `NodeMonitor` also polls `ilxctl` on :8080 (`rig/rigcore.py:431`). A node
    with no camera lands in `ILX_DOWN`; make sure that state doesn't suppress
    the flash.
-4. **Clock topology.** `at_epoch` is a node-clock instant and the pulse is a
+4. **Clock topology.** *Done:* `deploy.sh jetson` makes the Jetson a chrony
+   server and `deploy.sh node` (run from it) points each Pi at it with
+   `prefer`. `at_epoch` is a node-clock instant and the pulse is a
    local busy-wait (`rig/piagent.py:842`). Make the Jetson the **chrony
    reference** the Pis discipline to (as the retired Jetson was — ~85 µs RMS
    then); `host_offset` collapses toward zero and the strobe's schedule needs
@@ -221,7 +234,8 @@ no Jetson-specific code — the branch predates the Mac port):
 5. **Scheduling quality on Tegra.** Busy-wait at SCHED_FIFO as piagent does;
    verify the Jetson's `late_ms` distribution under survey load matches the
    Pis' sub-ms behaviour (§6 test 7).
-6. **Docs.** `harness-and-strobe.md` and `strobe-trigger.md` both declare the
+6. **Docs.** *Done:* FIELD-RUN and the field manual carry the XR256 setup
+   and use. `harness-and-strobe.md` and `strobe-trigger.md` both declare the
    XR256 out of scope; revise once this brief is accepted. `FIELD-RUN.md`
    known-limits (§"No strobe yet", recycle ceiling, battery telemetry) change
    materially with this light.

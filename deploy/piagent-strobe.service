@@ -1,0 +1,22 @@
+[Unit]
+Description=Wild Sync piagent (strobe role) - XR256 trigger on the rigd host
+After=network-online.target chrony.service
+Wants=network-online.target
+
+# TEMPLATE - deploy/deploy.sh strobe renders __REPO__ and __USER__ and installs
+# the result on the Jetson. Same piagent as the camera nodes, run with
+# PIAGENT_ROLE=strobe: it claims ONLY the strobe line (chip, line and polarity
+# from /etc/default/piagent-strobe), never the Pi harness offsets, and runs no
+# EXPOSURE monitor and no IMU probe.
+
+[Service]
+Type=simple
+User=__USER__
+EnvironmentFile=/etc/default/piagent-strobe
+ExecStart=/usr/bin/python3 -u __REPO__/rig/piagent.py
+Restart=always
+RestartSec=3
+SupplementaryGroups=gpio
+
+[Install]
+WantedBy=multi-user.target

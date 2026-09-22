@@ -88,8 +88,8 @@ endif
 # (audit 2026-08-27), which is why deploy.sh now refuses to provision unless it
 # can see a real .so.
 #
-# That refusal left no way to provision a node FROM the Mac at all - and since
-# the Jetson was retired the Mac is the only host there is. This target closes
+# That refusal left no way to provision a node FROM a Mac host at all. (A
+# Jetson host is Linux aarch64: plain `make sdk` already stages .so.) This target closes
 # that gap: it always copies .so, never $(DYLIB_EXT), and writes to a separate
 # directory so the host's own lib/ is untouched and `make` here keeps working.
 #

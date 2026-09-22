@@ -1,18 +1,21 @@
 # Field run — checklist and operating guide
 
-Written 2026-08-23 for the first field survey after the macOS-host rebuild.
-Read `docs/HANDOFF.md` §-1 for what changed; this is the drive-it-on-the-boat
-sheet. rigd runs on the Mac; the two Pi camera nodes run ilxctl + piagent.
+The drive-it-on-the-boat sheet. The operator's guide is the field manual,
+`docs/USER-GUIDE.html`; installing from scratch is `README.md` (Install) and
+`docs/PI-SETUP.md`. rigd runs on the Jetson; each camera's Pi runs ilxctl +
+piagent + olive-bridge; the Jetson also fires the XR256.
 
-## Topology as left
+## Topology
 
 | | |
 |---|---|
-| rigd host | this Mac, launchd agent `org.wildtechnology.wildsync.rigd`, UI at http://localhost:9090 |
+| rigd host | Jetson Orin NX, 192.168.1.29, systemd `rigd`, UI at http://192.168.1.29:9090 (`localhost:9090` on the Jetson) |
+| strobe | XR256, triggered from a Jetson GPIO through the opto board; systemd `piagent-strobe`; appears in the fleet as the camera-less node `jetson` |
 | cam1 | Pi 5, 192.168.1.201, **on its own 802.3at Mode-A PoE injector** (NOT the switch) |
 | cam2 | Pi 4, 192.168.1.202, on the Ubiquiti 2.5G PoE switch |
-| clocks | the two Pis peer each other (chrony orphan mode); 0.6 ms apart, no upstream needed at sea |
-| nav | iKonvert on /dev/cu.usbserial-B400BIHV; **set its DIP switches all-ON for RAW mode** or nav stays silent |
+| IMUs | one Olive olixVision per camera, on that camera's Pi (USB-C, `olive0`); each camera's flight log carries its own IMU's attitude |
+| clocks | the Jetson is the chrony master; the Pis follow it and peer each other as a fallback (~0.6 ms apart with no upstream) |
+| nav | Subsonus RTK antenna on the NMEA 2000 backbone → iKonvert → Jetson USB (`/dev/serial/by-id/usb-FTDI_…`); **iKonvert DIP switches all ON for RAW mode** or nav stays silent |
 
 **Why cam1 is on an injector:** two nodes firing in sync drew more than the
 switch's PoE budget and it dropped a port every time (measured; not a Pi
@@ -24,7 +27,11 @@ the port power-cycle events.
 ## Pre-dive checklist
 
 1. **Power the injector and the switch; confirm both nodes.** UI header shows
-   `2/2 cameras`. Or: `curl -s localhost:9090/api/fleet | python3 -m json.tool`.
+   `2/2 cameras`. Or, on the Jetson:
+   `curl -s localhost:9090/api/fleet | python3 -m json.tool`.
+   **Open or create the project** on the first screen (one per campaign). Its
+   transects, drained RAWs and exports live under
+   `~/wildsync-projects/<name>/`; switching is refused during a run or drain.
 2. **Camera clocks.** Both bodies are ~2 days slow and USB cannot set them
    (Sony refuses it). Set date/time in each body's menu. Not fatal if skipped —
    the rig timestamps every frame by its GPIO exposure edge, and ingest stamps
@@ -54,31 +61,50 @@ the port power-cycle events.
    work, by design; that is the rule holding, not a fault. The only way to lift
    it is to restart ilxctl with `--allow-autofocus` (bench only) — a node in
    that state advertises `afAllowed:true` to the whole fleet.
-5. **Nav.** If you want live GPS, put the iKonvert in RAW mode (all four DIP
-   switches ON, power-cycle it). Otherwise the flight log uses the armed
-   static fix in `~/rig/static_fix.json` — edit that to today's launch point.
-   The preflight will say "STATIC fix in use"; that is a choice, hit Start
-   anyway.
-6. **Disk.** Host `~/rig-runs` and `~/rig-raw` want room: a Small JPEG is
+5. **Nav.** Subsonus powered with an RTK fix, iKonvert in RAW mode (all four
+   DIP switches ON, power-cycle it after changing them). The header reads
+   `nav fix`, and `/api/diag`'s `time` block shows the GPS time source.
+   Without nav, the flight log uses the armed static fix in
+   `~/rig/static_fix.json` — edit that to today's launch point. The preflight
+   will say "STATIC fix in use"; that is a choice, hit Start anyway.
+   **IMUs:** the IMU tab shows both Olives live (~15 Hz). If one is absent,
+   check its USB-C cable and `systemctl status olive-bridge` on that Pi.
+6. **Disk.** The project folder on the Jetson wants room: a Small JPEG is
    ~200 KB, a LossLessL RAW ~30-35 MB, and the drain now also pulls each shot's
    full-size **card JPEG** beside its RAW — budget roughly twice what a
    RAW-only drain used to need. `df -h ~`. The `runs_disk_low` anomaly fires
-   under 5 GB.
-7. **Host clock.** The Mac is **not** disciplined to the Pis and it matters:
-   measured 187 ms behind NTP, drifting ~60 ppm. The rig now corrects both the
-   fire schedule and every frame timestamp for it and says so once per run
-   ("host clock is X ms off the nodes"), but the correction carries its own
-   RTT/2 uncertainty and that lands in `time_err_ms`. **Turn on network time
-   before the dive** — System Settings → General → Date & Time → Set
-   automatically — and the term goes away. A host >100 ms out raises
-   `host_clock_offset`; the header shows an amber `clk ±N ms vs host` chip on
-   any camera more than 50 ms from the host. That chip now reads the
-   **RTT-filtered median**, not the last raw `/health` sample (a single sample
-   produced 83 ms false alarms on a pair chrony had 20 µs apart); the raw
-   sample is still in the chip's tooltip as "last raw sample N ms", so the two
-   figures differing by tens of ms on a busy link is expected. A link too slow
-   to measure a clock over (best RTT ≥20 ms) reads `clk unmeasurable — link
-   N ms` instead of printing an estimate that is mostly network.
+   under 5 GB. The Diag tab's cameras/cards table converts each body's
+   remaining shots into GB: cam1's card is ~64 GB class and cam2's ~512 GB, so
+   swap cam1 to a matching V60 512 GB for long lines.
+7. **Host clock.** On the Jetson, `chronyc tracking` should show it
+   synchronised and `chronyc clients` should list both Pis. The Jetson's clock
+   is the reference every shot **and the strobe** are scheduled against. An
+   earlier, undisciplined host measured 187 ms behind NTP and drifting
+   ~60 ppm; the rig corrects the fire schedule and every frame timestamp for a
+   host offset and says so once per run ("host clock is X ms off the nodes"),
+   but the correction carries its own RTT/2 uncertainty into `time_err_ms`. A
+   host >100 ms out raises `host_clock_offset`; the header shows an amber
+   `clk ±N ms vs host` chip on any camera more than 50 ms from the host. That
+   chip reads the **RTT-filtered median**, not the last raw `/health` sample;
+   the raw sample is in the chip's tooltip, so the two differing by tens of ms
+   on a busy link is expected. A link too slow to measure a clock over (best
+   RTT ≥20 ms) reads `clk unmeasurable — link N ms` instead.
+8. **Strobe (XR256).** Before its housing is sealed: dial on the working step
+   (start at 250 µs; **never Auto**, which free-runs), and write it down — the
+   dial is unreachable once sealed. 24 V rail regulated and inside 22.8–25.2 V,
+   green power LED on. Trigger pair from the Jetson's opto board to the light's
+   PI terminal. In the UI, Controls → Strobe: enabled, Node `jetson`,
+   δ 10 ms; the header pill reads `strobe T+10ms`. **Shutter 1/30 or slower on
+   both bodies** (the fleet default 1/200 is too fast — the preflight warns).
+   Take one frame with the strobe disabled to check ambient, then Capture one
+   with it enabled: the chip between the frames must read **LIT**. Point the
+   light away from people on deck. `systemctl status piagent-strobe` on the
+   Jetson if the node `jetson` is missing from the fleet.
+9. **Calibration.** Calib tab, **in the water** (the WACP-C changes the focal
+   length, so an in-air calibration is wrong underwater): checkerboard corner
+   counts and square size, follow the amber guidance to green, Compute, Save.
+   Stereo VSLAM picks it up automatically. For the IMUs, set the rig still and
+   level and press **Calibrate both** (ten seconds, refused if anything moves).
 
 ## Running a transect
 
@@ -90,7 +116,7 @@ the port power-cycle events.
 - Live preview and small-JPEG delivery run together at 2 Hz with the RAW
   landing on the card — verified 30/30 pairs, 0.4 ms skew, 1 ms preview.
 - Each delivered JPEG is **deleted from the Pi the instant it is verified on
-  the host**, so the Pi spool never fills. The RAW stays on the card. Shooting
+  the Jetson**, so the Pi spool never fills. The RAW stays on the card. Shooting
   RAW+JPEG, the JPEG carries the flight_log row and the RAW is archived beside
   it under the same stem — frame counts count exposures, not files.
 - **A camera that drops out pauses the grid within 3 shots** rather than letting
@@ -107,6 +133,10 @@ the port power-cycle events.
   the pull tally in Transects. By default this also kicks off a card drain
   (below). `drain_started` in the reply is now the truth, so if it says false,
   the cards were **not** emptied and the reason is in the event journal.
+- With the strobe armed, every pair shows **LIT**, **STROBE MISS** or
+  **STROBE ?** beside the jitter chip. A miss means the flash landed outside an
+  exposure window: check both shutters are 1/30 or slower, then move δ towards
+  the middle of 8–12 ms. Transects counts strobe misses per line.
 - `<run>/index.jsonl` is the authoritative frame index. **Do not delete it** —
   ingest and `stereo_check` read it in preference to `run.json`, whose index
   keeps only the last 2000 frames.
@@ -135,7 +165,7 @@ It is pulled off the card **between runs**:
 - The unit of work is the **shot**, not the file: a drain pulls **both** halves
   of each exposure (the RAW *and* its full-size card JPEG, which becomes
   `<base>.card.JPG` in the run and is what `stereo_check` reads). For each:
-  pull to `~/rig-raw` → the Pi's SHA-256 must match the bytes the host received
+  pull to the project's `raw/<node>/` → the Pi's SHA-256 must match the bytes the host received
   → **only when every file of that shot is verified** is the shot deleted from
   the card. `/api/card/delete` is per-shot, so a partly-failed transfer now
   leaves the **whole** shot on the card — expect shots to survive a drain where
@@ -143,8 +173,8 @@ It is pulled off the card **between runs**:
   host-disk floor (2 GB) stops the drain rather than overfilling.
 - **A drain can be cancelled**: `POST /api/drain/cancel`. It stops between
   shots, never between a verify and a card delete, so cancelling can never cost
-  a card original. Anything not reached is still on the card. That replaces
-  `launchctl kickstart -k`, which SIGTERMs rigd and kills the drain mid-pull.
+  a card original. Anything not reached is still on the card. Use it rather
+  than restarting rigd, which kills the drain mid-pull.
 - Duplicate card names (after a body File Number Reset) land as
   `<stem>-c<contentId>.ARW`. That is deliberate, not corruption: nothing already
   verified on the host is ever overwritten.
@@ -153,7 +183,8 @@ It is pulled off the card **between runs**:
   convergence is suspended for that body (its badge freezes rather than going
   divergent).
 - After drain, **run `rig/ingest.py` per node** — `python3 rig/ingest.py
-  ~/rig-raw/cam1` — which renames the RAWs to the rig scheme and writes XMP
+  ~/wildsync-projects/<name>/raw/cam1` (for the Legacy project,
+  `~/rig-raw/cam1`) — which renames the RAWs to the rig scheme and writes XMP
   sidecars (true time, position, attitude). It now prints an `ingest totals:`
   line; read it. A **combined** directory holding both bodies' cards is
   REFUSED when rigd's journal has no `exif_offset` for the run
@@ -189,7 +220,8 @@ convenient or when a card is filling.
 | `camera_clock_wrong` | the body clock is days off (expected; ingest corrects the archive). |
 | `nav_gateway_down` | no live NMEA. If a static fix is armed it is a note, not a fault. |
 | `nav_no_fix` | **recording with no position.** The static fix is armed at run *start* only, so a bus that drops mid-line leaves those rows' lat/long EMPTY — they cannot be placed afterwards. Fix the bus and restart the line. |
-| `host_clock_offset` | the Mac's clock is off the nodes (checklist §7). Turn on network time. |
+| `host_clock_offset` | the Jetson's clock is off the nodes (checklist §7). Check `chronyc tracking` on the Jetson. |
+| `imu_stall` | no IMU sample near a capture instant; that camera's attitude columns are left empty. Check its Olive (checklist §5). |
 | `node_clock_unmeasurable` | that node's link is too slow (RTT ≥20 ms) to verify the 10 ms stereo budget. Check the PoE/switch path. |
 
 Not an anomaly chip, but worth knowing when you are reading the event journal:
@@ -201,8 +233,10 @@ which is deliberately suppressed while the node says `busy`).
 
 ## Known limits (not blockers)
 
-- No strobe yet (deferred). The hardware is wired and the software supports it;
-  one live fire with the flash pointed away will prove the sync-tip wire.
+- The strobe's flash length is set on the XR256's dial and is fixed once its
+  housing is sealed; change it only between dives.
+- The strobe needs a shutter of 1/30 or slower; faster, and the curtain closes
+  before the flash at T + δ.
 - The card drain needs a clean transfer session; power-cycle if wedged (above).
 - cam1's PoE must stay isolated on this switch (see topology).
 - A GPS-corrected `datetime` is absolute to about **half a second** (the
@@ -221,60 +255,39 @@ which is deliberately suppressed while the node says `busy`).
 ## Recovery one-liners
 
 ```
-# fleet + anomalies
+# on the Jetson: fleet + anomalies
 curl -s localhost:9090/api/fleet | python3 -m json.tool
 curl -s localhost:9090/api/anomalies | python3 -m json.tool
-# a node's health / power
+# a node's health / power / IMU
 curl -s 192.168.1.201:8081/health | python3 -m json.tool
 # cancel a running card drain (stops between shots; never loses an original)
 curl -s -X POST localhost:9090/api/drain/cancel
-# restart rigd (finalises any active run first; the plist now allows 60 s for it,
-# so re-run the deploy bootstrap if your ~/Library/LaunchAgents copy is older)
-launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd
+# restart rigd (finalises any active run first; the unit allows 60 s for it)
+sudo systemctl restart rigd
+# restart the strobe agent
+sudo systemctl restart piagent-strobe
+# an Olive IMU gone quiet (on that Pi)
+sudo systemctl restart olive-bridge
 # un-wedge a camera daemon (on the Pi) — see HANDOFF §2.2
 # power-cycle the camera body to clear a stuck transfer/PTP session
 ```
 
-## 2026-08-27 additions — projects, Diag/Alerts/Map tabs
+## The UI tabs
 
-- **Projects.** First load shows the project screen: create one per campaign
-  (name/vessel/site) or open an existing one. Everything a project records —
-  transects, drained RAWs, ZIP exports — lives under
-  `~/wildsync-projects/<name>/`. The pre-project surveys stay untouched in
-  `~/rig-runs`/`~/rig-raw` as the "Legacy" project. Switching is refused while
-  a run or drain is active. The header shows the open project; click it to
-  manage.
-- **Diag tab** is the engine-room page: formatted status log, project +
-  storage + disk, a cameras/cards table (the ≈left column converts each
-  body's remaining shots into GB so mismatched cards are obvious), drain
-  ("Download images") and **Format card** buttons — format asks facts-first
-  and then requires typing the camera's name — and per-run ZIP downloads.
-- **Alerts tab** carries only what needs a human: active anomalies plus the
-  warn/error history, red and bold.
-- **Map tab** plots every frame (cam1 dot, cam2 ring, one color per run) and
-  the boat's trail on an offline UTM canvas — wheel/drag to zoom/pan, Fit,
-  follow-live during a run, hover for the frame, click for its thumbnail.
-  Bench runs on a static fix plot as a single stacked point; that is the fix,
-  not a bug.
-- **Mid-run camera drop** now pauses the grid and SAYS so (Review header +
-  Diag + a red CAPTURE PAUSED line); it resumes only when the camera is back
-  and a probe fire delivers a frame. Run stop lines report per-camera image
-  counts.
-- **Known hardware fact:** cam1's card is ~64 GB class, cam2's ~512 GB class
-  (same settings, ~38 MB/frame both). Swap cam1 to a matching V60 512 GB for
-  long lines.
-
-## 2026-08-27 additions (later) — Calib tab, second IMU
-
-- **Calib tab.** Before survey work (ideally IN water, since the port changes
-  the focal length): print a checkerboard, enter its inner-corner counts and
-  measured square size (and the tape-measured camera spacing if you have it),
-  Start session, and follow the amber guidance - it tells you where to hold
-  the board, when to come closer, and when to tilt, until it turns green.
-  Compute, sanity-check the verdicts, Save. Stereo VSLAM switches from its
-  placeholder baseline to your calibration automatically.
-- **IMU calibrate**: set the rig still and level, press "Calibrate both".
-  Ten seconds, refused if anything moves.
-- **cam2's Olive IMU** rides the USB-C cable as a tiny ethernet device; it
-  needs no attention in the field. If /imu2 goes absent, check the cable and
-  `systemctl status olive-bridge` on cam2's Pi.
+- **Review** — run controls, card drain, the newest pair with jitter and strobe
+  chips. Mid-run camera drops pause the grid and say so (header, Diag, a red
+  CAPTURE PAUSED line); run stop lines report per-camera image counts.
+- **Transects** — finished lines, complete pairs, missing shots, strobe misses.
+- **Map** — every frame (cam1 dot, cam2 ring, one colour per run) and the
+  boat's trail on an offline UTM canvas; wheel/drag to zoom/pan, Fit,
+  follow-live, hover for the frame, click for its thumbnail. Bench runs on a
+  static fix plot as one stacked point.
+- **Controls** — per-camera exposure, focus and zoom; fleet recording format;
+  the Strobe panel.
+- **Nav / IMU** — live NMEA 2000 data and both Olives.
+- **Calib** — stereo checkerboard and IMU calibration (checklist §9).
+- **Diag** — status log, project + storage, cameras/cards table, drain
+  ("Download images"), **Format card** (facts first, then type the camera's
+  name), per-run ZIP downloads.
+- **Alerts** — only what needs a human: active anomalies plus warn/error history.
+- **Events** — the rig's diary.

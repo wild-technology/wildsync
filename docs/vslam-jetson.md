@@ -1,7 +1,7 @@
 # VSLAM-lite — live camera trajectory from the review stream
 
 Written 2026-08-27 (stereo mode added same day). Status: **framework v1,
-runs on the macOS host (CPU)**; finalized on the Jetson Orin Nano, where the
+developed on a macOS host (CPU)**; runs on the Jetson Orin NX rigd host, where the
 backend may be swapped for CUDA. Code: `rig/vslam.py`. Selftest:
 `python3 rig/tests/vslam_selftest.py` (no hardware, no network, passes with
 or without OpenCV installed — 61 checks with, 12 without).
@@ -264,7 +264,7 @@ Measured on this Mac (M-series, CPU, `proc_scale` 0.5 → feature work at
 | trickle rate to keep up with | 2 Hz → 500 ms budget per frame |
 | snapshot JSON at defaults | ~100-125 KB |
 
-Orin Nano CPU (6x A78AE) is roughly 2-4x slower per core → est. 100-200 ms
+The Orin NX CPU (A78AE cores) is roughly 2-4x slower per core than the Mac → est. 100-200 ms
 per frame, still 2.5-5x headroom at 2 Hz **on CPU alone**. So: bring-up on
 the Jetson needs NO CUDA work to function; CUDA is an optimization, not a
 dependency. Re-measure with `stats.proc_ms` from a real run before deciding.

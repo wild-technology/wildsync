@@ -119,20 +119,11 @@ TimeoutStopSec=45
 # and SupplementaryGroups= extends the account's database groups rather than
 # replacing them, so this line is belt-and-braces - check `id ubuntu` first if
 # cam3 was imaged without that cloud-init user block.
-# UNSETTLED, and it is the one thing that lets this unit start cleanly and
-# still find no camera: there is NO udev rule for the Sony body anywhere in
-# this tree (deploy.sh installs only 99-gpio.rules; 054c/0e90 appears only in
-# HANDOFF 2.2's unbind/bind recipe). cam1/cam2 work today under hand-installed
-# units. On real hardware settle which of the two is true, on cam1, with the
-# body attached:
-#   systemctl show -p User -p SupplementaryGroups ilxctl
-#   ls -l /dev/bus/usb/*/* ; grep -ri 054c /etc/udev/rules.d /lib/udev/rules.d
-# If those units run as root, either drop User=/SupplementaryGroups= here too,
-# or have deploy.sh install a rule (IDs from the HANDOFF 2.2 recipe, not
-# invented):
-#   SUBSYSTEM=="usb", ATTR{idVendor}=="054c", ATTR{idProduct}=="0e90", GROUP="plugdev", MODE="0660"
-# Do not trust this unit on cam3 until that is settled: the failure is a
-# silent "no camera found", identical in the UI to a body in the wrong mode.
+# deploy.sh node installs that rule (99-wildsync-sony.rules: Sony vendor
+# 054c, group plugdev, 0660) and adds `ubuntu` to plugdev. If a node still
+# finds no camera with the unit active, check the rule landed and the body is
+# in PC Remote mode:
+#   ls -l /dev/bus/usb/*/* ; cat /etc/udev/rules.d/99-wildsync-sony.rules
 SupplementaryGroups=plugdev
 # Paths are hardcoded to the cam1/cam2 layout (user `ubuntu`, checkout at
 # /home/ubuntu/wildsync, spool at /home/ubuntu/Pictures/ILX-LR1), exactly as

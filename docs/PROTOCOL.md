@@ -1169,3 +1169,35 @@ until measured, so intrinsics come entirely from a checkerboard - no priors.
   ~/rig/imu_calibration.json. First live calibration recorded 2026-08-27
   (cam1 gyro bias [-1.06,-1.27,0] dps; the Olive AHRS stream reports
   zeroed gyro at rest - on-device bias correction, noted for fusion).
+
+## Additions 2026-09-21 — Jetson host, strobe role, Olive as primary IMU
+
+### piagent configuration (environment, `/etc/default/piagent*`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PIAGENT_ROLE` | `node` | `strobe` = camera-less strobe host: claims only the strobe line, runs no EXPOSURE monitor and no IMU, answers 409 to every `/gpio/*` except `/gpio/strobe` |
+| `WILDSYNC_GPIOCHIP` | discovered | force the gpiochip (a non-Pi board, e.g. the Jetson's `tegra234-gpio`) |
+| `WILDSYNC_STROBE_LINE` | `26` | strobe line offset on that chip (`WILDSYNC_STROBE_BCM` still accepted) |
+| `WILDSYNC_STROBE_ACTIVE` | `low` | `low`: open-drain, pulled low for the pulse (contact-closure flash). `high`: push-pull, idle low, rising edge at the strobe instant (XR256 via its opto board) |
+| `PIAGENT_IMU` | Yahboom | `olive[:spec]` puts the Olive on the primary slot (`/imu/*`) and turns slot 2 off |
+| `PIAGENT_IMU2` | auto | second slot, unchanged |
+
+`/health` → `gpio` gains `role` and `strobe.active`.
+
+### Deployed configuration
+
+- The Jetson runs rigd and `piagent-strobe.service` (strobe role), registered
+  in `~/rig/nodes.json` as `"jetson": {"host": "127.0.0.1", "cam_num": 9,
+  "optional": true}` with `{"jetson": false}` in `camera_enabled.json`.
+- Camera nodes run `PIAGENT_IMU=olive:udp:9901`, `PIAGENT_IMU2=off`; the Olive
+  link is `olive0` (netplan `60-wildsync-olive.yaml`, matched on the
+  `cdc_ether` driver).
+- Node chrony prefers the Jetson (`20-wildsync-host.conf`) over the peer mesh.
+
+### Flight log attitude
+
+Each camera's `flight_log.csv` rows take attitude from **that camera's own
+node** when its `/health` reports `imu.present`; otherwise from the fleet IMU
+node as before. The 23-column header is unchanged. `rigcal` resolves each
+camera's IMU endpoint from its `/health` (`/imu`, else `/imu2`).

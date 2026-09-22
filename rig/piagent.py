@@ -73,7 +73,25 @@ BCM_EXPOSURE = 22   # header pin 15 -> harness pin 6
 # supplies its own 2.9 V pull-up), never parked (it is our OUTPUT, not a camera
 # input, and `gpio=26=ip,np` on the kernel cmdline makes unconfigured == off).
 # 0 disables strobe support on this node.
-BCM_STROBE = int(os.environ.get("WILDSYNC_STROBE_BCM", "26"))
+BCM_STROBE = int(os.environ.get("WILDSYNC_STROBE_LINE",
+                                os.environ.get("WILDSYNC_STROBE_BCM", "26")))
+# Strobe polarity. "low" (default) is the contact-closure flash above: an
+# open-drain line pulled low for the pulse. "high" is for a light whose trigger
+# input fires on a RISING edge through a driver/opto board - the XR256's
+# pulse-initiated input (docs/xr256-jetson-trigger.md): the line is a push-pull
+# output idling LOW, and the flash starts on the edge that raises it. Driving
+# the XR256 board active-low would start the flash on the RELEASE edge, one
+# pulse width (5 ms default) late.
+STROBE_ACTIVE_HIGH = os.environ.get("WILDSYNC_STROBE_ACTIVE", "low").strip() \
+    .lower() in ("high", "1", "rising")
+# Node role. "node" (default) is a camera Pi: harness, EXPOSURE monitor, IMU.
+# "strobe" is a camera-less strobe host - the Jetson, which fires the XR256.
+# It claims ONLY the strobe line: the harness numbers above are Pi header
+# offsets, and on another board's gpiochip they are unrelated pins that must
+# never be driven or biased. No EXPOSURE monitor, no IMU probing (the IMU
+# probe opens serial ports, and on the host one of those is the iKonvert).
+ROLE = os.environ.get("PIAGENT_ROLE", "node").strip().lower()
+STROBE_ROLE = ROLE == "strobe"
 # A strobe instant is scheduled relative to the shot's shared target T
 # (δ ≈ 8–12 ms after T clears curtain travel plus skew). Anything more than
 # this far from the trigger instant is a scheduling bug, not a plan.
@@ -193,7 +211,14 @@ def _run(cmd, timeout=5):
 
 
 def discover_gpiochip():
-    """Return the gpiochip name whose driver is the Pi header controller."""
+    """Return the gpiochip name whose driver is the Pi header controller.
+
+    WILDSYNC_GPIOCHIP overrides the search: a non-Pi strobe host (Jetson:
+    `gpiodetect` lists tegra234-gpio / tegra234-gpio-aon) names its chip
+    explicitly rather than trusting the Pi heuristic."""
+    forced = os.environ.get("WILDSYNC_GPIOCHIP", "").strip()
+    if forced:
+        return forced
     rc, out, _ = _run(["gpiodetect"])
     if rc != 0:
         # gpiodetect often needs root until the udev rule lands; try with sudo.
@@ -216,7 +241,16 @@ _HAVE_GPIO = shutil.which("gpioset") is not None
 # On the Pi the udev rule may still be missing; fall back to sudo -n so the
 # service works either way. Resolved once at startup.
 _GPIO_SUDO = []
-if _HAVE_GPIO:
+if _HAVE_GPIO and STROBE_ROLE:
+    # Permission probe WITHOUT touching a line: gpioget would request the pin
+    # as a biased input, and on a strobe host that pin may be wired to a
+    # trigger board. gpioinfo only reads the chip's line table.
+    rc, _, _ = _run(["gpioinfo", GPIOCHIP])
+    if rc != 0:
+        rc2, _, _ = _run(["sudo", "-n", "gpioinfo", GPIOCHIP])
+        if rc2 == 0:
+            _GPIO_SUDO = ["sudo", "-n"]
+elif _HAVE_GPIO:
     rc, _, _ = _run(["gpioget", "--bias=pull-up", GPIOCHIP, str(BCM_EXPOSURE)])
     if rc != 0:
         rc2, _, _ = _run(["sudo", "-n", "gpioget", "--bias=pull-up",
@@ -250,10 +284,17 @@ class _LineDriver:
 
     IDLE, ASSERT = 1, 0                  # open-drain: 1 == high-Z, 0 == pulled low
 
-    def __init__(self, chip_name, lines, pull_up=True):
+    def __init__(self, chip_name, lines, pull_up=True, active_high=False):
         """pull_up=False is for the strobe sync line: the flash supplies its
         own pull-up (measured 2.9 V open circuit), and adding ours would leak
-        current into its trigger circuit for no benefit."""
+        current into its trigger circuit for no benefit.
+
+        active_high=True inverts the line for a rising-edge trigger input
+        (the XR256 via its driver board): push-pull, idle LOW, pulse HIGH. It
+        is never used for the camera harness, whose inputs must idle high-Z."""
+        if active_high:
+            self.IDLE, self.ASSERT = 0, 1
+            pull_up = False
         self.ok = False
         self._lines = {}
         self._chip = None
@@ -263,7 +304,8 @@ class _LineDriver:
             return
         try:
             self._chip = gpiod.Chip(chip_name)
-            flags = getattr(gpiod, "LINE_REQ_FLAG_OPEN_DRAIN", 0)
+            flags = 0 if active_high else \
+                getattr(gpiod, "LINE_REQ_FLAG_OPEN_DRAIN", 0)
             # Bias is a newer kernel/libgpiod feature; if the build lacks it the
             # open-drain idle still leaves the line high-Z, which is safe.
             if pull_up:
@@ -451,8 +493,10 @@ class Gpio:
         self.available = _HAVE_GPIO
         # Prefer the in-process driver: it removes the per-shot subprocess spawn
         # that made trigger latency platform-dependent, and its open-drain idle
-        # doubles as the safe park for both camera inputs.
-        self.driver = _LineDriver(self.chip, self.PARKED_INPUTS)
+        # doubles as the safe park for both camera inputs. A strobe host has no
+        # harness: claim nothing here (see ROLE above).
+        self.driver = _LineDriver(self.chip, () if STROBE_ROLE
+                                  else self.PARKED_INPUTS)
         # Strobe: claimed lazily on the first scheduled strobe, so a node with
         # nothing on pin 37 never touches the line at all. Open-drain with NO
         # pull-up (the flash supplies 2.9 V of its own) and never parked.
@@ -465,7 +509,7 @@ class Gpio:
         # thread is idle unless a hold is actually live.
         self._watchdog_run = True
         threading.Thread(target=self._focus_watchdog_loop, daemon=True).start()
-        if self.available:
+        if self.available and not STROBE_ROLE:
             self._start_monitor()
             if not self.driver.ok:
                 for bcm in self.PARKED_INPUTS:
@@ -789,7 +833,8 @@ class Gpio:
             if not self.available:
                 self._strobe, self._strobe_err = False, "no gpio on this node"
                 return False
-            drv = _LineDriver(self.chip, (BCM_STROBE,), pull_up=False)
+            drv = _LineDriver(self.chip, (BCM_STROBE,), pull_up=False,
+                              active_high=STROBE_ACTIVE_HIGH)
             if not drv.ok:
                 self._strobe, self._strobe_err = False, \
                     "could not claim BCM%d (gpiod path required)" % BCM_STROBE
@@ -1375,6 +1420,7 @@ class Gpio:
     def state(self):
         parked = self.parked()
         return {"chip": self.chip, "available": self.available,
+                "role": ROLE,
                 "focus_held": self.focus_held(),
                 # How long the hold has been live: a hold that outlived its
                 # owner used to be invisible to the host; now rigd can alarm on
@@ -1414,13 +1460,14 @@ class Gpio:
                 # first scheduled strobe, so claimed=False on a node with no
                 # flash is the normal, safe state, not a fault.
                 "strobe": {"bcm": BCM_STROBE,
+                           "active": "high" if STROBE_ACTIVE_HIGH else "low",
                            "claimed": bool(self._strobe),
                            "fires": self._strobe_fires,
                            "last_epoch": self._strobe_last,
                            "error": self._strobe_err},
                 # With the gpiod driver the lines are held open-drain-idle for
                 # the life of the process, which is the safe state by construction.
-                "harness_safe": (self.driver.ok
+                "harness_safe": (STROBE_ROLE or self.driver.ok
                                  or all(parked.get(b) for b in self.PARKED_INPUTS))}
 
     def shutdown(self):
@@ -1701,6 +1748,12 @@ class Imu:
 #   "olive:udp[:port]"      UDP listener (default port: imu_olive's 9901)
 #   "olive:sim"             synthetic stream (offline tests)
 IMU2_SPEC = os.environ.get("PIAGENT_IMU2", "")
+# Primary-slot driver. Unset/"yb" keeps the Yahboom reader (imu_yb) on /imu/*.
+# "olive[:spec]" (same spec forms as above) puts the Olive olixVision on the
+# PRIMARY slot, so /imu/* - which the flight log's attitude columns read -
+# serves it, and slot 2 is switched off. This is how a rig whose IMUs are
+# Olives (one per camera) is configured: PIAGENT_IMU=olive:udp:9901.
+IMU_SPEC = os.environ.get("PIAGENT_IMU", "").strip()
 
 
 class Imu2(Imu):
@@ -1778,8 +1831,16 @@ class Imu2(Imu):
 
 
 GPIO = Gpio()
-IMU = Imu()
-IMU2 = Imu2()
+if STROBE_ROLE:
+    # No IMU on a strobe host: the probe would open the host's serial ports.
+    IMU = Imu2(spec="off")
+    IMU2 = Imu2(spec="off")
+elif IMU_SPEC.lower().startswith("olive"):
+    IMU = Imu2(spec=IMU_SPEC)
+    IMU2 = Imu2(spec="off")
+else:
+    IMU = Imu()
+    IMU2 = Imu2()
 
 
 # ---------------------------------------------------------------------------
@@ -1972,6 +2033,14 @@ class Handler(BaseHTTPRequestHandler):
                         "error": "request body is not valid JSON"}, 400)
             return
         try:
+            if STROBE_ROLE and path.startswith("/gpio/") \
+                    and path != "/gpio/strobe":
+                # A strobe host has no camera harness: every other /gpio/*
+                # action would drive a Pi header offset on this board's chip.
+                self._send({"ok": False, "code": 409,
+                            "error": "strobe-only node (PIAGENT_ROLE=strobe): "
+                                     "%s is not available here" % path}, 409)
+                return
             if path == "/gpio/focus":
                 # Optional ttl_s: the hold lease length; absent means the
                 # 30 s default. Repeating {hold:true} is the keepalive.

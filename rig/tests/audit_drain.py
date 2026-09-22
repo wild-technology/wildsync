@@ -608,6 +608,12 @@ def _g6_foreign_xmp(opts):
 def _g6_stereo_missing_jpg(opts):
     sect("audit G6: stereo_check must skip a pair whose .card.JPG is missing "
          "instead of tracebacking on the first Image.open")
+    try:
+        import cv2  # noqa: F401 - stereo_check imports it at the top
+    except ImportError as e:
+        note("stereo_check needs OpenCV (%s) - G6 skipped on this host; "
+             "deploy.sh jetson installs python3-opencv on the rig" % e)
+        return
     d = _tmp()
     runs = os.path.join(d, "runs")
     root, rows = _write_run(runs, "260823_0000_stereo", 3)

@@ -46,13 +46,14 @@ hostname.
 |---|---|
 | Raspberry Pi 5 (4 GB or 8 GB) | cam1 is a Pi 5, **cam2 is a Pi 4 — both work**. The 40-pin header pinout is identical; only the GPIO chip differs (Pi 5 `gpiochip4`/pinctrl-rp1, Pi 4 `gpiochip0`/pinctrl-bcm2711). `piagent` **discovers** it at runtime by finding the pinctrl chip with ≥40 lines (`rig/piagent.py:discover_gpiochip`) — never hard-code it. |
 | Ubuntu **24.04 LTS arm64 preinstalled SERVER** image | Not desktop. The fleet contract is Ubuntu 24.04 + Python 3.12 + libgpiod v1.6.3 (`docs/PROTOCOL.md`). A desktop image adds a display stack these nodes never use and changes the boot-time and power picture for nothing. |
-| SD card, **V60 / UHS-II**, 64 GB+ | The card in the *Pi* holds the OS and the PC-save spool. The card in the *camera body* is the archive and must also be fast — cam1's old body card stalled on L-size RAW writes (`docs/FIELD-RUN.md` pre-dive §3). Size the Pi card against the spool: nothing prunes `~/Pictures/ILX-LR1` automatically. |
+| SD card, **V60 / UHS-II**, 64 GB+ | The card in the *Pi* holds the OS and the PC-save spool. The card in the *camera body* is the archive and must also be fast — cam1's old body card stalled on L-size RAW writes (`docs/FIELD-RUN.md` pre-dive §3). rigd deletes each frame from `~/Pictures/ILX-LR1` once it has pulled it; the spool only grows when pulls fail (`spool_not_draining`). |
 | PoE HAT (802.3at) | See §8. cam3 runs on its **own dedicated injector**. |
 | GPIO trigger harness | 4 leads. Pinout in §1.1 and `docs/PROTOCOL.md`. |
 | Sony ILX-LR1 body + USB cable to the Pi | The **fallback** stack. One body per node. `ilxctl` takes the single camera on the bus; `--camera`/`--match` exist for the dev bench only. |
 | **Basler a2A4504-18umBAS** + **USB 3** cable | The **primary** camera (§11). USB3 Vision, 20.2 MP mono global shutter, IMX541, 4504×4504 Mono8. Must go in one of the Pi 5's **USB 3** ports — measured 360 MB/s. Bus-powered; see §11 on the current ceiling. |
 | Lens covering a **1.1″** sensor | The Basler's format. Without one you get a frame with no scene structure, and every JPEG size measurement off it is meaningless (§13). |
-| A host on the **rig switch** | Not on Starlink Wi-Fi. See §4 — this is the trap that eats an afternoon. |
+| **Olive olixVision IMU** + USB-C cable | One per camera, into one of the Pi's USB ports. `deploy.sh node` configures it (§6.1). |
+| A host on the **rig switch** | The Jetson Orin NX that runs rigd, wired to the rig switch. If you work from a laptop, it must be wired too, not on Starlink Wi-Fi — see §4. |
 
 ### 1.1 GPIO harness pinout
 
@@ -237,7 +238,7 @@ Ethernet NIC is necessary but **not sufficient**. The symptom is a node that
 pings from nothing, ssh that hangs, and a rig header stuck one camera short,
 all while the Pi is perfectly healthy.
 
-To reach the cameras from the Mac:
+The Jetson is wired to the rig switch and has no Wi-Fi on that range, so it is not affected. A **laptop** on both networks is. To reach the cameras from a Mac:
 
 ```sh
 sudo networksetup -setairportpower en0 off      # Wi-Fi OFF; static IP alone is not enough
@@ -348,7 +349,8 @@ next person which `gpiochip` to expect.
 
 ## 6. Install the rig software
 
-Three commands, in this order, from the checkout on the rigd host:
+Three commands, in this order, from the checkout on the rigd host (the Jetson,
+after `deploy/deploy.sh jetson` has run there once):
 
 ```sh
 cd /path/to/wildsync
@@ -363,30 +365,24 @@ password prompt otherwise.
 
 ### The prerequisite `provision` enforces
 
-`provision_node()` **refuses to run** unless `lib/libCr_Core.so` exists in the
-checkout:
+`provision` needs the **Linux aarch64** Camera Remote SDK to push to the node,
+and **refuses to run** without it:
 
 ```
-REFUSING provision: <repo>/lib has no libCr_Core.so (Linux SDK).
+REFUSING provision: no Linux aarch64 libCr_Core.so to send.
 ```
 
-The nodes need the **Linux aarch64** Camera Remote SDK. `make sdk` stages
-whatever platform the *host* builds for — on the Mac that is `.dylib` files —
-and `provision` `rsync -az --delete`s `lib/` to the node wholesale. Rsyncing
-macOS dylibs **bricked a node build with a missing `libCr_Core.so` while looking
-like a completely successful provision** (audit 2026-08-27). The refusal exists
-so that cannot happen twice; do not work around it.
+```sh
+make sdk-linux CRSDK_DIR=/path/to/unpacked/Linux64ARMv8-package
+```
 
-Two clean ways to satisfy it:
+This stages the `.so` files into `lib-linux/`, which `provision` prefers. It
+works the same on the Jetson and on a Mac, and leaves a Mac's own `lib/`
+(macOS dylibs for a local `ilxctl` build) untouched.
 
-1. **Provision from a Linux host.** `make sdk CRSDK_DIR=/path/to/unpacked/RemoteCli`
-   there stages `.so` files and the Linux `CrAdapter/`, and `provision` pushes
-   the right thing.
-2. **From the Mac, use a separate copy of the checkout** staged with the Linux
-   SDK package, and run `deploy/deploy.sh provision cam3` from that copy. Do not
-   stage the Linux SDK into your working checkout: `lib/CrAdapter/` holds one
-   platform's adapters at a time, so overwriting it breaks the Mac's own
-   `ilxctl` build until you re-run `make sdk` against the macOS package.
+Never push macOS `.dylib` files to a node: that once produced a node build with
+a missing `libCr_Core.so` that looked like a successful provision (audit
+2026-08-27), which is what the refusal exists to prevent.
 
 `ilxctl` is **always built on the node** — the Makefile probes `-mcpu=native`
 and a binary built elsewhere SIGILLs. Never scp the binary between machines.
@@ -401,33 +397,52 @@ its last line:
   ilxctl: active   piagent: active
 ```
 
-**`ilxctl.service` did not exist in this repo until this branch.** cam1 and cam2
-have been running hand-installed units nobody ever captured; `deploy/ilxctl.service`
-is a reconstruction from the daemon's own behaviour, and its header says so.
-Before assuming the fleet is uniform, diff it against the real thing:
+`ilxctl` runs as `ubuntu`, not root. `node` installs the udev rule that lets
+it open the camera (`/etc/udev/rules.d/99-wildsync-sony.rules`: Sony vendor
+`054c`, group `plugdev`) and adds `ubuntu` to `plugdev`. If the unit is active
+but finds no camera, check that rule and that the body is in PC Remote mode
+before anything else. cam1 and cam2 were originally set up with hand-installed
+units; compare once with `ssh ubuntu@192.168.1.201 'systemctl cat ilxctl'`.
+
+### 6.1 The Olive IMU
+
+Each camera carries an Olive olixVision IMU on its node. Plug its USB-C into
+one of the Pi's USB ports; `node` does the rest:
+
+- it pins the IMU's USB network link as `olive0`, Pi `192.168.7.2/24`, IMU
+  `192.168.7.100` (`/etc/netplan/60-wildsync-olive.yaml`, applied only when it
+  changes);
+- `olive-bridge.service` relays the IMU's stream to piagent on local UDP 9901;
+- `/etc/default/piagent` gets `PIAGENT_IMU=olive:udp:9901`, so the Olive is
+  the node's primary IMU and its attitude goes into that camera's flight log.
+
+Check it:
 
 ```sh
-ssh ubuntu@192.168.1.201 'systemctl cat ilxctl'
+ssh ubuntu@192.168.1.20N 'ip -br addr show olive0; systemctl is-active olive-bridge'
+curl -s 192.168.1.20N:8081/health | python3 -c "import sys,json; print(json.load(sys.stdin)['imu'])"
 ```
 
-The open question is USB permissions: there is **no udev rule for the Sony body
-anywhere in this tree** (`deploy.sh` installs only `99-gpio.rules`), so whether
-a non-root `ilxctl` can claim the camera depends on how cam1's hand-installed
-unit does it. That is called out in the unit's own comments with the exact
-commands to settle it. Until it is settled on hardware, treat "unit active, no
-camera found" as the expected failure mode and check there first.
+`present: true` with an `attitude_hz` around 15 is healthy. For a node that
+still carries the older Yahboom IMU, deploy it with
+`WILDSYNC_NODE_IMU=yb deploy/deploy.sh node camN`.
 
 ### Chrony, after provisioning
 
-`provision` writes `/etc/chrony/conf.d/wildsync.conf` pointing the node at
-whatever host ssh'd in, with `prefer` — i.e. the Mac, which is deliberately
-**not** a rig clock master. The card's own step
-(`deploy/pi-resync/user-data.template`) writes the real topology: a full mesh of
-peers across `192.168.1.201/.202/.203` plus an orphan local reference, and
-chrony elects one master by comparing reference IDs. Re-apply that step (or
-remove `wildsync.conf`) after any `provision`, then verify per §9. This is the
-known gap the template documents; it is inert only while nothing on the Mac
-answers NTP.
+The node's clock topology has two layers:
+
+1. The card's own step (`deploy/pi-resync/user-data.template`) writes a full
+   mesh of peers across `192.168.1.201/.202/.203` plus an orphan local
+   reference, so the nodes stay within about a millisecond of each other with
+   no upstream at all.
+2. `deploy.sh node`, run **from the Jetson** after `deploy.sh jetson`, adds
+   `/etc/chrony/conf.d/20-wildsync-host.conf` pointing the node at the Jetson
+   with `prefer`. The Jetson fires the XR256 on its own clock and the nodes fire
+   the cameras on theirs, so one reference keeps the strobe timing honest.
+
+`provision` writes no chrony configuration of its own. Verify per §9:
+`chronyc sources` on a node should show the Jetson selected (`*`) and the
+peers as candidates.
 
 ---
 
@@ -561,7 +576,7 @@ lost power mid-run) and `node_undervoltage` (the rail is sagging). Both are in
 **On the node:**
 
 ```sh
-systemctl is-active ilxctl piagent          # active, active
+systemctl is-active ilxctl piagent olive-bridge   # active, active, active
 cat /sys/module/usbcore/parameters/usbfs_memory_mb   # 1000 (see below)
 grep -o 'usbcore.usbfs_memory_mb=[0-9]*' /proc/cmdline   # present == survives reboot
 ```
@@ -580,9 +595,9 @@ What to actually look at:
 | Endpoint | Check |
 |---|---|
 | `:8081/gpio/state` | `harness_safe` true — the lines are open-drain-idle, no stuck half-press. `chip` is `gpiochip4` on a Pi 5 (`gpiochip0` on a Pi 4) — discovered, not configured. |
-| `:8081/health` | `gpio.ok` true, `gpio.focus_held` false, `disk_free_mb` sane, `power.undervolt_now` false. `node` is the **hostname** (`piagent.py` sets `NODE = socket.gethostname()`), so it reads `pi-cam3` while rigd calls the node `cam3` — that is expected, not a mismatch. |
+| `:8081/health` | `imu.present` true (the Olive, §6.1), `gpio.ok` true, `gpio.focus_held` false, `disk_free_mb` sane, `power.undervolt_now` false. `node` is the **hostname** (`piagent.py` sets `NODE = socket.gethostname()`), so it reads `pi-cam3` while rigd calls the node `cam3` — that is expected, not a mismatch. |
 | `:8080/api/status` | `connected` true, `model`, `id` (record the body serial for the fleet table), `slotStatus`, `remainShots`. **`afAllowed` must be `false`** — `true` means the daemon was started with `--allow-autofocus`, which must never happen on a field node. |
-| `:9090/api/fleet` | three entries; cam3 present with `cam_num` 3. |
+| `:9090/api/fleet` | one entry per camera node (plus `jetson` once the strobe agent is installed); cam3 present with `cam_num` 3. |
 
 **Clocks.** Every scheduled fire and every `epoch_hw` edge lives on the *node's*
 clock, so inter-node clock skew lands 1:1 in true exposure skew while the rig's
@@ -597,7 +612,8 @@ for ip in 192.168.1.201 192.168.1.202 192.168.1.203; do
 done
 ```
 
-All three must print the **same Reference ID** — that is the one-line proof the
+All three must print the **same Reference ID** — the Jetson's address when the
+nodes were deployed from it (§6, Chrony) — which is the one-line proof the
 group has exactly one master. Two distinct refids is a split. After a master
 handover the followers slew rather than step, so give it a minute before
 trusting the budget. rigd's `node_clock_skew` (not `chronyc`) is the detector
@@ -908,7 +924,7 @@ failure into a passing run. `basler_spool.py` now **counts** EXIF failures and
 fails the run on any of them. Verify on the pulled frames, not on the node's
 own say-so.
 
-## 15. Verify the whole path — camera to Mac
+## 15. Verify the whole path — camera to host
 
 Do these in order; each gates the next. The first four need no camera.
 

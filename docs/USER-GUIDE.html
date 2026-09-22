@@ -296,11 +296,10 @@ specific to one of them. The Jetson is the brain; everything else reports to it.
 <tbody>
 <tr><td class="mono">Jetson Orin NX</td><td class="mono">rigd</td><td>the host: settings, the shot schedule, pulling pictures, writing transect folders, serving this page. It also fires the strobe and is the rig's reference clock</td></tr>
 <tr><td class="mono">cam1 / cam2 Pis</td><td class="mono">ilxctl + piagent</td><td>a Raspberry Pi beside each camera, controlled by the Jetson: talks to the body over USB, fires it down the harness wire, timestamps the exposure edge, and reads that camera's IMU</td></tr>
-<tr><td class="mono">ESP32 node controllers</td><td>-</td><td>one per camera node, alongside the Pi</td></tr>
-<tr><td class="mono">per-camera IMUs</td><td>-</td><td>one IMU on each camera, so each frame carries the attitude of the camera that took it (IMU tab)</td></tr>
+<tr><td class="mono">Olive IMUs</td><td class="mono">olive-bridge</td><td>one Olive Robotics olixVision IMU per camera, on USB-C to that camera's Pi, so each frame carries the attitude of the camera that took it (IMU tab)</td></tr>
 <tr><td class="mono">XR256 strobe</td><td>-</td><td>one LED flash, triggered by the Jetson, lights both cameras' exposures at once (section 05)</td></tr>
-<tr><td class="mono">iKonvert gateway</td><td>-</td><td>brings the boat's NMEA 2000 data (position, heading, depth) into rigd over USB</td></tr>
-<tr><td class="mono">Subsonus RTK antenna</td><td>-</td><td>RTK-grade position and heading for the rig</td></tr>
+<tr><td class="mono">iKonvert gateway</td><td>-</td><td>the NMEA 2000 to USB gateway on the Jetson: carries the Subsonus data and the boat's other N2K data (depth) into rigd</td></tr>
+<tr><td class="mono">Subsonus RTK antenna</td><td>-</td><td>RTK-grade position, heading and GPS time, sent as NMEA 2000 messages on the backbone and brought in through the iKonvert</td></tr>
 <tr><td class="mono">cam3 (optional)</td><td class="mono">baslerctl + piagent</td><td>a Pi 5 with a Basler machine-vision camera. It stays hidden until it first answers, so the header still reads <code>2/2</code> without it</td></tr>
 </tbody></table></div>
 
@@ -423,7 +422,7 @@ drain is active.</p></div>
 
 <li><b>Calibrate</b><div class="d">
   <p>Calib tab, <strong>in the water</strong> - the WACP-C changes the focal length, so an in-air calibration is wrong underwater. Enter the checkerboard's inner-corner counts and square size, start a session and follow the amber guidance until it turns green, then Compute and Save. Stereo VSLAM picks up the new calibration automatically.</p>
-  <p>For the IMU: set the rig still and level and press <b>Calibrate both</b>. It takes ten seconds and refuses if anything moves.</p>
+  <p>For the Olive IMUs: set the rig still and level and press <b>Calibrate both</b>. It takes ten seconds and refuses if anything moves.</p>
 </div></li>
 </ol>
 </section>
@@ -514,7 +513,7 @@ the light, not in software.</p>
   <p>Run the trigger twisted pair from the Jetson's trigger board to the light's PI terminal. The opto board is the only electrical link between the Jetson and the 24 V side.</p>
 </div></li>
 <li><b>Arm it in the UI</b><div class="d">
-  <p>Controls &gt; <strong>Strobe</strong>: tick <em>enabled</em>, set <em>Node</em> to the Jetson, and set <em>delta ms after T</em> to <strong>10</strong>. Leave <em>Pulse ms</em> at its default: in PI mode the pulse only has to start the flash, and the dial sets how long it lasts.</p>
+  <p>Controls &gt; <strong>Strobe</strong>: tick <em>enabled</em>, set <em>Node</em> to <code>jetson</code>, and set <em>delta ms after T</em> to <strong>10</strong>. Leave <em>Pulse ms</em> at its default: in PI mode the pulse only has to start the flash, and the dial sets how long it lasts.</p>
   <p>The header pill changes from <code>strobe off</code> to <code>strobe T+10ms</code>.</p>
 </div></li>
 <li><b>Shutter 1/30 or slower on both bodies</b><div class="d">
@@ -724,7 +723,7 @@ Jetson (<code>chronyc tracking</code>). Node skew: the two Pis need to agree wit
 <tr><td class="mono">node_clock_skew</td><td><span class="sev warn">warn</span></td><td>the two Pis' clocks disagree</td><td>scheduled fires land that far apart - both must follow one time master</td></tr>
 <tr><td class="mono">host_clock_offset</td><td><span class="sev warn">warn</span></td><td>the Jetson's clock is off the cameras'</td><td>check chrony on the Jetson: <code>chronyc tracking</code></td></tr>
 <tr><td class="mono">node_clock_unmeasurable</td><td><span class="sev warn">warn</span></td><td>a node's clock cannot be measured - the link is too slow</td><td>check the network to that node</td></tr>
-<tr><td class="mono">imu_stall</td><td><span class="sev warn">warn</span></td><td>IMU samples have gone stale</td><td>check IMU wiring and power on that node</td></tr>
+<tr><td class="mono">imu_stall</td><td><span class="sev warn">warn</span></td><td>IMU samples have gone stale</td><td>check that camera's Olive: its USB-C cable, and <code>olive-bridge</code> on that Pi</td></tr>
 <tr><td class="mono">nav_gateway_down</td><td><span class="sev warn">warn</span></td><td>no live NMEA</td><td>with a static fix armed this is a note, not a fault</td></tr>
 <tr><td class="mono">nav_no_fix</td><td><span class="sev warn">warn</span></td><td>the gateway is alive but there is no GPS fix</td><td>check the N2K backbone and the GPS source</td></tr>
 <tr><td class="mono">spool_not_draining</td><td><span class="sev warn">warn</span></td><td>delete-after-pull is failing - the Pi will fill</td><td>prune that node's spool</td></tr>
@@ -734,8 +733,8 @@ Jetson (<code>chronyc tracking</code>). Node skew: the two Pis need to agree wit
 <tr><td class="mono">runs_disk_low</td><td><span class="sev bad">bad</span></td><td>the Jetson's transect volume is low</td><td>when it fills, frames get <em>no</em> flight-log row - move finished transects off</td></tr>
 </tbody></table></div>
 <div class="note tip"><span class="lab">Measured but not alarmed</span>
-<p>Three things the rig shows without raising a pill: the IMU's attitude rate (about
-50 Hz, below the 60 Hz target), a GPS time source two senders disagree about, and a
+<p>Three things the rig shows without raising a pill: each Olive's attitude rate (about
+15 Hz as the rig receives it), a GPS time source two senders disagree about, and a
 FOCUS line held longer than a calibration should hold it. Read them in the IMU tab
 and in Events rather than waiting for an alert.</p></div>
 </section>
@@ -759,6 +758,10 @@ curl -s 192.168.1.201:8081/health | python3 -m json.tool
 <span class="cmt"># restart the brain - finalises any active run first, nothing is lost</span>
 sudo systemctl restart rigd
 
+<span class="cmt"># restart the strobe agent / an Olive IMU relay (on that Pi)</span>
+sudo systemctl restart piagent-strobe
+sudo systemctl restart olive-bridge
+
 <span class="cmt"># clear a Pi's leftover picture spool</span>
 curl -s -X POST 192.168.1.201:8080/api/spool/prune -d '{"confirm":"prune"}'</code></pre>
 
@@ -774,7 +777,7 @@ curl -s -X POST 192.168.1.201:8080/api/spool/prune -d '{"confirm":"prune"}'</cod
 <ul>
 <li><strong>The strobe's flash length is fixed once its housing is sealed.</strong> Change it only between dives, at the dial.</li>
 <li><strong>The strobe needs shutter 1/30 or slower.</strong> A faster shutter closes before the flash at T + delta arrives.</li>
-<li><strong>The IMU runs at about 50 Hz</strong>, not the 60 Hz originally wanted. The page reports the real rate rather than a nicer one.</li>
+<li><strong>The Olive IMUs reach the rig at about 15 Hz.</strong> Each frame gets the nearest sample within 100 ms; the page reports the real rate rather than a nicer one.</li>
 <li><strong>cam1's power stays on its own injector.</strong></li>
 <li><strong>No fleet focus or zoom</strong>, deliberately, until lens-encoder parity is proven.</li>
 <li><strong>Delivered JPEGs are review-size</strong> (~1.7 MP). The survey resolution lives in the RAW on the card - drain it.</li>
