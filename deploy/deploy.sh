@@ -91,16 +91,17 @@ provision_node() {
   scp -q "$REPO"/Makefile ubuntu@"$ip":/home/ubuntu/wildsync/Makefile
   ssh ubuntu@"$ip" "bash -s" <<REMOTE
 set -uo pipefail
-# USBFS_MB is a FLOOR, never an assignment. cam3 also carries a Basler
-# a2A4504 (20.2 MP), whose single 20.3 MB frame needs ~1000 MB of URB space,
-# and this step used to hard-set 150 - so re-provisioning a node silently
-# broke Basler transfers while the Sony path looked fine. Raise, never lower.
+# USBFS_MB is a FLOOR, never an assignment. Another USB3 camera on the same
+# node can need a much larger value (around 1000 MB of URB space for a large
+# single frame), and this step used to hard-set 150 - so re-provisioning such
+# a node silently broke that camera's transfers while the Sony path looked
+# fine. Raise, never lower.
 cur=\$(cat /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null || echo 0)
 case "\$cur" in ''|*[!0-9]*) cur=0;; esac
 # ...and the PERSISTED value, which can legitimately be higher than the running
 # one: a node whose cmdline.txt already says 1000 but has not rebooted yet is
 # still running 150, so a runtime-only floor would quietly write 1000 back down
-# to 150 and undo the Basler setting on the next boot.
+# to 150 and undo the larger setting on the next boot.
 pers=\$(sed -n 's/.*usbcore\.usbfs_memory_mb=\([0-9]*\).*/\1/p' \
         /boot/firmware/cmdline.txt 2>/dev/null | head -1)
 case "\$pers" in ''|*[!0-9]*) pers=0;; esac
