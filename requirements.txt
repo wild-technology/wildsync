@@ -72,23 +72,3 @@ opencv-python-headless        # imported as cv2
 # path goes through olive-bridge over UDP and uses the standard library only.
 # `deploy.sh provision` does not install python3-serial; add it by hand on a
 # node that needs it.
-
-# ---------------------------------------------------------------------------
-# Basler option - rig/basler_spool.py, on a node that carries the Basler
-# a2A4504 (cam3). Not needed for the Sony ILX-LR1 rig.
-#   pip, inside ~/pylon-venv on that node (docs/PI-SETUP.md section 13),
-#   together with numpy and opencv-python-headless from the section above.
-#   deploy.sh installs none of this.
-# ---------------------------------------------------------------------------
-
-# pypylon - Basler's Python binding to the pylon camera runtime. basler_spool
-#           exits at import without it, and without numpy and cv2.
-# piexif  - writes the capture instant into each JPEG's EXIF; basler_spool
-#           exits at start-up without it.
-#
-# docs/PI-SETUP.md section 13 also installs Pillow and PyTurboJPEG<2 into that
-# venv; basler_spool imports neither.
-#
-# Uncomment to install into the Basler venv:
-# pypylon
-# piexif

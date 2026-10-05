@@ -27,7 +27,7 @@
       "copyrightText": "Copyright (c) 2026 Wild Technologies",
       "primaryPackagePurpose": "APPLICATION",
       "summary": "Control software for a multi-camera Sony ILX-LR1 underwater stereo rig.",
-      "comment": "Source only: ilxctl (C++17, src/) is built on the target with make; rigd and the tools (Python, rig/) run from the checkout, and deploy.sh copies piagent and its helpers to each node. The MIT licence in LICENSE covers the project's own code and documentation. It does not cover the Sony Camera Remote SDK, which is not in the repository, nor the four vendor PDFs kept for reference in docs/, which remain the copyright of their publishers (see THIRD_PARTY_NOTICES.md). Operating-system packages that deploy/deploy.sh installs from apt (build-essential, rsync, chrony, gpiod, libusb-1.0-0, libxml2 on the nodes; chrony and rsync on the Jetson) are infrastructure and are not listed as packages here; the Python packages among them are."
+      "comment": "Source only: ilxctl (C++17, src/) is built on the target with make; rigd and the tools (Python, rig/) run from the checkout, and deploy.sh copies piagent and its helpers to each node. The MIT licence in LICENSE covers the project's own code and documentation. It does not cover the Sony Camera Remote SDK, which is not in the repository, nor the three vendor PDFs kept for reference in docs/, which remain the copyright of their publishers (see THIRD_PARTY_NOTICES.md). Operating-system packages that deploy/deploy.sh installs from apt (build-essential, rsync, chrony, gpiod, libusb-1.0-0, libxml2 on the nodes; chrony and rsync on the Jetson) are infrastructure and are not listed as packages here; the Python packages among them are."
     },
     {
       "name": "Sony Camera Remote SDK",
@@ -154,7 +154,7 @@
       "licenseDeclared": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
       "copyrightText": "NOASSERTION",
       "primaryPackagePurpose": "LIBRARY",
-      "comment": "Imported by the calibration and VSLAM tools (rig/rigcal.py, rig/vslam.py, rig/stereo_check.py), their self-tests, and rig/basler_spool.py. Not pinned and not in this repository. On the Jetson it is the apt package python3-numpy, installed by `deploy/deploy.sh jetson`; that version is not recorded. Licence expression from the installed package metadata on the development host (numpy 2.5.2); an older distribution package may declare a different expression.",
+      "comment": "Imported by the calibration and VSLAM tools (rig/rigcal.py, rig/vslam.py, rig/stereo_check.py) and their self-tests. Not pinned and not in this repository. On the Jetson it is the apt package python3-numpy, installed by `deploy/deploy.sh jetson`; that version is not recorded. Licence expression from the installed package metadata on the development host (numpy 2.5.2); an older distribution package may declare a different expression.",
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
@@ -174,7 +174,7 @@
       "licenseDeclared": "Apache-2.0",
       "copyrightText": "NOASSERTION",
       "primaryPackagePurpose": "LIBRARY",
-      "comment": "Imported as `cv2` by the calibration and VSLAM tools (rig/rigcal.py, rig/vslam.py, rig/stereo_check.py), their self-tests, and rig/basler_spool.py. Not pinned and not in this repository. On the Jetson it is the apt package python3-opencv, installed by `deploy/deploy.sh jetson`; that version is not recorded. On a macOS or development host and in the Basler venv it is the pip wheel opencv-python-headless. Licence from that wheel's metadata on the development host (opencv-python-headless 5.0.0.93, declared Apache 2.0); the wheel's own packaging scripts are MIT and it bundles further third-party libraries listed in its LICENSE-3RD-PARTY.txt.",
+      "comment": "Imported as `cv2` by the calibration and VSLAM tools (rig/rigcal.py, rig/vslam.py, rig/stereo_check.py) and their self-tests. Not pinned and not in this repository. On the Jetson it is the apt package python3-opencv, installed by `deploy/deploy.sh jetson`; that version is not recorded. On a macOS or development host it is the pip wheel opencv-python-headless. Licence from that wheel's metadata on the development host (opencv-python-headless 5.0.0.93, declared Apache 2.0); the wheel's own packaging scripts are MIT and it bundles further third-party libraries listed in its LICENSE-3RD-PARTY.txt.",
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
@@ -195,46 +195,6 @@
       "copyrightText": "NOASSERTION",
       "primaryPackagePurpose": "LIBRARY",
       "comment": "Imported as `gpiod` by rig/piagent.py for the FOCUS/TRIGGER lines on each camera node and for the strobe line on the Jetson. Linux only; not in this repository. It is the apt package python3-libgpiod, installed by `deploy/deploy.sh provision` on a node and `deploy/deploy.sh strobe` on the Jetson. The version given is the libgpiod API the code is written against and the one docs/PROTOCOL.md specifies for the nodes (Ubuntu 24.04); the version on the Jetson (Ubuntu 22.04) is not recorded. The licence is not asserted: the package is not installed on the host where this document was written, so it could not be read from package metadata."
-    },
-    {
-      "name": "pypylon",
-      "SPDXID": "SPDXRef-Package-pypylon",
-      "versionInfo": "NOASSERTION",
-      "supplier": "NOASSERTION",
-      "downloadLocation": "NOASSERTION",
-      "filesAnalyzed": false,
-      "licenseConcluded": "NOASSERTION",
-      "licenseDeclared": "NOASSERTION",
-      "copyrightText": "NOASSERTION",
-      "primaryPackagePurpose": "LIBRARY",
-      "comment": "Optional: Basler's Python binding to the pylon camera runtime, imported only by rig/basler_spool.py on a node that carries a Basler a2A4504. Not used by the Sony ILX-LR1 rig. Installed with pip into ~/pylon-venv on that node (docs/PI-SETUP.md section 13); deploy.sh does not install it. Version and licence are not asserted: the package is not pinned and is not installed on the host where this document was written.",
-      "externalRefs": [
-        {
-          "referenceCategory": "PACKAGE-MANAGER",
-          "referenceType": "purl",
-          "referenceLocator": "pkg:pypi/pypylon"
-        }
-      ]
-    },
-    {
-      "name": "piexif",
-      "SPDXID": "SPDXRef-Package-piexif",
-      "versionInfo": "NOASSERTION",
-      "supplier": "NOASSERTION",
-      "downloadLocation": "NOASSERTION",
-      "filesAnalyzed": false,
-      "licenseConcluded": "NOASSERTION",
-      "licenseDeclared": "NOASSERTION",
-      "copyrightText": "NOASSERTION",
-      "primaryPackagePurpose": "LIBRARY",
-      "comment": "Optional: writes the capture instant into each JPEG's EXIF in rig/basler_spool.py, on a node that carries a Basler a2A4504. Not used by the Sony ILX-LR1 rig. Installed with pip into ~/pylon-venv on that node (docs/PI-SETUP.md section 13); deploy.sh does not install it. Version and licence are not asserted: the package is not pinned and is not installed on the host where this document was written.",
-      "externalRefs": [
-        {
-          "referenceCategory": "PACKAGE-MANAGER",
-          "referenceType": "purl",
-          "referenceLocator": "pkg:pypi/piexif"
-        }
-      ]
     }
   ],
   "hasExtractedLicensingInfos": [
@@ -316,18 +276,6 @@
       "relationshipType": "DEPENDS_ON",
       "relatedSpdxElement": "SPDXRef-Package-gpiod",
       "comment": "piagent on the camera nodes and in its strobe role on the Jetson."
-    },
-    {
-      "spdxElementId": "SPDXRef-Package-pypylon",
-      "relationshipType": "OPTIONAL_DEPENDENCY_OF",
-      "relatedSpdxElement": "SPDXRef-Package-wildsync",
-      "comment": "Basler option only (rig/basler_spool.py)."
-    },
-    {
-      "spdxElementId": "SPDXRef-Package-piexif",
-      "relationshipType": "OPTIONAL_DEPENDENCY_OF",
-      "relatedSpdxElement": "SPDXRef-Package-wildsync",
-      "comment": "Basler option only (rig/basler_spool.py)."
     }
   ]
 }

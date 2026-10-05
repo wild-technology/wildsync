@@ -26,8 +26,6 @@ asserted" rather than guessed.
 | numpy | not pinned | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | Python package | apt `python3-numpy` (Jetson) or pip |
 | OpenCV (Python bindings) | not pinned | Apache-2.0 | Python package, imported as `cv2` | apt `python3-opencv` (Jetson) or pip `opencv-python-headless` |
 | gpiod (libgpiod Python bindings) | v1.6.3 API | not asserted | Python package, imported as `gpiod` | apt `python3-libgpiod` (camera nodes, Jetson strobe role) |
-| pypylon | not pinned | not asserted | Python package, Basler option only | pip, in `~/pylon-venv` on the Basler node |
-| piexif | not pinned | not asserted | Python package, Basler option only | pip, in `~/pylon-venv` on the Basler node |
 
 Which Python package is used by which part of the system, and which are
 installed from apt by `deploy/deploy.sh` rather than pip, is in
@@ -125,14 +123,12 @@ declare a different licence expression.
 
 `gpiod` is the libgpiod Python binding, written against the v1.6.3 API that
 `docs/PROTOCOL.md` specifies for the nodes (Ubuntu 24.04 packages it as
-`python3-libgpiod`). `pypylon` and `piexif` are used only by the optional
-Basler spool, `rig/basler_spool.py`, and are not used by the Sony ILX-LR1 rig.
-None of the three was installed on the host where this file was written, so
-their licences and versions are not asserted.
+`python3-libgpiod`). It was not installed on the host where this file was
+written, so its licence and version are not asserted.
 
 ## Vendor documentation kept in `docs/`
 
-Four PDFs from equipment vendors are kept in `docs/` for reference. They are
+Three PDFs from equipment vendors are kept in `docs/` for reference. They are
 not part of Wild Sync, are not covered by its licence, and remain the
 copyright of their publishers.
 
@@ -140,7 +136,6 @@ copyright of their publishers.
 |---|---|---|
 | `docs/XR256_Datasheet.pdf` | Smart Vision Lights | XR256 high-speed strobe light (OverDrive) product data sheet |
 | `docs/VA_Imaging_Industrial_Strobe_Controller.pdf` | VA Imaging | Industrial strobe controller page from the publisher's web site (its footer reads "(c) 2026 - VA Imaging"), saved to PDF from a browser on 2026-08-28 |
-| `docs/a2A4504-18umBAS \| Basler Product Documentation.pdf` | Basler | Product documentation page for the Basler ace 2 a2A4504-18umBAS camera, saved to PDF from a browser on 2026-08-28 |
 | `docs/iKonvertManual.pdf` | Digital Yacht | Instruction manual for the iKonvert NMEA 2000 gateway |
 
 ## Referenced at view time, not distributed
