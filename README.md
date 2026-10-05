@@ -85,6 +85,7 @@ src/            ilxctl — C++ camera daemon (one per node, :8080)
 rig/            Python: rigd (Jetson), piagent (node), nav, run, UI
 rig/tests/      regression + soak suites (no hardware required)
 deploy/         deploy.sh and the systemd units
+third_party/    httplib.h — cpp-httplib, vendored (MIT)
 docs/           PROTOCOL.md (interface contract), HANDOFF.md (state + TODO), hardware notes
 ```
 
@@ -323,5 +324,9 @@ and documentation. It does **not** cover:
   under Sony's own licence agreement;
 - the **vendor PDFs in `docs/`** (Basler, Smart Vision Lights, VA Imaging,
   Digital Yacht), kept for reference and the copyright of their publishers;
-- `third_party/httplib.h`, which is cpp-httplib by Yuji Hirose and keeps its own
-  MIT licence notice.
+- the third-party components listed in
+  [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), each under its own
+  licence. `third_party/httplib.h` is cpp-httplib, vendored under its MIT
+  licence.
+
+`sbom.spdx.json` is the same component list as an SPDX 2.3 document.

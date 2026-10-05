@@ -1,0 +1,333 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "wildsync-1.1.0",
+  "documentNamespace": "https://github.com/wild-technology/wildsync/spdx/wildsync-1.1.0-0778cda5-3a93-4863-b979-22e341bd46f7",
+  "creationInfo": {
+    "created": "2026-10-05T18:33:58Z",
+    "creators": [
+      "Organization: Wild Technologies"
+    ],
+    "comment": "Written by hand from the repository contents (Makefile, deploy/deploy.sh, the imports under rig/ and deploy/, third_party/) and from the Sony Camera Remote SDK v2.02.00 package. No file-level analysis was run. Versions and licences that could not be confirmed from the SDK package or from an installed package's own metadata are recorded as NOASSERTION; the comment on each package says what was checked. THIRD_PARTY_NOTICES.md is the readable form of this document."
+  },
+  "documentDescribes": [
+    "SPDXRef-Package-wildsync"
+  ],
+  "packages": [
+    {
+      "name": "wildsync",
+      "SPDXID": "SPDXRef-Package-wildsync",
+      "versionInfo": "1.1.0",
+      "supplier": "Organization: Wild Technologies",
+      "downloadLocation": "git+https://github.com/wild-technology/wildsync.git",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright (c) 2026 Wild Technologies",
+      "primaryPackagePurpose": "APPLICATION",
+      "summary": "Control software for a multi-camera Sony ILX-LR1 underwater stereo rig.",
+      "comment": "Source only: ilxctl (C++17, src/) is built on the target with make; rigd and the tools (Python, rig/) run from the checkout, and deploy.sh copies piagent and its helpers to each node. The MIT licence in LICENSE covers the project's own code and documentation. It does not cover the Sony Camera Remote SDK, which is not in the repository, nor the four vendor PDFs kept for reference in docs/, which remain the copyright of their publishers (see THIRD_PARTY_NOTICES.md). Operating-system packages that deploy/deploy.sh installs from apt (build-essential, rsync, chrony, gpiod, libusb-1.0-0, libxml2 on the nodes; chrony and rsync on the Jetson) are infrastructure and are not listed as packages here; the Python packages among them are."
+    },
+    {
+      "name": "Sony Camera Remote SDK",
+      "SPDXID": "SPDXRef-Package-sony-camera-remote-sdk",
+      "versionInfo": "2.02.00",
+      "supplier": "Organization: Sony Corporation",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-Sony-CameraRemoteSDK",
+      "licenseDeclared": "LicenseRef-Sony-CameraRemoteSDK",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Proprietary. NOT redistributed with this project and not present in the repository or its history. Each developer obtains the package from Sony under Sony's licence agreement and stages it locally with `make sdk` (headers into include/CRSDK/, shared libraries into lib/) or `make sdk-linux` (Linux aarch64 libraries into lib-linux/, and the headers); all three directories are git-ignored. ilxctl includes the CRSDK headers and links libCr_Core, and the SDK loads its transport adapters from CrAdapter/ at run time; the build copies the libraries next to the binary. The code was built against v2.02.00. The package also ships OpenCV for Sony's sample application; this project does not stage or use that copy."
+    },
+    {
+      "name": "libusb",
+      "SPDXID": "SPDXRef-Package-libusb",
+      "versionInfo": "1.0.26",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "LGPL-2.1-or-later",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "homepage": "https://libusb.info/",
+      "comment": "Bundled inside the Sony Camera Remote SDK as CrAdapter/libusb-1.0.0.dylib (macOS) and CrAdapter/libusb-1.0.so (Linux); not in this repository. Version from libusb/version.h in the source archive Sony ships with the SDK (SourceCodeOfOpenSourceSoftware/libusb.zip: 1.0.26, nano 11724); the same version record is present in the macOS and Linux aarch64 binaries. Licence from that archive's COPYING and source file headers. Sony's SDK readme names libusb as open-source software whose licence conditions the distributor of an application must meet."
+    },
+    {
+      "name": "libssh2",
+      "SPDXID": "SPDXRef-Package-libssh2",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Bundled inside the Sony Camera Remote SDK as CrAdapter/libssh2.dylib (macOS) and CrAdapter/libssh2.so (Linux); not in this repository. The version is not asserted because the package is not consistent: the source archive Sony ships (SourceCodeOfOpenSourceSoftware/libssh2.zip) is 1.10.0, while the binaries identify themselves as 1.10.0 (macOS arm64) and 1.11.0 (macOS x86_64, Linux aarch64). Licence from the COPYING file in that source archive."
+    },
+    {
+      "name": "OpenSSL",
+      "SPDXID": "SPDXRef-Package-openssl",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Not a separate file: statically linked into libraries of the Sony Camera Remote SDK (libssh2, and the monitor-protocol library - libmonitor_protocol on macOS, libmonitor_protocol_pf on Linux aarch64). Not in this repository. The version is not asserted because the package is not consistent: the source archive Sony ships (SourceCodeOfOpenSourceSoftware/openssl.zip) is 3.0.8, while the binaries carry the version strings 3.0.13 (libssh2) and 3.0.10 (monitor-protocol library). Licence from LICENSE.txt in that source archive."
+    },
+    {
+      "name": "cpp-httplib",
+      "SPDXID": "SPDXRef-Package-cpp-httplib",
+      "versionInfo": "0.19.0",
+      "supplier": "Person: Yuji Hirose",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright (c) 2025 Yuji Hirose. All rights reserved.",
+      "primaryPackagePurpose": "LIBRARY",
+      "homepage": "https://github.com/yhirose/cpp-httplib",
+      "comment": "Single-header HTTP server library, vendored at third_party/httplib.h and compiled into ilxctl. Version from CPPHTTPLIB_VERSION in the header; licence and copyright from the header's own notice. The file is byte-identical to SimpleCli/app/httplib.h in Sony's Camera Remote SDK v2.02.00 package.",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:github/yhirose/cpp-httplib"
+        }
+      ]
+    },
+    {
+      "name": "pyserial",
+      "SPDXID": "SPDXRef-Package-pyserial",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Imported as `serial` by rig/nav.py (iKonvert NMEA 2000 gateway) and by the serial transports of rig/imu_yb.py and rig/imu_olive.py. Not pinned and not in this repository. On the Jetson it is the apt package python3-serial, installed by `deploy/deploy.sh jetson`; that version is not recorded. Licence from the installed package on the development host (pyserial 3.5: SPDX identifier in its source files).",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/pyserial"
+        }
+      ]
+    },
+    {
+      "name": "Pillow",
+      "SPDXID": "SPDXRef-Package-pillow",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "MIT-CMU",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Imported as `PIL` by rig/run.py (EXIF fallback for a frame's capture instant), rig/stereo_check.py, rig/tests/fakenode.py and the icon generators in deploy/icons/. Not pinned and not in this repository. On the Jetson it is the apt package python3-pil, installed by `deploy/deploy.sh jetson`; that version is not recorded. Licence from the installed package metadata on the development host (Pillow 12.3.0).",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/pillow"
+        }
+      ]
+    },
+    {
+      "name": "numpy",
+      "SPDXID": "SPDXRef-Package-numpy",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Imported by the calibration and VSLAM tools (rig/rigcal.py, rig/vslam.py, rig/stereo_check.py), their self-tests, and rig/basler_spool.py. Not pinned and not in this repository. On the Jetson it is the apt package python3-numpy, installed by `deploy/deploy.sh jetson`; that version is not recorded. Licence expression from the installed package metadata on the development host (numpy 2.5.2); an older distribution package may declare a different expression.",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/numpy"
+        }
+      ]
+    },
+    {
+      "name": "OpenCV (Python bindings)",
+      "SPDXID": "SPDXRef-Package-opencv-python",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Imported as `cv2` by the calibration and VSLAM tools (rig/rigcal.py, rig/vslam.py, rig/stereo_check.py), their self-tests, and rig/basler_spool.py. Not pinned and not in this repository. On the Jetson it is the apt package python3-opencv, installed by `deploy/deploy.sh jetson`; that version is not recorded. On a macOS or development host and in the Basler venv it is the pip wheel opencv-python-headless. Licence from that wheel's metadata on the development host (opencv-python-headless 5.0.0.93, declared Apache 2.0); the wheel's own packaging scripts are MIT and it bundles further third-party libraries listed in its LICENSE-3RD-PARTY.txt.",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/opencv-python-headless"
+        }
+      ]
+    },
+    {
+      "name": "gpiod (libgpiod Python bindings)",
+      "SPDXID": "SPDXRef-Package-gpiod",
+      "versionInfo": "1.6.3",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Imported as `gpiod` by rig/piagent.py for the FOCUS/TRIGGER lines on each camera node and for the strobe line on the Jetson. Linux only; not in this repository. It is the apt package python3-libgpiod, installed by `deploy/deploy.sh provision` on a node and `deploy/deploy.sh strobe` on the Jetson. The version given is the libgpiod API the code is written against and the one docs/PROTOCOL.md specifies for the nodes (Ubuntu 24.04); the version on the Jetson (Ubuntu 22.04) is not recorded. The licence is not asserted: the package is not installed on the host where this document was written, so it could not be read from package metadata."
+    },
+    {
+      "name": "pypylon",
+      "SPDXID": "SPDXRef-Package-pypylon",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Optional: Basler's Python binding to the pylon camera runtime, imported only by rig/basler_spool.py on a node that carries a Basler a2A4504. Not used by the Sony ILX-LR1 rig. Installed with pip into ~/pylon-venv on that node (docs/PI-SETUP.md section 13); deploy.sh does not install it. Version and licence are not asserted: the package is not pinned and is not installed on the host where this document was written.",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/pypylon"
+        }
+      ]
+    },
+    {
+      "name": "piexif",
+      "SPDXID": "SPDXRef-Package-piexif",
+      "versionInfo": "NOASSERTION",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "primaryPackagePurpose": "LIBRARY",
+      "comment": "Optional: writes the capture instant into each JPEG's EXIF in rig/basler_spool.py, on a node that carries a Basler a2A4504. Not used by the Sony ILX-LR1 rig. Installed with pip into ~/pylon-venv on that node (docs/PI-SETUP.md section 13); deploy.sh does not install it. Version and licence are not asserted: the package is not pinned and is not installed on the host where this document was written.",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/piexif"
+        }
+      ]
+    }
+  ],
+  "hasExtractedLicensingInfos": [
+    {
+      "licenseId": "LicenseRef-Sony-CameraRemoteSDK",
+      "name": "Sony Camera Remote SDK licence agreement",
+      "extractedText": "The Sony Camera Remote SDK is proprietary software supplied by Sony under its own licence agreement. The agreement is not reproduced here. The readme shipped with the SDK (Camera_Remote_SDK_Readme_v2.02.00.pdf) states that the licence agreement is linked from http://www.sony.net/CameraRemoteSDK/ .",
+      "seeAlsos": [
+        "http://www.sony.net/CameraRemoteSDK/"
+      ],
+      "comment": "Placeholder identifier for a proprietary licence. Obtain and read the agreement from Sony before using or distributing the SDK."
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-wildsync"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-sony-camera-remote-sdk",
+      "comment": "Build and run time, ilxctl only. Supplied by the developer; not distributed with this project."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-sony-camera-remote-sdk",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-libusb"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-sony-camera-remote-sdk",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-libssh2"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-sony-camera-remote-sdk",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-openssl"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-libssh2",
+      "relationshipType": "STATIC_LINK",
+      "relatedSpdxElement": "SPDXRef-Package-openssl",
+      "comment": "Statically linked into the libssh2 binary that the SDK ships."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-cpp-httplib",
+      "comment": "Vendored at third_party/httplib.h."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-pyserial",
+      "comment": "rigd navigation input; serial IMU transports."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-pillow",
+      "comment": "rigd EXIF capture-time fallback; stereo_check."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-numpy",
+      "comment": "Calibration and VSLAM tools."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-opencv-python",
+      "comment": "Calibration and VSLAM tools."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-wildsync",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-gpiod",
+      "comment": "piagent on the camera nodes and in its strobe role on the Jetson."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-pypylon",
+      "relationshipType": "OPTIONAL_DEPENDENCY_OF",
+      "relatedSpdxElement": "SPDXRef-Package-wildsync",
+      "comment": "Basler option only (rig/basler_spool.py)."
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-piexif",
+      "relationshipType": "OPTIONAL_DEPENDENCY_OF",
+      "relatedSpdxElement": "SPDXRef-Package-wildsync",
+      "comment": "Basler option only (rig/basler_spool.py)."
+    }
+  ]
+}
