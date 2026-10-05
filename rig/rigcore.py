@@ -1953,7 +1953,7 @@ class SettingsManager:
 # ---------------------------------------------------------------------------
 # The time_source label for "no GPS time; stamps are the rigd host's clock".
 # Runs recorded before v1.1.0 wrote "jetson" for the same thing, whatever the
-# host actually was (the 20 Aug 2026 transects were recorded on a Mac). New
+# host actually was (the 2026-08-20 transects were recorded on a Mac). New
 # runs write "host"; every reader must accept both.
 HOST_TIME_SOURCE = "host"
 LEGACY_HOST_TIME_SOURCE = "jetson"

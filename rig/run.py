@@ -4059,7 +4059,7 @@ class RunManager:
                 if node is not None:
                     sim_new = self._note_simulated(self.active,
                                                    self._mon(node))
-                    if node in self.active["simulated_nodes"]:
+                    if node in (self.active.get("simulated_nodes") or ()):
                         # Per frame as well as per run, so index.jsonl alone
                         # (the file readers prefer) says which frames came
                         # from a simulated camera.
