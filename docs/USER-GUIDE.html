@@ -301,7 +301,7 @@ specific to one of them. The Jetson is the brain; everything else reports to it.
 <tr><td class="mono">XR256 strobe</td><td>-</td><td>one LED flash, triggered by the Jetson, lights both cameras' exposures at once (section 05)</td></tr>
 <tr><td class="mono">iKonvert gateway</td><td>-</td><td>the NMEA 2000 to USB gateway on the Jetson: carries the Subsonus data and the boat's other N2K data (depth) into rigd</td></tr>
 <tr><td class="mono">Subsonus RTK antenna</td><td>-</td><td>RTK-grade position, heading and GPS time, sent as NMEA 2000 messages on the backbone and brought in through the iKonvert</td></tr>
-<tr><td class="mono">cam3 (optional)</td><td class="mono">baslerctl + piagent</td><td>a Pi 5 with a Basler machine-vision camera. It stays hidden until it first answers, so the header still reads <code>2/2</code> without it</td></tr>
+<tr><td class="mono">cam3 (optional)</td><td class="mono">ilxctl + piagent</td><td>a third camera node, added in <code>~/rig/nodes.json</code>. It stays hidden until it first answers, so the header still reads <code>2/2</code> without it</td></tr>
 </tbody></table></div>
 
 <h3>Each camera, front to back</h3>

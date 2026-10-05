@@ -44,6 +44,8 @@ dates.
 ### Removed
 - Internal working notes: `docs/HANDOFF.md` and
   `docs/audit-2026-08-16-findings.json`.
+- Setup notes, a capture script and vendor documentation for a camera that is
+  not part of this system.
 
 ## [1.0.0] - 2026-09-21
 
@@ -92,7 +94,8 @@ of 31 August 2026. From the commits between the macOS port and the tag:
 - Hardening, project layer, Diag/Alerts/Map tabs, VSLAM and Olive IMU
   (2026-08-27), including the Olive IMU live WebSocket bridge and rig
   calibration.
-- Basler cam3 node, `ilxctl` unit and two-predicate fleet (2026-08-28).
+- Optional third node (`cam3`), `ilxctl` unit and two-predicate fleet
+  (2026-08-28).
 
 ## Repository history
 

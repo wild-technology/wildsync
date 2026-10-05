@@ -334,7 +334,7 @@ Each of these presents as a software fault and is not one.
   sustained RAW-to-card needs a card that can actually take it (a V60/UHS-II
   card is the rig's standard; about 250 rapid fires preceded the stall seen on
   2026-08-16, so keep bench test batches modest and watch `slotWriting`).
-- **`usbfs_memory_mb` must be at least 150 (1000 on a Basler node), and it does not persist by itself.** The 16 MB
+- **`usbfs_memory_mb` must be at least 150, and it does not persist by itself.** The 16 MB
   Linux default drops the SDK's transfer session; the camera still connects, still
   answers property reads and still writes to its own card, so it presents as a
   broken camera. It is set on the kernel command line — `modprobe.d` does nothing
@@ -354,7 +354,7 @@ and documentation. It does **not** cover:
 
 - the **Sony Camera Remote SDK**, which is not in this repository and stays
   under Sony's own licence agreement;
-- the **vendor PDFs in `docs/`** (Basler, Smart Vision Lights, VA Imaging,
+- the **vendor PDFs in `docs/`** (Smart Vision Lights, VA Imaging,
   Digital Yacht), kept for reference and the copyright of their publishers;
 - the third-party components listed in
   [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), each under its own

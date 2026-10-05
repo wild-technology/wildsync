@@ -26,7 +26,6 @@ a recorded field run.
 | **Jetson Orin NX host** (JetPack 6, systemd, `deploy.sh jetson`) | Supported by the current software. A Jetson was the host for the earlier bench work and the 2026-08-16 measurements in the README; the Mac replaced it on 2026-08-23 and the Jetson install was added back on 2026-09-21. No recorded field run used a Jetson host |
 | **Per-camera Olive IMUs** (`olive-bridge`, `deploy.sh node` default) | Supported. First run on the rig on 2026-08-27, after the field transects; no recorded field run |
 | **XR256 strobe** (`piagent` in its strobe role, `deploy.sh strobe`) | Software added on 2026-09-21 and covered by the offline tests. **No strobe has been connected or fired in any field run, and the XR256 has not yet been fired with the camera array** |
-| Basler a2A4504 on a third node (cam3) | The camera was brought up and measured on 2026-08-28 (`docs/PI-SETUP.md` Part III). Its camera service (`baslerctl`) does not exist, so it cannot join a run. Not part of the two-camera rig |
 
 The two chrony topologies (below) follow the same split: the Mac-host topology
 was the one in use on 2026-08-20.
@@ -451,7 +450,7 @@ Exit 0 means every listed file matches its recorded SHA-256 (`docs/PROTOCOL.md`,
 |---|---|
 | Operating the rig: the screen, a transect, the strobe, the cards, alerts | `docs/USER-GUIDE.html` (field manual) |
 | The boat checklist and recovery commands | `docs/FIELD-RUN.md` |
-| A node from a bare SD card; Basler stack; troubleshooting | `docs/PI-SETUP.md` |
+| A node from a bare SD card; troubleshooting | `docs/PI-SETUP.md` |
 | IMUs | `docs/olive-imu.md` |
 | The XR256 and the contact-closure flash | `docs/xr256-jetson-trigger.md`, `docs/strobe-trigger.md` |
 | The camera harness, leads and timing | `docs/harness-and-strobe.md` |
