@@ -2761,7 +2761,8 @@ function renderRunList(){
       escapeHtml(r.run_id)}">
       <span class="rid">${escapeHtml(r.run_id)}</span>
       <span class="muted small">${(r.cams||[]).length} cam · ${
-        r.frames??'?'} frm · ${state}</span></div>`;}).join('');
+        r.frames??'?'} frm · ${state}${r.simulated?
+        ' · <span style="color:var(--warn)">SIMULATED</span>':''}</span></div>`;}).join('');
   el.querySelectorAll('.runrow').forEach(d=>d.onclick=()=>{
     RUN_SEL=d.dataset.id; RUN_SHOT=null; RUN_DETAIL=null;
     $('#runDetail').innerHTML='<span class="muted small">reading…</span>';
@@ -2785,7 +2786,12 @@ function renderRunDetail(){
       <div class="big" style="color:var(--bad)">${p.strobe_missed}</div></div>`:''}
     <div class="small muted">grouped at ±${p.tolerance_s??'?'} s${
       d.interrupted?' · <span style="color:var(--warn)">this run was '+
-      'interrupted; run.json was rebuilt from the flight_logs</span>':''}</div>
+      'interrupted; run.json was rebuilt from the flight_logs</span>':''}${
+      d.simulated?' · <span style="color:var(--warn)">SIMULATED: recorded '+
+      'against test cameras ('+escapeHtml((d.simulated_nodes||[]).join(', '))+
+      '), not survey data</span>':''}${
+      d.software?' · software '+escapeHtml(String(d.software.describe||
+      d.software.commit||'unknown')):''}</div>
     <span style="flex:1"></span>
     <button class="act" id="btnOpenRun">Open folder</button>
   </div>`;

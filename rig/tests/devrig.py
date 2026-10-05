@@ -14,7 +14,12 @@ rig code runs, so nothing here can reach the live fleet even by accident. On
 macOS the fakes' 127.0.0.x aliases are remapped through fakenode.loopback_map
 (Linux binds them natively).
 
-State lives in a throwaway temp home (or --home) — never ~/rig."""
+State lives in a throwaway temp home (or --home) — never ~/rig.
+
+Every run recorded here is marked as a test recording: the fakes report
+`"simulated": true` on /health and /api/status, and rigd writes
+`"simulated": true` into the run's run.json, per frame into index.jsonl, and
+one SIMULATED line into its events.log."""
 
 import argparse
 import json

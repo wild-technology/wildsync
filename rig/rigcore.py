@@ -470,6 +470,13 @@ class NodeMonitor(threading.Thread):
         # camera off is how you stop a body drawing power and spooling frames
         # nobody will use on this dive, without losing the box it hangs off.
         self.camera_enabled = True
+        # True once this node has said it is a simulation: the test fakes
+        # (rig/tests/fakenode.py) answer `"simulated": true` on /health and
+        # /api/status; the real piagent and ilxctl never send the key. Sticky
+        # for the life of the monitor, and the run layer copies it into every
+        # run this node joins (run.json "simulated"). Nothing an operator sets
+        # can raise or clear it.
+        self.simulated = False
 
     def is_present(self):
         """Is this node part of the rig at all right now?
@@ -509,6 +516,7 @@ class NodeMonitor(threading.Thread):
                 if self.last_seen else None,
                 "status": self.status, "health": self.health,
                 "convergence": dict(self.convergence),
+                "simulated": self.simulated,
             }
 
     def _set_state(self, new, **ctx):
@@ -614,6 +622,9 @@ class NodeMonitor(threading.Thread):
                 self._uptime = up
         with self._lock:
             self.health = {} if health.get("_unreachable") else health
+            if (pia_ok and health.get("simulated") is True) or \
+                    (reachable and status.get("simulated") is True):
+                self.simulated = True
             if clock is not None:
                 self.clock = clock
                 self._clock_hist.append(clock)
@@ -2220,6 +2231,9 @@ class RunBrowser:
                 "final": bool(doc.get("final")),
                 "interrupted": bool(doc.get("interrupted")),
                 "time_source": (doc.get("time") or {}).get("source"),
+                # Recorded against simulated cameras. Absent in run.json
+                # means a real run (and every run before v1.1.0).
+                "simulated": doc.get("simulated") is True,
                 "skew_ms_max": (doc.get("sync") or {}).get("skew_ms_max"),
                 "pulled": {n: (s or {}).get("pulled")
                            for n, s in stats.items()},
@@ -2320,6 +2334,8 @@ class RunBrowser:
         detail["strobe"] = doc.get("strobe")
         # Absent (null) on runs recorded before v1.1.0.
         detail["software"] = doc.get("software")
+        detail["simulated"] = doc.get("simulated") is True
+        detail["simulated_nodes"] = doc.get("simulated_nodes") or []
         with self._lock:
             if len(self._cache) > 16:
                 self._cache.clear()

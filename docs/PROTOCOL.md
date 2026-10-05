@@ -1257,3 +1257,34 @@ The same object is in `GET /api/diag` (`rigd.software`), in the rigd journal's
 `host` (no GPS correction; the rigd host's clock) or `gps`. Runs recorded
 before v1.1.0 carry the legacy `jetson` for `host`; see the flight_log section
 above. Readers use `rigcore.HOST_TIME_SOURCES` / `rigcore.is_host_time_source()`.
+
+### Simulated runs
+
+A run recorded against the test fakes (`rig/tests/fakenode.py`, which
+`rig/tests/soaktest.py` and `rig/tests/devrig.py` drive) is marked inside its
+own files:
+
+- `run.json`: top-level **`"simulated": true`** and **`"simulated_nodes":
+  ["cam1", …]`** (the nodes that reported themselves simulated). **Absent means
+  a real run**, which is also how every run recorded before v1.1.0 reads.
+- `index.jsonl` (and `run.json`'s `index`): **`"simulated": true`** on each
+  frame that came from a simulated node; absent otherwise.
+- `events.log`: one `WARN simulated` line,
+  `SIMULATED: <nodes> reported simulated cameras (rig/tests/fakenode.py) - this
+  run is a test recording, not survey data`.
+- `flight_log.csv` is unchanged (same 23 columns).
+
+The marker is derived only from what a node itself reports. The fakes answer
+`"simulated": true` on `/health` and `/api/status`, always (no override can
+remove it); the real piagent and ilxctl never send the key. `NodeMonitor`
+records it per node (`simulated`, sticky for the life of rigd), and the run
+layer latches every such node into the run at start, at late adoption and on
+each indexed frame. The set only grows: once a run is marked it stays marked,
+including through crash recovery. There is no flag or setting that marks or
+unmarks a run, so a real run cannot be marked and a simulated one cannot be
+left unmarked.
+
+Also exposed: `/api/fleet` and `/api/diag` node entries (`simulated`),
+`/api/run` (`simulated`), `/api/runs` entries (`simulated`), and
+`/api/run/detail` (`simulated`, `simulated_nodes`). The UI's transect browser
+labels such runs SIMULATED.

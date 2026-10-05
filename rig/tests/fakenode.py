@@ -21,6 +21,11 @@ Fidelity that matters
   a `drift()` (hand-nudged body), or a reboot to factory defaults.
 * Frames are real JPEGs with real EXIF DateTimeOriginal/SubSecTimeOriginal, so
   the EXIF capture-time path is exercised for real rather than stubbed.
+* Both surfaces say what they are: `/api/status` and `/health` carry
+  `"simulated": true`, always, with no knob to turn it off. rigd records it per
+  node and marks every run a fake joins (run.json `"simulated": true`), so a run
+  recorded against these fakes - soaktest, devrig - can never pass for survey
+  data. The real ilxctl and piagent never send the key.
 
 Faults it can wear (per surface: "ilx", "pia", or "both")
 ---------------------------------------------------------
@@ -517,6 +522,7 @@ class FakeNode:
         with self._lock:
             s = self.settings
             doc = {
+                "simulated": True,
                 "connected": self.connected,
                 "model": self.model if self.connected else "",
                 "id": self.id if self.connected else "",
@@ -570,6 +576,7 @@ class FakeNode:
             doc.update(self.label_override)
             for k in self.hide_keys:
                 doc.pop(k, None)
+            doc["simulated"] = True        # not overridable, by design
             return doc
 
     def health(self):
@@ -577,6 +584,7 @@ class FakeNode:
             imu_age = (round(time.time() - self.imu[-1]["epoch"], 3)
                        if self.imu else None)
             return {
+                "simulated": True,
                 "node": self.name,
                 "uptime_s": round(time.time() - self.boot_epoch, 1),
                 "gpio": {"chip": "gpiochip4", "available": self.has_gpio,

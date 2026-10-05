@@ -1964,6 +1964,11 @@ class RunManager:
             run = {"run_id": rid, "root": root, "label": label,
                    "started": now, "config": config,
                    "software": dict(self.software),
+                   # Nodes that reported themselves simulated (see
+                   # _note_simulated). Latched before the first run.json
+                   # write, so the marker is on disk from the start.
+                   "simulated_nodes": {m.name_ for m in live
+                                       if getattr(m, "simulated", False)},
                    "time_off": time_off, "time_src": time_src,
                    "nodes": [m.name_ for m in live],
                    "events_fh": events_fh, "nmea_fh": nmea_fh,
@@ -2003,6 +2008,8 @@ class RunManager:
                    " + local changes" if sw.get("dirty") is True else "",
                    sw.get("describe"), sw.get("source")),
                 run_id=rid, **sw)
+            if run["simulated_nodes"]:
+                self._say_simulated(run, sorted(run["simulated_nodes"]))
             if not PIL_AVAILABLE:
                 self.events.emit(
                     "warn", "run",
@@ -2100,6 +2107,7 @@ class RunManager:
                     self.workers[m.name_] = w
                     if m.name_ not in run["nodes"]:
                         run["nodes"].append(m.name_)
+                    self._note_simulated(run, m)
                     m._edge_buf = []
                     self.events.emit(
                         "warn", "run",
@@ -4008,6 +4016,33 @@ class RunManager:
                 self.active["orphans"][node] = \
                     self.active["orphans"].get(node, 0) + n
 
+    def _note_simulated(self, run, m):
+        """Latch node `m` into the run's simulated set if it says it is one.
+
+        Caller holds self._lock. The marker comes only from what the node
+        itself reports (NodeMonitor.simulated: the test fakes answer
+        `"simulated": true`, the real piagent and ilxctl never send the key),
+        never from a flag or a setting, so a real run cannot be marked and a
+        simulated one cannot be left unmarked by someone forgetting. The set
+        only grows: once run.json says simulated, it stays. True when `m` is
+        new to the set."""
+        if m is None or not getattr(m, "simulated", False):
+            return False
+        sims = run.setdefault("simulated_nodes", set())
+        if m.name_ in sims:
+            return False
+        sims.add(m.name_)
+        self._say_simulated(run, [m.name_])
+        return True
+
+    def _say_simulated(self, run, names):
+        """The events.log line that goes with the run.json marker."""
+        self.events.emit(
+            "warn", "simulated",
+            "SIMULATED: %s reported simulated cameras (rig/tests/fakenode.py) "
+            "- this run is a test recording, not survey data"
+            % ", ".join(names), run_id=run["run_id"], nodes=list(names))
+
     def on_frame(self, node, cam_num, fname, orig, epoch):
         self.events.emit("debug", "frame", "%s <- %s" % (fname, orig), node=node)
 
@@ -4021,6 +4056,16 @@ class RunManager:
                 # throws away an eighth of the tolerance the harness buys.
                 rec = {"cam": cam_num, "file": fname, "orig": orig,
                        "epoch": round(epoch, 6), "src": source}
+                if node is not None:
+                    sim_new = self._note_simulated(self.active,
+                                                   self._mon(node))
+                    if node in self.active["simulated_nodes"]:
+                        # Per frame as well as per run, so index.jsonl alone
+                        # (the file readers prefer) says which frames came
+                        # from a simulated camera.
+                        rec["simulated"] = True
+                    if sim_new:
+                        self._write_run_json()
                 if path:
                     # Which way this frame was fired. A USB-fired frame carries
                     # 0-200 ms of skew against its pair and has to be
@@ -4138,6 +4183,11 @@ class RunManager:
                "index": run["index"][-2000:],
                "stats": {n: w.stats() for n, w in self.workers.items()},
                "final": final, "written": time.time()}
+        if run.get("simulated_nodes"):
+            # Recorded against simulated cameras. Present only then: absence
+            # means a real run, which is also how every older run reads.
+            doc["simulated"] = True
+            doc["simulated_nodes"] = sorted(run["simulated_nodes"])
         try:
             tmp = os.path.join(run["root"], "run.json.tmp")
             with open(tmp, "w") as fh:
@@ -4159,6 +4209,7 @@ class RunManager:
                     "frames": len(run["index"]),
                     "time_source": run["time_src"],
                     "gps_offset_s": round(run["time_off"], 3),
+                    "simulated": bool(run.get("simulated_nodes")),
                     "sync": {"shots": len(skews),
                              "skew_ms_max": skews[-1] if skews else None,
                              "late_shots": run["late_shots"],

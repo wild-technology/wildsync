@@ -15,6 +15,11 @@ P2  software stamp. Every run records the code that made it: run.json
     line, resolved once at start-up from git, else BUILD_INFO.json, else
     "unknown" - and nothing about resolving it may hang or fail a run.
 
+P3  simulated runs. A run recorded against the test fakes carries the marker
+    inside its own files (run.json "simulated", index.jsonl per frame, one
+    events.log line), derived only from what the nodes report, so a real run
+    can never be marked and a simulated one never left unmarked.
+
 Hermetic: in-process fakes on loopback only, temp run roots, never ~/rig or
 ~/rig-runs.
 
@@ -51,13 +56,19 @@ def _read_flight(path):
         return list(csv.DictReader(fh))
 
 
-def _short_run(label, specs=None, frames=2, nav=None):
+def _short_run(label, specs=None, frames=2, nav=None, prep=None):
     """One real run against fakes: start, land `frames` frames per camera,
-    stop. Returns (env, result of start, run root). The caller closes env."""
+    stop. Returns (env, result of start, run root). The caller closes env.
+    `prep(env)` runs before the monitors' first poll."""
     specs = specs or [("cam1", "127.0.0.2", 1), ("cam2", "127.0.0.3", 2)]
-    env = Env(specs, poll=0.3, threaded=True,
+    env = Env(specs, poll=0.3, threaded=False,
               nav=nav if nav is not None else FakeNav(fix=False),
               imu_node="cam9")
+    if prep is not None:
+        prep(env)
+    env.threaded = True
+    for m in env.monitors:
+        m.start()
     for spec in specs:
         env.wait_state(spec[0], "CAM_CONNECTED")
     r = env.runmgr.start({"label": label, "calibrate": False})
@@ -371,9 +382,157 @@ def _p2_software_stamp(opts):
 
 
 # ---------------------------------------------------------------------------
+# P3 — simulated runs are marked inside their own files
+# ---------------------------------------------------------------------------
+def _index_lines(root):
+    with open(os.path.join(root, "index.jsonl")) as fh:
+        return [json.loads(ln) for ln in fh if ln.strip()]
+
+
+def _as_real_node(node):
+    """Make a fake answer exactly as the real piagent and ilxctl do: the same
+    documents with no "simulated" key. Test-only - FakeNode itself has no way
+    to stop saying it is simulated."""
+    from fakenode import FakeNode
+    node.status = lambda: {k: v for k, v in FakeNode.status(node).items()
+                           if k != "simulated"}
+    node.health = lambda: {k: v for k, v in FakeNode.health(node).items()
+                           if k != "simulated"}
+
+
+def _p3_simulated(opts):
+    sect("P3 simulated runs: marked in run.json, index.jsonl and events.log "
+         "from what the nodes report; real runs never marked")
+    from fakenode import FakeNode, FACTORY
+    fk = FakeNode("camS", "127.0.0.9", cam_num=9)
+    try:
+        fk.label_override = {"simulated": False}
+        fk.hide_keys = {"simulated"}
+        check("a fake says it is simulated on both surfaces, and no override "
+              "or hidden key can stop it",
+              fk.status().get("simulated") is True
+              and fk.health().get("simulated") is True)
+    finally:
+        fk.close()
+    with open(os.path.join(RIG, "piagent.py")) as fh:
+        pia = fh.read()
+    src = ""
+    srcdir = os.path.join(os.path.dirname(RIG), "src")
+    for fn in sorted(os.listdir(srcdir)):
+        if fn.endswith((".cpp", ".h")):
+            with open(os.path.join(srcdir, fn), errors="replace") as fh:
+                src += fh.read()
+    check("the real piagent and ilxctl never send a 'simulated' key",
+          "simulated" not in pia and "simulated" not in src)
+
+    env, r, root = _short_run("p3-sim")
+    try:
+        doc = json.load(open(os.path.join(root, "run.json")))
+        check("run.json of a run against the fakes says simulated, naming "
+              "the nodes",
+              doc.get("simulated") is True
+              and doc.get("simulated_nodes") == ["cam1", "cam2"],
+              json.dumps({k: doc.get(k) for k in ("simulated",
+                                                   "simulated_nodes")}))
+        idx = _index_lines(root)
+        check("every index.jsonl frame of it says simulated",
+              idx and all(e.get("simulated") is True for e in idx),
+              str(len(idx)))
+        with open(os.path.join(root, "events.log")) as fh:
+            sim_lines = [ln for ln in fh if "SIMULATED" in ln]
+        check("events.log has one SIMULATED line for it",
+              len(sim_lines) == 1 and "cam1, cam2" in sim_lines[0],
+              "".join(sim_lines)[:200])
+        with open(os.path.join(root, "cam1", "flight_log.csv"),
+                  newline="") as fh:
+            hdr = next(csv.reader(fh))
+        check("the flight_log shape is unchanged (23 columns)",
+              hdr == runmod.FLIGHT_HEADER and len(hdr) == 23, str(len(hdr)))
+        rb = rigcore.RunBrowser()
+        row = {x["run_id"]: x for x in rb.list_runs()["runs"]}.get(r["run_id"])
+        det = rb.detail(r["run_id"])
+        check("the run browser lists and opens it as simulated",
+              (row or {}).get("simulated") is True
+              and det.get("simulated") is True
+              and det.get("simulated_nodes") == ["cam1", "cam2"],
+              json.dumps(row)[:200])
+        check("each fake's monitor recorded it", all(
+            m.simulated and m.snapshot().get("simulated") for m in env.monitors))
+
+        # Never unmarked: crash recovery rewrites run.json but keeps it.
+        doc["final"] = False
+        with open(os.path.join(root, "run.json"), "w") as fh:
+            json.dump(doc, fh)
+        import types
+        import rigd
+        fake_rig = types.SimpleNamespace(runs=rigcore.RunBrowser(),
+                                         events=env.events)
+        rigd.Rig._recover_runs(fake_rig)
+        doc2 = json.load(open(os.path.join(root, "run.json")))
+        check("crash recovery keeps the simulated marker",
+              doc2.get("interrupted") is True and doc2.get("simulated") is True
+              and doc2.get("simulated_nodes") == ["cam1", "cam2"],
+              json.dumps({k: doc2.get(k) for k in ("interrupted", "simulated")}))
+    finally:
+        env.close()
+
+    # The same run against nodes that answer like the real daemons.
+    def realise(env):
+        for n in env.nodes.values():
+            _as_real_node(n)
+    env, r, root = _short_run("p3-real", prep=realise)
+    try:
+        doc = json.load(open(os.path.join(root, "run.json")))
+        check("a run against real-shaped nodes carries no simulated key",
+              "simulated" not in doc and "simulated_nodes" not in doc
+              and not any(m.simulated for m in env.monitors),
+              json.dumps({k: doc.get(k) for k in ("simulated",)}))
+        idx = _index_lines(root)
+        check("...nor do its index.jsonl frames",
+              idx and not any("simulated" in e for e in idx), str(len(idx)))
+        with open(os.path.join(root, "events.log")) as fh:
+            ev = fh.read()
+        check("...nor its events.log", "SIMULATED" not in ev)
+        row = {x["run_id"]: x for x in
+               rigcore.RunBrowser().list_runs()["runs"]}.get(r["run_id"])
+        check("the run browser reports it as a real run",
+              (row or {}).get("simulated") is False, json.dumps(row)[:160])
+
+        # A node that turns out to be simulated mid-run (its first answers
+        # lost) marks the run from that frame on, and the run stays marked.
+        r2 = env.runmgr.start({"label": "p3-late", "calibrate": False})
+        root2 = r2.get("root", "")
+        m1 = env.mon("cam1")
+        n1 = env.node("cam1")
+        n1.add_frame(epoch=time.time())
+        wait_for(lambda: len(_index_lines(root2)) >= 1, 10)
+        m1.simulated = True
+        n1.add_frame(epoch=time.time() + 0.5)
+        wait_for(lambda: len(_index_lines(root2)) >= 2, 10)
+        m1.simulated = False          # a monitor never clears it; the run
+        env.runmgr.stop()             # must not depend on that either
+        doc3 = json.load(open(os.path.join(root2, "run.json")))
+        idx3 = _index_lines(root2)
+        check("a node that reports simulated mid-run marks the run, and the "
+              "mark survives to the final run.json",
+              doc3.get("simulated") is True
+              and doc3.get("simulated_nodes") == ["cam1"]
+              and doc3.get("final") is True,
+              json.dumps({k: doc3.get(k) for k in ("simulated",
+                                                    "simulated_nodes")}))
+        check("frames before it are unmarked, frames from it on are marked",
+              len(idx3) >= 2 and "simulated" not in idx3[0]
+              and idx3[-1].get("simulated") is True,
+              json.dumps(idx3)[:300])
+    finally:
+        env.close()
+
+
+# ---------------------------------------------------------------------------
 def suite(opts):
     _p1_time_source(opts)
     _p2_software_stamp(opts)
+    _p3_simulated(opts)
 
 
 if __name__ == "__main__":

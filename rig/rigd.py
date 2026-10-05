@@ -1838,6 +1838,9 @@ class Rig:
             # False = the operator switched this CAMERA off. The node is still
             # here (polled, clocked, strobe-capable); it just takes no frames.
             "camera_enabled": m.camera_enabled,
+            # The node said it is a test fake (rig/tests/fakenode.py); any run
+            # it joins is marked simulated in run.json.
+            "simulated": bool(getattr(m, "simulated", False)),
             "connected": status.get("connected", False),
             "model": status.get("model"), "id": status.get("id"),
             "battery": status.get("battery"),
