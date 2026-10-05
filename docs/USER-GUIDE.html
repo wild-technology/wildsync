@@ -263,6 +263,7 @@ footer{border-top:1px solid var(--line);margin-top:56px;padding-top:20px;
     <li><a href="#s9"><span class="n">10</span><span>Alert reference</span></a></li>
     <li><a href="#s10"><span class="n">11</span><span>Recovery</span></a></li>
     <li><a href="#s11"><span class="n">12</span><span>Limits</span></a></li>
+    <li><a href="#s12"><span class="n">13</span><span>Revision history</span></a></li>
   </ol>
 </nav>
 
@@ -782,6 +783,21 @@ curl -s -X POST 192.168.1.201:8080/api/spool/prune -d '{"confirm":"prune"}'</cod
 <li><strong>No fleet focus or zoom</strong>, deliberately, until lens-encoder parity is proven.</li>
 <li><strong>Delivered JPEGs are review-size</strong> (~1.7 MP). The survey resolution lives in the RAW on the card - drain it.</li>
 </ul>
+</section>
+
+<section id="s12">
+<h2><span class="num">13</span>Revision history</h2><div class="rule"></div>
+<p>This manual has been issued in more than one edition, and the editions describe
+different hardware. Check the edition you are reading against the rig in front of
+you, and against the rig that recorded the data you are looking at.</p>
+
+<div class="tw"><table>
+<thead><tr><th>edition</th><th>hardware it describes</th><th>recorded field data</th></tr></thead>
+<tbody>
+<tr><td class="mono">24 Aug 2026<br>build label "audit-fixes"</td><td>A Mac running <code>rigd</code>, and one Raspberry Pi per camera running <code>ilxctl</code> + <code>piagent</code>. Cameras fired by the hardware GPIO trigger. No strobe.</td><td><strong>This is the edition that matches the 20 Aug 2026 Narragansett Bay field transects.</strong> Those were recorded with a Mac host; a Pi 5 on cam1 and a Pi 4 on cam2; the hardware GPIO trigger; one IMU, on cam1; no strobe fired; and no live navigation (a static fix). "audit-fixes" is a build label for the audit-pass commits of 23-24 Aug 2026, not a branch or tag.</td></tr>
+<tr><td class="mono">21 Sep 2026<br>software tag <code>v1.0.0</code></td><td>A Jetson Orin NX running <code>rigd</code>, the XR256 strobe role, and one Olive IMU per camera. Describes the software tagged <code>v1.0.0</code>.</td><td>Does not match the 20 Aug 2026 field data. The strobe has not been fired with the camera array, and this configuration was not used for the 20 Aug 2026 transects.</td></tr>
+<tr><td class="mono">Current edition</td><td>The same hardware as the 21 Sep 2026 edition. Its text is unchanged from that edition apart from this revision history.</td><td>As for the 21 Sep 2026 edition: does not match the 20 Aug 2026 field data.</td></tr>
+</tbody></table></div>
 </section>
 
 </main>
