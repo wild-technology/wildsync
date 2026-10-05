@@ -16,6 +16,8 @@ real time and place straight off the archive.
     python3 rig/ingest.py /Users/wild/Pictures/2026/2026-08-18
     python3 rig/ingest.py <card_dir> --run 260820_1925_transect-01 --move
     python3 rig/ingest.py <card_dir> --dry-run
+    python3 rig/ingest.py --verify 260820_1925_transect-01   # check SHA256SUMS
+    python3 rig/ingest.py --write-sums 260820_1925_transect-01
     python3 rig/ingest.py --selftest
 
 Card files are timed from EXIF — the JPEG's when there is one, otherwise the
@@ -40,11 +42,19 @@ the run (no extra space on the same volume) or copied; --move removes the
 card-dir copy afterwards, and only ever after the destination is confirmed
 byte-identical. Nothing is written unless every step of a run's match is
 consistent; the manifest says what happened.
+
+Hashes. ingest_manifest.csv carries the SHA-256 of each RAW and card JPEG as
+placed in the run (raw_sha256, jpg_sha256, appended after the original eight
+columns), and <run>/SHA256SUMS lists every frame in the run and, once run.json
+says the run is final, the run's own records - in the format `shasum -a 256
+-c` reads. A file already listed keeps the hash first recorded for it, so a
+re-ingest can never re-bless a file that changed since; --verify re-hashes
+everything listed. When the card files came from a drain, each placed file is
+also checked against the hash the drain verified (<dest>/SHA256SUMS).
 """
 import argparse
 import csv
 import glob
-import hashlib
 import json
 import os
 import re
@@ -58,11 +68,28 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from run import _exif_capture_epoch, FLIGHT_HEADER  # noqa: E402
+import rigcore                                         # noqa: E402
+# One hasher and one SHA256SUMS format for the drain and ingest alike.
+from drain import (SUMS_NAME, file_sha256, read_sums,  # noqa: E402
+                   verify_sums, write_sums)
 
 TOL_S = 0.75          # max |card exif - rig epoch| after offset removal
 BIN_S = 0.25          # histogram bin for offset discovery
 MIN_FRAC = 0.7        # fraction of rows a candidate offset must explain
 RUNS_DIR = os.path.expanduser("~/rig-runs")
+
+# ingest_manifest.csv, in column order. The first eight are the original
+# columns, unchanged; the two hashes were appended in v1.1.0, so a reader keyed
+# on position or on name keeps working, and an older manifest simply lacks them
+# (its rows read back with the hash columns empty).
+MANIFEST_COLUMNS = ["run_id", "cam", "card", "new_base", "epoch",
+                    "residual_ms", "raw", "jpg", "raw_sha256", "jpg_sha256"]
+
+# What <run>/SHA256SUMS covers besides the frames, once run.json is final:
+# the run's own records, at the top of the run and in each camera directory.
+RUN_RECORD_FILES = ("run.json", "index.jsonl", "events.log", "nmea_raw.log",
+                    "unpulled.jsonl", "ingest_manifest.csv")
+CAM_RECORD_FILES = ("flight_log.csv",)
 
 
 # ---------------------------------------------------------------------------
@@ -474,14 +501,6 @@ def xmp_sidecar(row, fl, run_id, cam, residual_s, pair_spread_ms):
 """ % (iso, iso, iso, gps, ws))
 
 
-def _sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def place(src, dst, move, dry):
     """Hardlink (same volume) or copy src to dst; --move removes src.
 
@@ -504,13 +523,13 @@ def place(src, dst, move, dry):
             same = False
         if not same:
             same = (os.path.getsize(dst) == os.path.getsize(src)
-                    and _sha256_file(dst) == _sha256_file(src))
+                    and file_sha256(dst) == file_sha256(src))
         if same:
             if move and os.path.exists(src):
                 os.unlink(src)
             return "exists"
         stem, ext = os.path.splitext(dst)
-        alt = "%s.conflict-%s%s" % (stem, _sha256_file(src)[:8], ext)
+        alt = "%s.conflict-%s%s" % (stem, file_sha256(src)[:8], ext)
         if not os.path.exists(alt):
             tmp = alt + ".part"
             shutil.copy2(src, tmp)
@@ -547,6 +566,143 @@ def place(src, dst, move, dry):
     return how
 
 
+# ---------------------------------------------------------------------------
+# hashes: manifest columns and <run>/SHA256SUMS
+# ---------------------------------------------------------------------------
+_FRESH_PLACEMENTS = ("linked", "copied", "moved")
+
+
+def _placed_path(how, dst):
+    """Where place() left the card file's bytes, or None (dry run)."""
+    how = str(how)
+    if how.startswith("conflict:"):
+        return os.path.join(os.path.dirname(dst), how.split(":", 1)[1])
+    if how in _FRESH_PLACEMENTS or how == "exists":
+        return dst
+    return None
+
+
+class RunHasher:
+    """SHA-256 of files in one run, each hashed at most once per pass.
+
+    A file <run>/SHA256SUMS already lists keeps the hash recorded for it
+    unless the caller says its bytes were just written: re-hashing on every
+    ingest would quietly re-record a frame that had changed on disk since,
+    and the record exists to catch exactly that."""
+
+    def __init__(self, root):
+        self.root = root
+        self.recorded = read_sums(os.path.join(root, SUMS_NAME))
+        self.known = {}
+        self.hashed = 0
+
+    def rel(self, path):
+        return os.path.relpath(path, self.root).replace(os.sep, "/")
+
+    def sha(self, path, fresh=False):
+        rel = self.rel(path)
+        if rel in self.known and not fresh:
+            return self.known[rel]
+        if not fresh and rel in self.recorded:
+            v = self.recorded[rel]
+        else:
+            v = file_sha256(path)
+            self.hashed += 1
+        self.known[rel] = v
+        return v
+
+
+def run_sum_files(root, doc=None):
+    """The relative paths <run>/SHA256SUMS covers.
+
+    Every frame (rigcore.FRAME_EXTS: review JPEG, RAW, card JPEG, a parked
+    .conflict- file) in each camera directory - a subdirectory holding a
+    flight_log.csv, the run browser's own definition - and, once run.json says
+    final, the run's records (RUN_RECORD_FILES, CAM_RECORD_FILES). Not the
+    .xmp sidecars: they are derived from those records, ingest rewrites its
+    own, and photo editors write theirs. Symlinks are never followed."""
+    if doc is None:
+        try:
+            with open(os.path.join(root, "run.json")) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            doc = {}
+    final = isinstance(doc, dict) and doc.get("final") is True
+    out = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return out, final
+    for d in names:
+        p = os.path.join(root, d)
+        if os.path.islink(p):
+            continue
+        if os.path.isdir(p):
+            if not os.path.isfile(os.path.join(p, "flight_log.csv")):
+                continue
+            for fn in sorted(os.listdir(p)):
+                fp = os.path.join(p, fn)
+                if os.path.islink(fp) or not os.path.isfile(fp):
+                    continue
+                if fn.lower().endswith(rigcore.FRAME_EXTS) \
+                        or (final and fn in CAM_RECORD_FILES):
+                    out.append(d + "/" + fn)
+        elif final and d in RUN_RECORD_FILES and os.path.isfile(p):
+            out.append(d)
+    return out, final
+
+
+def write_run_sums(root, doc=None, hasher=None, log=print):
+    """(Re)write <run>/SHA256SUMS. Returns {files, hashed, final, missing,
+    skipped}. Entries for files that are gone are KEPT, so --verify reports
+    them missing instead of the record quietly forgetting them."""
+    hasher = hasher or RunHasher(root)
+    files, final = run_sum_files(root, doc)
+    entries = {}
+    for rel in files:
+        # ingest_manifest.csv is rewritten by every ingest; nothing else
+        # listed here is ever rewritten in place.
+        entries[rel] = hasher.sha(os.path.join(root, *rel.split("/")),
+                                  fresh=(rel == "ingest_manifest.csv"))
+    missing = sorted(r for r in hasher.recorded if r not in entries
+                     and not os.path.isfile(os.path.join(root, *r.split("/"))))
+    for rel in hasher.recorded:
+        entries.setdefault(rel, hasher.recorded[rel])
+    skipped = write_sums(os.path.join(root, SUMS_NAME), entries)
+    rid = os.path.basename(os.path.normpath(root))
+    log("  %s: %s lists %d files (%d hashed now)%s%s%s"
+        % (rid, SUMS_NAME, len(entries) - len(skipped), hasher.hashed,
+           "" if final else "; run.json is not final, so only frames",
+           "; WARNING %d listed file(s) are no longer present: %s"
+           % (len(missing), ", ".join(missing[:5])) if missing else "",
+           "; %d name(s) not representable, left out" % len(skipped)
+           if skipped else ""))
+    return {"files": len(entries) - len(skipped), "hashed": hasher.hashed,
+            "final": final, "missing": missing, "skipped": skipped}
+
+
+def resolve_run(arg, runs_dir=RUNS_DIR):
+    """A run given as a directory path or as a run id under runs_dir."""
+    if os.path.isdir(arg):
+        return os.path.abspath(arg)
+    return os.path.join(runs_dir, arg)
+
+
+def verify_run(path, log=print):
+    """Re-hash everything <path>/SHA256SUMS lists. Returns the verify_sums()
+    report plus "unlisted": files a fresh SHA256SUMS would cover that this
+    one does not (written after it, or a run that was never ingested)."""
+    rep = verify_sums(path, log=log)
+    if rep["sums"] is not None and os.path.isfile(os.path.join(path,
+                                                               "run.json")):
+        files, _ = run_sum_files(path)
+        listed = read_sums(rep["sums"])
+        rep["unlisted"] = [r for r in files if r not in listed]
+    else:
+        rep["unlisted"] = []
+    return rep
+
+
 def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
            log=print, offsets=None):
     """Returns {"runs": [...], "leftover": [...], "totals": {...}} — totals
@@ -566,6 +722,14 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
             "- a stem collision paired foreign files; using the JPEG's" % mism)
     used = set()
     report = []
+    # The drain's hash record for these files, when they came from a drain:
+    # <dest>/SHA256SUMS lists them as "<node dir>/<name>".
+    staging = os.path.basename(os.path.normpath(card_dir))
+    drained = {rel.split("/", 1)[1]: sha for rel, sha in read_sums(
+        os.path.join(os.path.dirname(os.path.normpath(card_dir)),
+                     SUMS_NAME)).items()
+        if rel.startswith(staging + "/")}
+    hash_mismatch = []
     roots = sorted(glob.glob(os.path.join(runs_dir, "*", "run.json")))
     for rj in roots:
         root = os.path.dirname(rj)
@@ -596,6 +760,7 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                 shots.setdefault(round(r["epoch"]), {})[cam] = r["epoch"]
         manifest = []
         summary = {}
+        hasher = None if dry else RunHasher(root)
         # Certain matches first: a camera whose card numbering equals its
         # PC-save counter is resolved by number before any camera is matched
         # by time, so the time pass only ever sees the series left over.
@@ -681,6 +846,29 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                     summary[cam]["raw"] += 1
                 if c["jpg"]:
                     acts["jpg"] = place(c["jpg"], os.path.join(camdir, base + ".card.JPG"), move, dry)
+                # SHA-256 of what now sits in the run for each card file.
+                # A file placed just now is hashed from disk; one placed by
+                # an earlier ingest keeps the hash SHA256SUMS recorded.
+                shas = {}
+                for kind, src, ext in (("arw", c["arw"], ".ARW"),
+                                       ("jpg", c["jpg"], ".card.JPG")):
+                    held = (_placed_path(acts.get(kind),
+                                         os.path.join(camdir, base + ext))
+                            if hasher and kind in acts else None)
+                    if not held or not os.path.isfile(held):
+                        continue
+                    shas[kind] = hasher.sha(
+                        held, fresh=acts[kind] in _FRESH_PLACEMENTS)
+                    want = drained.get(os.path.basename(src))
+                    if want and want != shas[kind]:
+                        hash_mismatch.append("%s cam%d %s" % (rid, cam,
+                                                             hasher.rel(held)))
+                        log("  %s cam%d: WARNING %s differs from the hash the "
+                            "drain verified for %s (%s... vs %s...) - the "
+                            "staged copy changed after the drain"
+                            % (rid, cam, hasher.rel(held),
+                               os.path.basename(src), shas[kind][:12],
+                               want[:12]))
                 # a run name already holding DIFFERENT bytes is never
                 # overwritten (place() parks the new file beside it) - count
                 # it so the operator is told rather than left to find it
@@ -713,12 +901,15 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                                  "new_base": base, "epoch": "%.6f" % r["epoch"],
                                  "residual_ms": "%.1f" % (res * 1000.0),
                                  "raw": acts.get("arw", "none"),
-                                 "jpg": acts.get("jpg", "none")})
+                                 "jpg": acts.get("jpg", "none"),
+                                 "raw_sha256": shas.get("arw", ""),
+                                 "jpg_sha256": shas.get("jpg", "")})
             for r in unmatched:
                 manifest.append({"run_id": rid, "cam": cam, "card": "",
                                  "new_base": os.path.splitext(r["file"])[0],
                                  "epoch": "%.6f" % r["epoch"], "residual_ms": "",
-                                 "raw": "MISSING ON CARD", "jpg": ""})
+                                 "raw": "MISSING ON CARD", "jpg": "",
+                                 "raw_sha256": "", "jpg_sha256": ""})
             rm = summary[cam]["residual_ms"]
             log("  %s cam%d: %d/%d matched by %s (series %s, clock offset %+.2f s)"
                 " RAW %d | residual median %.1f ms max %.1f ms | unmatched %d%s"
@@ -744,10 +935,16 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                 except (OSError, ValueError):
                     old_rows = []
             with open(mp, "w", newline="") as fh:
-                w = csv.DictWriter(fh, fieldnames=list(manifest[0].keys()),
+                # Rows kept from an older manifest have no hash columns;
+                # restval leaves those cells empty.
+                w = csv.DictWriter(fh, fieldnames=MANIFEST_COLUMNS,
                                    extrasaction="ignore", restval="")
                 w.writeheader()
                 w.writerows(old_rows + manifest)
+            try:
+                write_run_sums(root, doc=doc, hasher=hasher, log=log)
+            except OSError as e:
+                log("  %s: WARNING %s not written: %s" % (rid, SUMS_NAME, e))
         report.append({"run_id": rid, "summary": summary})
     # what the card holds that belongs to no run
     leftover = [c for c in cards if c["stem"] not in used]
@@ -758,6 +955,7 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
               "conflicts": 0, "cards": len(cards),
               "cards_timed": sum(1 for c in cards if c["exif"] is not None),
               "leftover": len(leftover), "exif_mismatch": mism,
+              "hash_mismatch": len(hash_mismatch),
               "ambiguous": []}
     for r in report:
         for cam, sm in r["summary"].items():
@@ -768,13 +966,15 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
             if str(sm.get("how", "")).startswith("ambiguous"):
                 totals["ambiguous"].append("%s cam%s" % (r["run_id"], cam))
     log("ingest totals: %d runs, %d matched, %d unmatched, %d RAW placed, "
-        "%d leftover, %d of %d card files timed%s%s"
+        "%d leftover, %d of %d card files timed%s%s%s"
         % (totals["runs"], totals["matched"], totals["unmatched"],
            totals["raw"], totals["leftover"], totals["cards_timed"],
            totals["cards"],
            ", %d CONFLICTS" % totals["conflicts"] if totals["conflicts"] else "",
            ", AMBIGUOUS: " + "; ".join(totals["ambiguous"])
-           if totals["ambiguous"] else ""))
+           if totals["ambiguous"] else "",
+           ", %d HASH MISMATCH vs the drain record" % totals["hash_mismatch"]
+           if totals["hash_mismatch"] else ""))
     return {"runs": report, "leftover": [c["stem"] for c in leftover],
             "totals": totals}
 
@@ -841,12 +1041,65 @@ def _selftest():
     assert "<exif:GPSLatitude>41,25.426512N" in x and "<wildsync:capture_epoch>" in x, x[:400]
     assert "<wildsync:time_source>jetson</wildsync:time_source>" in x, x
     assert os.path.exists(os.path.join(root, "ingest_manifest.csv"))
+    # hashes: manifest columns appended, SHA256SUMS over frames + records
+    with open(os.path.join(root, "ingest_manifest.csv"), newline="") as fh:
+        mrows = list(csv.DictReader(fh))
+        assert list(mrows[0].keys()) == MANIFEST_COLUMNS, list(mrows[0].keys())
+    for mr in mrows:
+        camdir = os.path.join(root, "cam%s" % mr["cam"])
+        assert mr["raw_sha256"] == file_sha256(
+            os.path.join(camdir, mr["new_base"] + ".ARW")), mr
+        assert mr["jpg_sha256"] == file_sha256(
+            os.path.join(camdir, mr["new_base"] + ".card.JPG")), mr
+    v = verify_run(root, log=lambda *a: None)
+    listed = read_sums(os.path.join(root, SUMS_NAME))
+    assert v["ok"] == v["listed"] and not v["failed"] and not v["missing"], v
+    assert "run.json" in listed and "cam1/flight_log.csv" in listed, listed
+    assert not any(k.endswith(".xmp") for k in listed), listed
+    assert len([k for k in listed if k.endswith(".ARW")]) == 8, listed
     # idempotent
     out2 = ingest(card, runs_dir=runs, log=lambda *a: None)
     assert out2["runs"][0]["summary"][2]["matched"] == 4
+    # a changed frame is caught, and a later --write-sums does not re-bless it
+    arw = os.path.join(root, "cam%s" % mrows[0]["cam"],
+                       mrows[0]["new_base"] + ".ARW")
+    os.unlink(arw)                      # break the hardlink, then rewrite
+    with open(arw, "wb") as fh:
+        fh.write(b"BITROT" * 50)
+    write_run_sums(root, log=lambda *a: None)
+    v2 = verify_run(root, log=lambda *a: None)
+    assert v2["failed"] == [os.path.relpath(arw, root).replace(os.sep, "/")], v2
     shutil.rmtree(tmp)
     print("INGEST SELF-TEST: PASS (number + time matching, offsets recovered, "
-          "RAW renamed, XMP with GPS, manifest, idempotent)")
+          "RAW renamed, XMP with GPS, manifest, idempotent, hashes, "
+          "SHA256SUMS verify)")
+
+
+def _cli_verify(targets, runs_dir):
+    """--verify: exit 0 when every listed file matches, 1 when any failed or
+    is missing, 2 when a target has no SHA256SUMS at all."""
+    worst = 0
+    for t in targets:
+        path = resolve_run(t, runs_dir)
+        print("%s:" % path)
+        rep = verify_run(path, log=lambda m: print("  " + m))
+        if rep["sums"] is None:
+            print("  no %s here - nothing was recorded (a run never ingested "
+                  "or recorded before v1.1.0; --write-sums records one)"
+                  % SUMS_NAME)
+            worst = max(worst, 2)
+            continue
+        bad = len(rep["failed"]) + len(rep["missing"])
+        print("  %d listed: %d OK, %d FAILED, %d MISSING%s"
+              % (rep["listed"], rep["ok"], len(rep["failed"]),
+                 len(rep["missing"]),
+                 "; %d file(s) present but not listed (written after %s?)"
+                 % (len(rep["unlisted"]), SUMS_NAME) if rep["unlisted"]
+                 else ""))
+        print("  %s" % ("VERIFIED" if not bad else "NOT VERIFIED"))
+        if bad:
+            worst = max(worst, 1)
+    return worst
 
 
 def main():
@@ -856,10 +1109,27 @@ def main():
     ap.add_argument("--run", action="append", help="only this run id (repeatable)")
     ap.add_argument("--move", action="store_true", help="remove card-dir copies after placing")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--verify", action="append", metavar="RUN",
+                    help="re-hash everything RUN's SHA256SUMS lists (a run id "
+                         "under --runs, or any directory holding a SHA256SUMS, "
+                         "e.g. the drain's ~/rig-raw); repeatable")
+    ap.add_argument("--write-sums", action="append", metavar="RUN",
+                    help="write or extend RUN's SHA256SUMS without ingesting "
+                         "(files already listed keep their recorded hash); "
+                         "repeatable")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         _selftest(); return
+    if a.verify or a.write_sums:
+        for t in a.write_sums or []:
+            path = resolve_run(t, a.runs)
+            if not os.path.isfile(os.path.join(path, "run.json")):
+                ap.error("%s is not a run directory (no run.json)" % path)
+            write_run_sums(path)
+        if a.verify:
+            sys.exit(_cli_verify(a.verify, a.runs))
+        return
     if not a.card_dir:
         ap.error("card_dir is required")
     ingest(a.card_dir, runs_dir=a.runs, only=a.run, move=a.move, dry=a.dry_run)

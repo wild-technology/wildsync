@@ -20,6 +20,12 @@ P3  simulated runs. A run recorded against the test fakes carries the marker
     events.log line), derived only from what the nodes report, so a real run
     can never be marked and a simulated one never left unmarked.
 
+P4  hashes. The drain records every verified file's SHA-256 before the card
+    delete; ingest writes raw_sha256/jpg_sha256 after the original eight
+    manifest columns and a shasum-compatible <run>/SHA256SUMS; --verify
+    re-hashes; a recorded hash is never silently replaced; runs without any
+    of this still load.
+
 Hermetic: in-process fakes on loopback only, temp run roots, never ~/rig or
 ~/rig-runs.
 
@@ -529,10 +535,226 @@ def _p3_simulated(opts):
 
 
 # ---------------------------------------------------------------------------
+# P4 — drain hash record, manifest hashes, SHA256SUMS, --verify
+# ---------------------------------------------------------------------------
+def _drainer(node, nominal, dest):
+    import drain as draindrv
+    from fakenode import loopback_map
+    h, port = loopback_map(nominal, 8080)
+    dr = draindrv.Drainer(node, h, dest=dest, log=lambda *a: None)
+    dr.base = "http://%s:%d" % (h, port)
+    return dr
+
+
+def _cli(*args):
+    import subprocess
+    p = subprocess.run([sys.executable, os.path.join(RIG, "ingest.py")]
+                       + list(args), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=120)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def _oneline(out, n=4):
+    """The last lines of a command's output as one detail string, so its own
+    FAILED/MISSING lines can never read as a failing check in the log."""
+    return " | ".join(ln.strip() for ln in out.strip().splitlines()[-n:])
+
+
+def _shasum_check(root):
+    """(tool, ok) from the system's own checker, or (None, None)."""
+    import subprocess
+    for tool in (["shasum", "-a", "256", "-c"], ["sha256sum", "-c"]):
+        if shutil.which(tool[0]):
+            p = subprocess.run(tool + ["SHA256SUMS"], cwd=root,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=120)
+            return tool[0], p.returncode == 0, _oneline(p.stdout.decode())
+    return None, None, ""
+
+
+def _p4_hashes(opts):
+    sect("P4 hashes: drain record, manifest raw_sha256/jpg_sha256, "
+         "<run>/SHA256SUMS, --verify, legacy runs")
+    import drain as draindrv
+    import ingest
+    from fakenode import make_jpeg
+
+    # -- the drain's durable per-file record --------------------------------
+    env = Env([("cam1", "127.0.0.2", 1)], poll=0.3, threaded=True)
+    raw = os.path.join(env.dir, "raw")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        node = env.node("cam1")
+        for _ in range(3):
+            node.add_frame(epoch=time.time())
+        n_card = len(node.card)
+        dr = _drainer("cam1", "127.0.0.2", raw)
+        rep = dr.run(keep_card=True)
+        rec = draindrv.read_sums(os.path.join(raw, "SHA256SUMS"))
+        want = {"cam1/" + f: draindrv.file_sha256(
+            os.path.join(raw, "cam1", f)) for f in rep["files"]}
+        check("the drain records the hash of every file it lands, as "
+              "cam1/<name> beside the node directories",
+              rep["files"] and rec == want and n_card == rep["pulled"],
+              "%d files, %d recorded" % (len(rep["files"]), len(rec)))
+        check("the staging directory itself holds only card files",
+              "SHA256SUMS" not in os.listdir(os.path.join(raw, "cam1")))
+        with open(os.path.join(raw, "SHA256SUMS")) as fh:
+            n_lines = len(fh.readlines())
+        dr2 = _drainer("cam1", "127.0.0.2", raw)
+        dr2.run(keep_card=True)        # the same contents, re-verified
+        with open(os.path.join(raw, "SHA256SUMS")) as fh:
+            n_lines2 = len(fh.readlines())
+        check("re-verifying identical files does not repeat their lines",
+              n_lines2 == n_lines, "%d -> %d" % (n_lines, n_lines2))
+        v = draindrv.verify_sums(raw)
+        check("the drain record verifies", v["ok"] == len(rec)
+              and not v["failed"] and not v["missing"], json.dumps(v)[:200])
+        tool, ok, out = _shasum_check(raw)
+        if tool:
+            check("%s -c accepts the drain record" % tool, ok, out)
+        # The record is part of the delete gate: no record, no delete.
+        blocked = os.path.join(env.dir, "raw-blocked")
+        os.makedirs(os.path.join(blocked, "SHA256SUMS"))   # unwritable as a file
+        node.add_frame(epoch=time.time())
+        before = set(node.card)
+        rep3 = _drainer("cam1", "127.0.0.2", blocked).run()
+        check("a drain that cannot write its hash record keeps the card "
+              "originals", set(node.card) == before and rep3["deleted"] == 0
+              and any("hash record" in e for e in rep3["errors"]),
+              json.dumps(rep3["errors"][:2]))
+    finally:
+        env.close()
+
+    # -- ingest: manifest columns, SHA256SUMS, cross-check, --verify --------
+    tmp = _tmp()
+    runs = os.path.join(tmp, "runs")
+    root, doc = write_legacy_run(runs)
+    rid = os.path.basename(root)
+    # cam1's card files, staged the way the drain leaves them
+    stage = os.path.join(tmp, "raw", "cam1")
+    os.makedirs(stage)
+    body_off = -86400.0 * 2 + 12.3            # the body's clock is days wrong
+    staged = []
+    for i, e in enumerate([x for x in doc["index"] if x["cam"] == 1]):
+        stem = "DSC%05d" % (100 + i)
+        with open(os.path.join(stage, stem + ".JPG"), "wb") as fh:
+            fh.write(make_jpeg(e["epoch"] + body_off))
+        with open(os.path.join(stage, stem + ".ARW"), "wb") as fh:
+            fh.write(b"ARW-%d-" % i * 4000)
+        staged += [stem + ".JPG", stem + ".ARW"]
+    draindrv.append_sums(os.path.join(tmp, "raw", "SHA256SUMS"), [
+        ("cam1/" + f, draindrv.file_sha256(os.path.join(stage, f)))
+        for f in staged])
+    out = ingest.ingest(stage, runs_dir=runs, log=lambda *a: None,
+                        offsets=[])
+    s1 = out["runs"][0]["summary"].get(1, {}) if out["runs"] else {}
+    check("ingest matches the staged cam1 files into the legacy run",
+          s1.get("matched") == 3 and s1.get("raw") == 3, json.dumps(s1))
+    with open(os.path.join(root, "ingest_manifest.csv"), newline="") as fh:
+        rd = csv.reader(fh)
+        hdr = next(rd)
+        mrows = [dict(zip(hdr, x)) for x in rd]
+    check("the manifest keeps the original eight columns in place and "
+          "appends raw_sha256, jpg_sha256",
+          hdr[:8] == LEGACY_MANIFEST_COLS
+          and hdr[8:] == ["raw_sha256", "jpg_sha256"], str(hdr))
+    c1 = [m for m in mrows if m["cam"] == "1"]
+    c2 = [m for m in mrows if m["cam"] == "2"]
+    ok_h = all(m["raw_sha256"] == draindrv.file_sha256(os.path.join(
+        root, "cam1", m["new_base"] + ".ARW")) and m["jpg_sha256"]
+        == draindrv.file_sha256(os.path.join(root, "cam1", m["new_base"]
+                                             + ".card.JPG")) for m in c1)
+    check("each RAW and card JPEG row carries the SHA-256 of the file in "
+          "the run", len(c1) == 3 and ok_h, json.dumps(c1[:1]))
+    check("rows kept from the older manifest load with empty hash cells",
+          len(c2) == 3 and all(m["raw_sha256"] == "" == m["jpg_sha256"]
+                               and m["raw"] == "linked" for m in c2),
+          json.dumps(c2[:1]))
+    listed = draindrv.read_sums(os.path.join(root, "SHA256SUMS"))
+    expect = {"run.json", "index.jsonl", "events.log", "ingest_manifest.csv",
+              "cam1/flight_log.csv", "cam2/flight_log.csv"}
+    frames = [k for k in listed if k.lower().endswith((".jpg", ".arw"))]
+    check("SHA256SUMS covers every frame and the final run's records, not "
+          "the XMP sidecars or itself",
+          expect <= set(listed) and len(frames) == 6 + 3 + 3
+          and not any(k.endswith(".xmp") or k == "SHA256SUMS"
+                      for k in listed), json.dumps(sorted(listed))[:300])
+    check("ingest found no difference from the drain's hashes",
+          out["totals"].get("hash_mismatch") == 0, json.dumps(out["totals"]))
+    tool, ok, sout = _shasum_check(root)
+    if tool:
+        check("%s -c accepts <run>/SHA256SUMS" % tool, ok, sout)
+    else:
+        soaktest.note("no shasum/sha256sum on this host: the shasum "
+                      "compatibility of SHA256SUMS was not exercised")
+    rc, cout = _cli("--runs", runs, "--verify", rid)
+    check("ingest.py --verify passes an untouched run (exit 0)",
+          rc == 0 and "VERIFIED" in cout and "NOT VERIFIED" not in cout,
+          _oneline(cout))
+
+    # A changed frame: --verify catches it, and neither a re-ingest nor
+    # --write-sums re-records it.
+    victim = os.path.join(root, "cam2", sorted(
+        f for f in os.listdir(os.path.join(root, "cam2"))
+        if f.endswith(".jpg"))[0])
+    with open(victim, "r+b") as fh:
+        fh.seek(40)
+        fh.write(b"\x00\x01\x02")
+    rc, cout = _cli("--runs", runs, "--write-sums", rid, "--verify", rid)
+    vrel = "cam2/" + os.path.basename(victim)
+    check("a changed frame fails --verify (exit 1) and --write-sums does "
+          "not re-bless it",
+          rc == 1 and ("FAILED " + vrel) in cout
+          and draindrv.read_sums(os.path.join(root, "SHA256SUMS"))[vrel]
+          == listed[vrel], _oneline(cout))
+    os.unlink(victim)
+    rc, cout = _cli("--runs", runs, "--verify", rid)
+    check("a deleted frame is reported MISSING, not forgotten",
+          rc == 1 and ("MISSING " + vrel) in cout, _oneline(cout))
+
+    # A staged file that changed after the drain verified it.
+    stage2 = os.path.join(tmp, "raw2", "cam1")
+    shutil.copytree(stage, stage2)
+    draindrv.append_sums(os.path.join(tmp, "raw2", "SHA256SUMS"), [
+        ("cam1/" + f, draindrv.file_sha256(os.path.join(stage2, f)))
+        for f in staged])
+    root2, _ = write_legacy_run(runs, rid="260820_1919_transect-01")
+    with open(os.path.join(stage2, staged[1]), "ab") as fh:
+        fh.write(b"tail")
+    logs = []
+    out2 = ingest.ingest(stage2, runs_dir=runs, only=[os.path.basename(root2)],
+                         log=logs.append, offsets=[])
+    check("ingest flags a placed file whose bytes differ from the drain's "
+          "verified hash", out2["totals"].get("hash_mismatch") == 1
+          and any("differs from the hash the drain verified" in m
+                  for m in logs), json.dumps(out2["totals"]))
+
+    # A run with no SHA256SUMS at all (every run before v1.1.0).
+    root3, _ = write_legacy_run(runs, rid="260820_0536_gps-e2e")
+    rc, cout = _cli("--runs", runs, "--verify", os.path.basename(root3))
+    check("--verify on a run that never recorded hashes says so (exit 2)",
+          rc == 2 and "no SHA256SUMS" in cout, _oneline(cout))
+    saved = rigcore.RUNS_DIR
+    rigcore.RUNS_DIR = runs
+    try:
+        rb = rigcore.RunBrowser()
+        ids = {x["run_id"] for x in rb.list_runs()["runs"]}
+        check("runs with and without hashes all list and open",
+              {rid, os.path.basename(root2), os.path.basename(root3)} <= ids
+              and rb.detail(os.path.basename(root3)).get("frames_indexed")
+              == 6, str(sorted(ids)))
+    finally:
+        rigcore.RUNS_DIR = saved
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 def suite(opts):
     _p1_time_source(opts)
     _p2_software_stamp(opts)
     _p3_simulated(opts)
+    _p4_hashes(opts)
 
 
 if __name__ == "__main__":

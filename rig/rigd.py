@@ -1616,17 +1616,22 @@ class Rig:
         # A card with files that matched nothing, an ambiguous attribution, or
         # a content conflict are all "look at this now"; the ordinary case is
         # one info line saying how many frames were placed.
+        # A placed file whose hash differs from the one the drain verified
+        # means the staged copy changed in between - also "look now".
         bad = bool(t.get("ambiguous") or t.get("conflicts")
+                   or t.get("hash_mismatch")
                    or (t.get("cards") and not matched))
         self.events.emit(
             "warn" if bad else "info", "drain",
             "%s post-drain ingest: %d matched, %d unmatched, %d RAW placed, "
-            "%d leftover of %d card files%s%s"
+            "%d leftover of %d card files%s%s%s"
             % (node, matched, t.get("unmatched", 0), t.get("raw", 0),
                t.get("leftover", 0), t.get("cards", 0),
                ", %d CONFLICTS" % t["conflicts"] if t.get("conflicts") else "",
                (", AMBIGUOUS: %s" % "; ".join(t["ambiguous"]))
-               if t.get("ambiguous") else ""),
+               if t.get("ambiguous") else "",
+               ", %d HASH MISMATCH vs the drain record" % t["hash_mismatch"]
+               if t.get("hash_mismatch") else ""),
             node=node, ingest=t)
         # ...and beside "deleted from card" in /api/drain and the UI's table.
         with self._drain_lock:

@@ -732,7 +732,7 @@ host-vs-node offset is invisible to this check by construction; that is
   the measured clock offset with rigd's journaled `exif_offset` as the
   tie-break), places `<base>.ARW` / `<base>.card.JPG` / `<base>.xmp`
   (true instant, GPS, UTM, attitude, pair spread) beside the review JPEG,
-  writes `ingest_manifest.csv`. `rig/stereo_check.py` verifies pairing by
+  writes `ingest_manifest.csv` (columns and hashes: "Run provenance" below). `rig/stereo_check.py` verifies pairing by
   relative-pose consistency against a mis-paired control.
 
 ### 2026-08-23 audit pass — frame index, drain control, nav provenance
@@ -851,8 +851,14 @@ runs/260815_1930_transect-01/
                       appended as each frame is indexed — readers prefer this
   nmea_raw.log        every serial line, prefixed epoch
   events.log          human-readable event stream
+  ingest_manifest.csv written by rig/ingest.py: one row per frame matched to
+                      (or missing from) the card, with the SHA-256 of the RAW
+                      and card JPEG placed (see "Run provenance")
+  SHA256SUMS          written by rig/ingest.py: SHA-256 of every frame and,
+                      once the run is final, of the run's records
   cam2/
     Cam2_20260815_193045.20.jpg …   (renamed; original name kept in flight_log)
+    Cam2_20260815_193045.20.ARW / .card.JPG / .xmp   (placed by ingest)
     flight_log.csv
   cam3/ …
 ```
@@ -1288,3 +1294,69 @@ Also exposed: `/api/fleet` and `/api/diag` node entries (`simulated`),
 `/api/run` (`simulated`), `/api/runs` entries (`simulated`), and
 `/api/run/detail` (`simulated`, `simulated_nodes`). The UI's transect browser
 labels such runs SIMULATED.
+
+### Hashes: drain record, ingest manifest, SHA256SUMS
+
+All hashes are SHA-256, hex, computed by streaming the file
+(`drain.file_sha256`, 1 MiB reads); the drain and ingest share that one helper
+and one file format. `SHA256SUMS` files use the format `shasum -a 256 -c` and
+`sha256sum -c` read: one `<64 hex>  <path>` line per file, paths relative to
+the directory holding the `SHA256SUMS`, `/`-separated.
+
+**Drain record.** Each file the drain lands is recorded in
+`<dest>/SHA256SUMS` (default `~/rig-raw/SHA256SUMS`, beside the per-node
+staging directories, so paths read `cam1/DSC00042.ARW`). The hash recorded is
+the one that matched the Pi's, and the line is appended and fsynced **before**
+that content's card delete: if the record cannot be written, the content stays
+on the card like any other failure. A re-verified identical file is not
+recorded twice. After `ingest --move` the record still lists the moved files;
+that is expected, the files now live in the run.
+
+**`ingest_manifest.csv` columns** (v1.1.0):
+
+```
+run_id,cam,card,new_base,epoch,residual_ms,raw,jpg,raw_sha256,jpg_sha256
+```
+
+The first eight are unchanged in name and position; `raw_sha256` and
+`jpg_sha256` are the SHA-256 of the RAW (`<new_base>.ARW`) and the card JPEG
+(`<new_base>.card.JPG`) as they sit in the run — for a `conflict:` outcome, of
+the parked `.conflict-` file. Empty when there is no such file (an unmatched
+row, `MISSING ON CARD`, a RAW-only shot's `jpg`) and on rows kept from a
+manifest written before v1.1.0. When the card files came from a drain, each
+placed file is also compared with the drain record; a difference is logged
+(`WARNING … differs from the hash the drain verified`), counted in ingest's
+`totals.hash_mismatch`, and raises rigd's post-drain `drain` event to warn.
+
+**`<run>/SHA256SUMS`** is (re)written by every ingest that places files into a
+run. It lists every frame (`.jpg .jpeg .arw .heif .hif`: review JPEGs, RAWs,
+card JPEGs, parked `.conflict-` files) in each camera directory and, once
+`run.json` says `final: true`, the run's records: `run.json`, `index.jsonl`,
+`events.log`, `nmea_raw.log`, `unpulled.jsonl`, `ingest_manifest.csv` and each
+`camN/flight_log.csv` (those present). The `.xmp` sidecars are not listed: they
+are derived from those records, ingest rewrites its own, and photo editors
+write theirs. A file already listed **keeps the hash first recorded for it** —
+only `ingest_manifest.csv`, which every ingest rewrites, and a file ingest has
+just placed are hashed again — so a later ingest can never re-record a frame
+that changed on disk. A listed file that has disappeared keeps its line.
+
+**Commands.**
+
+```
+python3 rig/ingest.py --verify <run_id | dir> [--runs DIR]   # re-hash, report
+python3 rig/ingest.py --write-sums <run_id | dir>            # record without ingesting
+shasum -a 256 -c SHA256SUMS                                  # from inside the dir
+```
+
+`--verify` prints each `FAILED` / `MISSING` path and a summary line
+(`N listed: N OK, N FAILED, N MISSING`, plus how many files a fresh
+`SHA256SUMS` would cover that this one does not), then `VERIFIED` or
+`NOT VERIFIED`. Exit status: 0 all listed files match, 1 a file failed or is
+missing, 2 there is no `SHA256SUMS` (nothing was recorded). It works on any
+directory holding a `SHA256SUMS`, the drain's `~/rig-raw` included. Both flags
+are repeatable. `--write-sums` records a run that was never ingested (a run
+recorded before v1.1.0 gets hashes of its files as they are at that moment, not
+as they were recorded).
+
+Runs without any of this — no hash columns, no `SHA256SUMS` — load everywhere
+as before; ingest merges an older manifest's rows with empty hash cells.

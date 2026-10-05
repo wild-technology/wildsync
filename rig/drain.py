@@ -15,6 +15,9 @@ A content is deleted from the card ONLY after every one of its files' host
 copies' hashes match the Pi's — the card API deletes whole contents, so
 verifying only the RAW and then deleting used to destroy the never-pulled
 card JPEG of every shot — and a failed transfer never loses the original.
+Each verified file's hash is appended to <dest>/SHA256SUMS ("cam1/<name>",
+shasum format) before its content is deleted from the card, so every host
+copy whose original is gone has a durable hash to be checked against.
 The camera is switched to RemoteTransfer control mode for the drain (it
 cannot shoot in that mode) and back to remote afterwards, so a drain must
 never overlap a run — rigd refuses to start one while a run is active, and
@@ -104,12 +107,133 @@ def _bytes(url, timeout=300):
         return r.read()
 
 
-def _file_sha256(path):
+def file_sha256(path):
+    """SHA-256 of a file, streamed in 1 MiB chunks (RAWs are tens of MB).
+    The one file hasher: the drain's verify, ingest's manifest columns and
+    every SHA256SUMS below use it."""
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+_file_sha256 = file_sha256
+
+
+# ---------------------------------------------------------------------------
+# SHA256SUMS — per-file hash records in the format `shasum -a 256 -c` and
+# `sha256sum -c` read: "<64 hex>  <path relative to the file's directory>".
+#
+# Two writers. The drain APPENDS one line per verified file it lands, to
+# <dest>/SHA256SUMS beside the per-node staging directories (so the paths read
+# "cam1/DSC00042.ARW"): the hash that matched the Pi's, recorded before the
+# card original is deleted. Ingest WRITES <run>/SHA256SUMS for the frames and
+# run files it covers (see ingest.write_run_sums). Both verify with
+# verify_sums(), `python3 rig/ingest.py --verify`, or shasum itself.
+# ---------------------------------------------------------------------------
+SUMS_NAME = "SHA256SUMS"
+
+
+def sums_path_ok(rel):
+    """A path these files can carry verbatim. The rig's own names never
+    need it, but a newline or backslash would need shasum's escape syntax
+    and an absolute or '..' path would point outside the tree."""
+    return (bool(rel) and "\n" not in rel and "\\" not in rel
+            and "\r" not in rel and not rel.startswith("/")
+            and ".." not in rel.split("/"))
+
+
+def read_sums(path):
+    """{relpath: sha256} from a SHA256SUMS file; {} when there is none.
+    Malformed lines are skipped; for a path listed twice the last line wins
+    (the drain appends)."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if len(line) < 67 or line[64] != " " or line[65] not in " *":
+                    continue
+                sha, rel = line[:64].lower(), line[66:]
+                if all(c in "0123456789abcdef" for c in sha) and rel:
+                    out[rel] = sha
+    except OSError:
+        return {}
+    return out
+
+
+def _fsync_dir(d):
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def write_sums(path, entries):
+    """Replace `path` with sorted `entries` ({relpath: sha256}), atomically
+    and fsynced. Paths sums_path_ok() refuses are skipped and returned."""
+    skipped = sorted(r for r in entries if not sums_path_ok(r))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for rel in sorted(entries):
+            if sums_path_ok(rel):
+                fh.write("%s  %s\n" % (entries[rel], rel))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path) or ".")
+    return skipped
+
+
+def append_sums(path, entries):
+    """Append (relpath, sha256) lines to `path` and fsync. Raises OSError."""
+    lines = "".join("%s  %s\n" % (sha, rel) for rel, sha in entries
+                    if sums_path_ok(rel))
+    if not lines:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(lines)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def verify_sums(root, name=SUMS_NAME, log=None):
+    """Re-hash every file `root/name` lists. Returns {"sums", "listed",
+    "ok", "failed": [...], "missing": [...]}; "sums" is None when the file
+    does not exist (nothing was ever recorded - not a failure of any file)."""
+    path = os.path.join(root, name)
+    rep = {"sums": None, "listed": 0, "ok": 0, "failed": [], "missing": []}
+    if not os.path.isfile(path):
+        return rep
+    rep["sums"] = path
+    entries = read_sums(path)
+    rep["listed"] = len(entries)
+    for rel in sorted(entries):
+        p = os.path.join(root, *rel.split("/"))
+        if not sums_path_ok(rel) or not os.path.isfile(p):
+            rep["missing"].append(rel)
+            if log:
+                log("MISSING %s" % rel)
+            continue
+        try:
+            got = file_sha256(p)
+        except OSError:
+            rep["missing"].append(rel)
+            if log:
+                log("UNREADABLE %s" % rel)
+            continue
+        if got == entries[rel]:
+            rep["ok"] += 1
+        else:
+            rep["failed"].append(rel)
+            if log:
+                log("FAILED %s" % rel)
+    return rep
 
 
 RIGD_BASE = "http://localhost:9090"
@@ -267,6 +391,13 @@ class Drainer:
             # idempotent: a reused Drainer must not nest dest/<node>/<node>
             self.dest = os.path.join(self.dest, self.node)
         os.makedirs(self.dest, exist_ok=True)
+        # The durable per-file hash record: <dest>/SHA256SUMS, one line per
+        # file this drain lands, "cam1/DSC00042.ARW", written before the card
+        # original is deleted. Beside the node directories, not in them, so a
+        # staging directory holds only card files.
+        self.sums_path = os.path.join(
+            os.path.dirname(self.dest.rstrip(os.sep)), SUMS_NAME)
+        self._sums = read_sums(self.sums_path)
         rep = {"node": self.node, "pulled": 0, "bytes": 0, "verified": 0,
                "deleted": 0, "skipped": 0, "errors": [], "files": [],
                "cancelled": False}
@@ -407,19 +538,20 @@ class Drainer:
             suffix = ""
             for tmp, name, sha, _ in staged:
                 dst = os.path.join(self.dest, name)
-                if os.path.exists(dst) and _file_sha256(dst) != sha:
+                if os.path.exists(dst) and file_sha256(dst) != sha:
                     suffix = "-c%s" % cid
                     break
             if suffix:
                 for tmp, name, sha, _ in staged:
                     stem, ext = os.path.splitext(name)
                     dst = os.path.join(self.dest, stem + suffix + ext)
-                    if os.path.exists(dst) and _file_sha256(dst) != sha:
+                    if os.path.exists(dst) and file_sha256(dst) != sha:
                         # same name AND same contentId yet different bytes: pin
                         # this copy by its own hash rather than lose either
                         suffix = "-c%s-%s" % (cid, sha[:8])
                         break
             wrote = 0
+            landed = []      # (relpath in the hash record, sha256)
             for tmp, name, sha, size in staged:
                 stem, ext = os.path.splitext(name)
                 final = stem + suffix + ext
@@ -432,6 +564,7 @@ class Drainer:
                 wrote += 1
                 rep["bytes"] += size
                 rep["files"].append(final)
+                landed.append((self.node + "/" + final, sha))
                 self.pi_delete_raw(name)       # free the Pi's -raw staging
             if wrote:
                 try:
@@ -442,6 +575,21 @@ class Drainer:
                         os.close(dirfd)
                 except OSError as e:
                     rep["errors"].append("dir fsync: %s" % e)
+                    all_ok = False
+            # Record the verified hashes BEFORE the card delete, so a host
+            # file whose card original is gone always has its hash on disk.
+            # A re-verified identical file is not recorded twice. If the
+            # record cannot be written the card copy is kept, like any other
+            # failure here.
+            new = [(rel, sha) for rel, sha in landed
+                   if self._sums.get(rel) != sha]
+            if new:
+                try:
+                    append_sums(self.sums_path, new)
+                    self._sums.update(new)
+                except OSError as e:
+                    rep["errors"].append("hash record %s: %s"
+                                         % (self.sums_path, e))
                     all_ok = False
             if not all_ok:
                 return
@@ -490,9 +638,12 @@ def _selftest():
     jpg_sha = hashlib.sha256(jpg).hexdigest()
     bad = b"CORRUPT" * 100
 
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="drain-selftest-")
+
     class Stub(Drainer):
         def __init__(self):
-            super().__init__("camX", "0.0.0.0", dest="/tmp/drain-selftest", log=lambda *a: None)
+            super().__init__("camX", "0.0.0.0", dest=tmpdir, log=lambda *a: None)
             self.mode = None
             os.makedirs(self.dest, exist_ok=True)
         def set_mode(self, mode): self.mode = mode; return {"ok": True, "mode": mode}
@@ -524,10 +675,16 @@ def _selftest():
     assert os.path.exists(os.path.join(s.dest, "A.JPG"))   # the card JPEG too
     assert not os.path.exists(os.path.join(s.dest, "B.ARW"))
     assert s.mode == "remote"                 # restored even though B failed
+    # the durable hash record: both verified files, not the corrupt one
+    sums = read_sums(os.path.join(tmpdir, SUMS_NAME))
+    assert sums == {"camX/A.JPG": jpg_sha, "camX/A.ARW": good_sha}, sums
+    v = verify_sums(tmpdir)
+    assert v["ok"] == 2 and not v["failed"] and not v["missing"], v
     import shutil
-    shutil.rmtree(s.dest)
+    shutil.rmtree(tmpdir)
     print("DRAIN SELF-TEST: PASS (whole-content pull, hash-gated delete, "
-          "corrupt file kept on card, mode restored, disk guard present)")
+          "corrupt file kept on card, mode restored, disk guard present, "
+          "hash record)")
 
 
 def main():
