@@ -139,7 +139,7 @@ copyright of their publishers.
 | File | Publisher | What it is |
 |---|---|---|
 | `docs/XR256_Datasheet.pdf` | Smart Vision Lights | XR256 high-speed strobe light (OverDrive) product data sheet |
-| `docs/Industrial Strobe Controller \| LED-Light \| Trigger.pdf` | VA Imaging | Industrial strobe controller page from the publisher's web site (its footer reads "(c) 2026 - VA Imaging"), saved to PDF from a browser on 2026-08-28 |
+| `docs/VA_Imaging_Industrial_Strobe_Controller.pdf` | VA Imaging | Industrial strobe controller page from the publisher's web site (its footer reads "(c) 2026 - VA Imaging"), saved to PDF from a browser on 2026-08-28 |
 | `docs/a2A4504-18umBAS \| Basler Product Documentation.pdf` | Basler | Product documentation page for the Basler ace 2 a2A4504-18umBAS camera, saved to PDF from a browser on 2026-08-28 |
 | `docs/iKonvertManual.pdf` | Digital Yacht | Instruction manual for the iKonvert NMEA 2000 gateway |
 
