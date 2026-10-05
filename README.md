@@ -306,3 +306,16 @@ every one presents as a software fault.
 
 See `docs/HANDOFF.md` for current fleet state, open work and the discoveries
 behind these notes; `docs/future-tests.md` for what still needs measuring.
+
+## Licence
+
+Wild Sync is released under the MIT licence ([`LICENSE`](LICENSE)), Copyright
+(c) 2026 Wild Technologies. The licence covers this repository's own source code
+and documentation. It does **not** cover:
+
+- the **Sony Camera Remote SDK**, which is not in this repository and stays
+  under Sony's own licence agreement;
+- the **vendor PDFs in `docs/`** (Basler, Smart Vision Lights, VA Imaging,
+  Digital Yacht), kept for reference and the copyright of their publishers;
+- `third_party/httplib.h`, which is cpp-httplib by Yuji Hirose and keeps its own
+  MIT licence notice.
