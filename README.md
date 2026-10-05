@@ -144,6 +144,12 @@ unzip it, unzip the `RemoteCli.zip` inside it, and stage it with
 nodes need the **Linux aarch64 (Linux64ARMv8)** package, both to build `ilxctl`
 and to provision them; a development build on a Mac needs the macOS package.
 
+**Python packages beyond the standard library:** listed in
+[`requirements.txt`](requirements.txt), grouped by the part of the system that
+imports them. Where `deploy.sh` installs them it uses apt packages (see
+Jetson Orin NX and Camera nodes above), not pip; `pip install -r requirements.txt`
+is for a macOS or other development host.
+
 `rigd` also runs on macOS (bench and development; `rig/tests/devrig.py` runs
 the full UI against two fake cameras on any host). On a Mac, stage the node SDK
 with `make sdk-linux CRSDK_DIR=/path/to/RemoteCli` (the RemoteCli folder of the

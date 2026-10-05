@@ -1,0 +1,94 @@
+# Wild Sync - Python packages imported beyond the standard library.
+#
+# Derived from the imports in every .py file under rig/ and deploy/, including
+# the tests. Nothing is pinned here: on the rig most of these are the
+# distribution's own apt packages (listed per section), whose version is
+# whatever Ubuntu ships for that release (Jetson: JetPack 6 / Ubuntu 22.04;
+# camera nodes: Ubuntu 24.04). On a macOS or other development host, install
+# the pip set with
+#
+#     python3 -m pip install -r requirements.txt
+#
+# Policy: docs/PROTOCOL.md ("Deliverables & boundaries") specifies the Python
+# standard library only for the services, with pyserial the one permitted
+# exception. Everything else below is imported guardedly or lazily, and each
+# entry says what stops working without it. The C++ daemon (ilxctl) has no
+# Python dependencies; its own third-party components are the Sony Camera
+# Remote SDK and third_party/httplib.h (see THIRD_PARTY_NOTICES.md).
+
+# ---------------------------------------------------------------------------
+# Host daemon - rigd (rig/rigd.py, rig/run.py, rig/nav.py)
+#   Jetson: apt, installed by `deploy/deploy.sh jetson`
+#           (python3-serial, python3-pil).
+#   macOS / development host: pip, from this file.
+# ---------------------------------------------------------------------------
+
+# pyserial - imported as `serial` by rig/nav.py, which reads the iKonvert
+# NMEA 2000 gateway on its serial port, and by the serial transports of
+# rig/imu_yb.py and rig/imu_olive.py. Without it rigd still runs and the
+# flight log carries empty nav columns.
+pyserial
+
+# Pillow - imported as `PIL` by rig/run.py for the EXIF fallback that supplies
+# a frame's capture instant when it has no GPIO edge. rigd starts without it
+# but warns at run start, and such a frame then takes the command time.
+# Also used by rig/stereo_check.py, the icon generators in deploy/icons/, and
+# the test fixtures in rig/tests/fakenode.py.
+Pillow
+
+# ---------------------------------------------------------------------------
+# Calibration and VSLAM tools - rig/rigcal.py (the stereo checkerboard
+# calibration behind rigd's Calib tab), rig/vslam.py, rig/stereo_check.py, and
+# rig/tests/rigcal_selftest.py, rig/tests/vslam_selftest.py
+#   Jetson: apt, installed by `deploy/deploy.sh jetson`
+#           (python3-numpy, python3-opencv).
+#   macOS / development host: pip, from this file.
+# rigcal and vslam import both lazily and report them unavailable when they are
+# missing; the rest of rigd is unaffected. stereo_check imports them at the top
+# and cannot run without them.
+# ---------------------------------------------------------------------------
+numpy
+opencv-python-headless        # imported as cv2
+
+# ---------------------------------------------------------------------------
+# Node service - piagent (rig/piagent.py): every camera Pi, and the Jetson in
+# its strobe role. Linux only; not installed with pip.
+#   Camera nodes: apt, installed by `deploy/deploy.sh provision`
+#                 (python3-libgpiod).
+#   Jetson strobe role: apt, installed by `deploy/deploy.sh strobe`
+#                 (python3-libgpiod).
+# ---------------------------------------------------------------------------
+
+# gpiod - in-process GPIO for the FOCUS and TRIGGER lines (class _LineDriver in
+# rig/piagent.py) and for the strobe line. The code is written against the
+# libgpiod v1.6.3 Python API, which docs/PROTOCOL.md pins and which is what
+# Ubuntu 24.04 packages as python3-libgpiod. It is left out of the pip set on
+# purpose: install the distribution package on the target. Without it piagent
+# falls back to one `gpioset` subprocess per edge, which costs milliseconds of
+# trigger timing (README, "How synchronised capture works").
+#
+# pyserial on a node is needed only when that node's IMU is read over a serial
+# port (WILDSYNC_NODE_IMU=yb, or an olive:/dev/ttyACM0 spec). The default Olive
+# path goes through olive-bridge over UDP and uses the standard library only.
+# `deploy.sh provision` does not install python3-serial; add it by hand on a
+# node that needs it.
+
+# ---------------------------------------------------------------------------
+# Basler option - rig/basler_spool.py, on a node that carries the Basler
+# a2A4504 (cam3). Not needed for the Sony ILX-LR1 rig.
+#   pip, inside ~/pylon-venv on that node (docs/PI-SETUP.md section 13),
+#   together with numpy and opencv-python-headless from the section above.
+#   deploy.sh installs none of this.
+# ---------------------------------------------------------------------------
+
+# pypylon - Basler's Python binding to the pylon camera runtime. basler_spool
+#           exits at import without it, and without numpy and cv2.
+# piexif  - writes the capture instant into each JPEG's EXIF; basler_spool
+#           exits at start-up without it.
+#
+# docs/PI-SETUP.md section 13 also installs Pillow and PyTurboJPEG<2 into that
+# venv; basler_spool imports neither.
+#
+# Uncomment to install into the Basler venv:
+# pypylon
+# piexif
