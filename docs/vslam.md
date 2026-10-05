@@ -1,8 +1,11 @@
 # VSLAM-lite — live camera trajectory from the review stream
 
-Written 2026-08-27 (stereo mode added same day). Status: **framework v1,
-developed on a macOS host (CPU)**; runs on the Jetson Orin NX rigd host, where the
-backend may be swapped for CUDA. Code: `rig/vslam.py`. Selftest:
+Status: **framework v1, CPU backend.** It runs on either rig host (a Mac or a
+Jetson Orin NX; the timings below were measured on a Mac, and the Orin NX
+figures are estimates), and the backend can be swapped for CUDA on a Jetson. It
+is **not wired into `rigd`**: it processes a run directory offline, or tails a
+growing one with `--follow` (the rigd wire-in is specified at the end of this
+file). Code: `rig/vslam.py`. Selftest:
 `python3 rig/tests/vslam_selftest.py` (no hardware, no network, passes with
 or without OpenCV installed — 61 checks with, 12 without).
 
@@ -21,7 +24,7 @@ photogrammetry planning. Two modes plus auto-detection:
 * **auto** (default) — stereo when the cam2 dir exists and >50% of frames
   find a same-instant partner by filename; mono otherwise.
 
-    pip3 install opencv-python-headless numpy     # Mac host (one-time)
+    python3 -m pip install -r requirements.txt    # Mac host (one-time; numpy + opencv)
     python3 rig/vslam.py ~/rig-runs/<run> [--mode auto|mono|stereo]
                          [--cam cam1] [--follow] [--baseline 0.30]
                          [--features 1500] [--json out.json] [--ply out.ply]
@@ -61,15 +64,16 @@ Also does (stereo mode — see its own section for honest caveats):
   planar-scene degeneracy
 * GPS as a cross-check: `stats.gps_ratio` = stereo length / GPS length
 
-Does not (v2/Jetson-day candidates, in rough priority order):
+Does not (v2 candidates, in rough priority order):
 * no bundle adjustment / loop closure — drift grows with segment length
 * no rotation-to-UTM in the ENGINE: the pose chain lives in the first-camera
   frame; the runner's snapshot carries a 2D similarity (`utm_align`) fitted
   trajectory→UTM for the overlay when the boat has actually moved >1 m
 * mono per-pair translation is unit-norm, so within a scale window all speed
   information comes from GPS; stereo mode is the fix when pairs exist
-* no measured baseline and no checkerboard stereo extrinsics yet — stereo
-  distances are placeholder-scaled until then (loudly flagged)
+* no measured baseline and no saved checkerboard stereo calibration (none is
+  recorded) — stereo distances are placeholder-scaled until one is saved (loudly
+  flagged)
 * no epipolar-GUIDED cross-camera matching: prototyped against the transect
   run with self-estimated extrinsics and it was a wash (gate ~= plain ratio
   matching); becomes worthwhile once calibrated extrinsics make the gate
@@ -120,7 +124,7 @@ single-plane degenerate case is documented at the call site. A second guard,
 `min_inlier_frac` (30%), rejects any solve that keeps a small consensus of a
 large match set — observed to kink the chain 90° in one step otherwise.
 
-## Intrinsics and calibration (Jetson-day task)
+## Intrinsics and calibration
 
 Default guess: 1616x1080, HFOV ~59° → fx ≈ 1429 px (`Intrinsics`; `--focal`
 and `--hfov` override; `--port-factor 1.33` for a flat underwater port, the
@@ -129,12 +133,13 @@ focal error; absolute angles and the landmark cloud do not.
 
 Calibration procedure (in this order of preference):
 
-1. **Checkerboard**: 9x6 board, ~30 review JPEGs from a live node at varying
-   pose/distance, `cv2.calibrateCamera` at 1616x1080. Store
-   `{fx, fy, cx, cy, dist}` in `rig/intrinsics_cam1.json`; wire it into
-   `Intrinsics` (small change — accept a dist vector, undistort points before
-   `rel_pose`). Calibrate THROUGH the housing port in water for survey use,
-   or multiply the in-air focal by 1.33 for a flat port (approximation).
+1. **Checkerboard**: the Calib tab (`rig/rigcal.py`) calibrates both cameras and
+   the pair from a rigid board seen by both at once (see the stereo section
+   below). Per-camera intrinsics in `vslam.Intrinsics` are not yet fed from that
+   file: the single-camera chain still uses the guess above, so a saved solution
+   improves the stereo engine only. Calibrate THROUGH the housing port in water
+   for survey use, or multiply the in-air focal by 1.33 for a flat port
+   (approximation).
 2. **EXIF**: the card JPEGs carry FocalLength (0x920A); f_px =
    f_mm / 35.7 × 1616 (stereo_check.py does exactly this). Good enough to
    replace the HFOV guess if no board is available.
@@ -178,9 +183,11 @@ homography kept 939 and cheirality picks the right decomposition at
 front-fraction 1.0 vs ≤0.59), then a medoid over the candidates' translation
 directions. That fixes rotation and the translation DIRECTION from image
 evidence only. The translation LENGTH is `--baseline`, a rig constant that
-is **currently unmeasured** (docs/future-tests.md §1 also flags lens parity
+is **not recorded as measured** (docs/future-tests.md §1 also flags lens parity
 as unverified) — the 0.30 m default is a placeholder and every status line,
-snapshot and CLI summary carries `UNCALIBRATED` until it is measured.
+snapshot and CLI summary carries `UNCALIBRATED` until a calibration is saved.
+The rig's nominal baseline is about 224 mm (unverified; `stereo_check.py`), not
+the 0.30 m default.
 **Every stereo distance scales linearly with baseline error; the SHAPE of
 the track does not.** Measure the physical baseline with a tape (±2 mm on
 0.3 m = 0.7% distance error) as the day-one stopgap; the checkerboard
@@ -218,19 +225,20 @@ more robust live overlay until the extrinsics are calibrated — auto mode
 picks stereo when pairs exist, so pass `--mode mono` explicitly if the
 overlay matters more than metric scale on a given day.
 
-**Checkerboard stereo calibration (Jetson day, replaces self-estimation):**
+**Checkerboard stereo calibration (replaces the self-estimate):**
 
-1. Rigid 9x6 board visible to BOTH cameras at once; ~30 synchronized review
+1. Rigid board visible to BOTH cameras at once; ~30 synchronized review
    pairs at varying pose/distance (in water, through the ports, for survey
-   use).
-2. `cv2.stereoCalibrate` at 1616x1080 → per-camera K + dist, and R, T
-   between the cameras. |T| IS the baseline — compare against the tape
-   measurement as a sanity check.
-3. Store as `rig/stereo_extrinsics.json`; wire-in = construct
-   `StereoVslamEngine` with the stored R, T instead of the self-estimate
-   (set `_ext` directly and `baseline_calibrated=True`) — the engine
-   already treats extrinsics as an opaque frozen constant, nothing else
-   changes.
+   use). The Calib tab drives this: `POST /api/rigcal/stereo/start|capture|
+   compute|save` (docs/PROTOCOL.md, "Rig calibration").
+2. `cv2.stereoCalibrate` → per-camera K + dist, and R, T between the cameras.
+   |T| IS the baseline — compare against the tape measurement as a sanity
+   check.
+3. Save writes `~/rig/stereo_calibration.json`. `vslam.load_stereo_calibration()`
+   freezes its R, T into the stereo engine (`_ext`, `baseline_calibrated=True`)
+   from the next run; nothing else changes. This wire-in is implemented and
+   covered by `rig/tests/rigcal_selftest.py` (synthetic data). No saved
+   calibration session is recorded.
 4. Re-run a drained run; `gps_ratio` should sit within a few % of 1.0 on a
    moving-GPS transect. Then enable epipolar-guided cross-camera matching
    (prototyped, parked — see the does-not list).
@@ -253,7 +261,7 @@ collapse to the sub-percent level.
 
 ## Measured performance and the Jetson budget
 
-Measured on this Mac (M-series, CPU, `proc_scale` 0.5 → feature work at
+Measured on a Mac (Apple Silicon, CPU, `proc_scale` 0.5 → feature work at
 808x540, flatten+CLAHE on, ORB 1500):
 
 | what | number |
@@ -265,19 +273,20 @@ Measured on this Mac (M-series, CPU, `proc_scale` 0.5 → feature work at
 | snapshot JSON at defaults | ~100-125 KB |
 
 The Orin NX CPU (A78AE cores) is roughly 2-4x slower per core than the Mac → est. 100-200 ms
-per frame, still 2.5-5x headroom at 2 Hz **on CPU alone**. So: bring-up on
-the Jetson needs NO CUDA work to function; CUDA is an optimization, not a
-dependency. Re-measure with `stats.proc_ms` from a real run before deciding.
+per frame, still 2.5-5x headroom at 2 Hz **on CPU alone**. This is an estimate,
+not a measurement on the Orin NX. So: running on a Jetson host needs NO CUDA
+work to function; CUDA is an optimization, not a dependency. Re-measure with
+`stats.proc_ms` from a real run before deciding.
 
-## Jetson finalization plan
+## Running on a Jetson host
 
-Day-1 bring-up (CPU, no new code):
+Bring-up (CPU, no new code):
 1. `sudo apt install python3-opencv python3-numpy` (JetPack's build; note the
    apt cv2 has **no CUDA** — that is fine for the CPU backend).
 2. `python3 rig/tests/vslam_selftest.py` → must be 61/61.
 3. `python3 rig/vslam.py <a drained run> --json /tmp/v.json --ply /tmp/v.ply`
    and check `stats.proc_ms` against the table above.
-4. Calibrate intrinsics (section above), re-run, keep the JSON.
+4. Save a stereo calibration (section above), re-run, keep the JSON.
 
 Backend candidates behind the SAME five-method interface, in ascending
 effort:
@@ -292,7 +301,7 @@ Decision gate: if CPU `proc_ms` < 250 on the Orin, ship v1 as-is and spend
 the effort on stereo scale instead — it buys accuracy, CUDA only buys speed
 we may not need at 2 Hz.
 
-## rigd integration spec (NOT implemented — wire-in plan, one sitting)
+## rigd integration spec (not implemented)
 
 Server (`rig/rigd.py`):
 * module-level `_vslam = None`; on **run start** (the same place the run dir

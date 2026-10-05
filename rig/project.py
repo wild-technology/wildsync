@@ -29,8 +29,8 @@ module attribute per call. Assigning the attribute on open() keeps both the
 tests and the consumers working unchanged; run.py was switched to attribute
 reads. The one rule: only open()/startup() assign it.
 
-Host-portable by construction (Mac today, Jetson Orin tomorrow): every path
-derives from $HOME, nothing platform-specific.
+Host-portable by construction (Mac or Jetson Orin): every path derives from
+$HOME, nothing platform-specific.
 """
 
 import json

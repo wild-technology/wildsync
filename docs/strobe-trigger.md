@@ -1,12 +1,17 @@
-# Strobe trigger — implementation brief
+# Strobe trigger — contact-closure design (Bolt VB-22 on a camera Pi)
 
-Working notes for wiring and firing the **Bolt VB-22** on the stereo rig.
-`docs/harness-and-strobe.md` remains the electrical reference for the camera
-harness; its XR256 sections do **not** apply — that light is out of scope, and
-none of its 24 V / 20 A constraints carry over.
+Implementation brief for wiring and firing a **Bolt VB-22** speedlight on the
+stereo rig. The rig's strobe is now the **XR256** (`docs/xr256-jetson-trigger.md`);
+this contact-closure design is still supported by `piagent` (its strobe polarity
+defaults to `low`, open-drain, BCM26) and the scheduling, δ and acceptance-test
+logic of §4 is the same for both lights. `docs/harness-and-strobe.md` is the
+electrical reference for the camera harness; the XR256's 24 V / 20 A constraints
+do not apply to this design.
 
-**Status 2026-08-16:** every open decision below is now **settled by measurement**.
-Nothing is coded yet; the wiring is fully specified and needs no components.
+**Status:** every open decision below was **settled by measurement** on
+2026-08-16. The scheduled pulse is implemented in `piagent` (`strobe_at_epoch`
+on `POST /gpio/fire`, and `POST /gpio/strobe`) and in `rigd` (`/api/strobe`). The
+wiring needs no components. No strobe has been connected or fired in a field run.
 
 ---
 
@@ -285,9 +290,11 @@ eyeballing frames — **but see §6, it only catches timing failures.**
 
 ## 7. Related, and worth folding in while you are in here
 
-Ringing on cam2's `EXPOSURE` lead is currently logged as "shield or shorten"
-(carried into `docs/HANDOFF.md`). The measured signature argues for a different order — and
-it matters more if topology B wins, since B hangs another load on that net.
+Ringing on cam2's `EXPOSURE` lead is logged as "shield or shorten". In the
+2026-08-16 measurement cam1 reported `edges_bounced` = 0 and cam2 662, so it is
+a cam2-harness problem only, and the strobe (on cam1) is unaffected by it. The
+measured signature argues for a different order of fixes — and it matters more
+if topology B wins, since B hangs another load on that net.
 
 cam2 produced 14 events inside 62 µs (`piagent.py:606`) — ~4.4 µs per
 transition. Against the candidates:

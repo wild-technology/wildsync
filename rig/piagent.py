@@ -124,15 +124,14 @@ FOCUS_HOLD_MAX_TTL_S = 600.0
 EDGE_FIRE_MAX_OPEN_S = 10.0
 
 # What "the IMU is running slow" means, judged against what THIS device does.
-# docs/HANDOFF.md's ">= 60 Hz" requirement is satisfied in that same document
-# by "174 Hz measured" - which is the FRAME rate (quat + euler + inertial +
-# baro). The YB-MRA02 publishes one quat and one euler per ~25 Hz device
+# The rig's ">= 60 Hz" IMU requirement is satisfied by the YB's measured 174 Hz
+# - which is the FRAME rate (quat + euler + inertial + baro). The YB-MRA02 publishes one quat and one euler per ~25 Hz device
 # cycle, so its ATTITUDE cadence is ~50 Hz (probe() measures 49.8 Hz) and can
 # never reach 60. The 2026-08 audit compared attitude_hz against the frame-rate
 # figure, so /health returned imu_rate_low:true on a perfectly healthy unit
 # from the first closed rate window onward - an alarm that is always on is an
 # alarm nobody reads. Each number is now judged against its own spec: frame_hz
-# against the HANDOFF figure, attitude_hz against a fraction of this device's
+# against the 60 Hz figure, attitude_hz against a fraction of this device's
 # own measured normal (the probe's sample_rate_hz, sanity-bounded).
 IMU_MIN_FRAME_HZ = 60.0
 IMU_ATTITUDE_HZ_NOMINAL = 50.0     # 2 orientation frames per 25 Hz cycle
@@ -1757,7 +1756,7 @@ IMU_SPEC = os.environ.get("PIAGENT_IMU", "").strip()
 
 
 class Imu2(Imu):
-    """Second IMU slot — the Olive olixVision X1 at cam2 (rig/imu_olive.py).
+    """Second IMU slot — the Olive olixVision X1 (rig/imu_olive.py).
 
     A second Imu INSTANCE, not new machinery: only the driver module, the
     config gate and the rate floors differ. Deliberately isolated from the
@@ -1773,11 +1772,12 @@ class Imu2(Imu):
     TAG = "imu2"
     ABSENT_MSG = ("no second IMU yet - will keep probing "
                   "(olixVision on /dev/ttyACM* or UDP)")
-    # The X1's healthy attitude cadence is UNKNOWN until bring-up (ROS-native
-    # units commonly run 100-400 Hz). Wide probe band so the measured normal
-    # can raise the bar honestly, and a frame floor low enough that a unit we
-    # have never measured cannot ring imu_rate_low all day; tighten both from
-    # the probe figures once the device is on the bench (docs/olive-imu.md).
+    # The X1's healthy attitude cadence was not known in advance (ROS-native
+    # units commonly run 100-400 Hz); as received through olive-bridge it is
+    # ~15 Hz (below). Wide probe band so the measured normal can raise the bar
+    # honestly, and a frame floor low enough that a slow-but-healthy stream
+    # cannot ring imu_rate_low all day; tighten both from long-run probe
+    # figures (docs/olive-imu.md).
     PROBE_BAND = (0.5, 20.0)
     FRAME_FLOOR_HZ = 10.0
 

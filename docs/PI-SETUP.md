@@ -1,17 +1,21 @@
 # Pi node setup — bare SD card to a running camera node
 
-Written while commissioning **cam3**, the third survey camera (branch
-`cam3-node`). Until now every node was built by hand and nothing wrote the steps
-down, so a new node meant reconstructing them from `deploy/deploy.sh` and two
-working Pis.
+The build sheet for one camera node: a Raspberry Pi that sits beside one camera
+and answers `:8080` (`ilxctl`, the camera over USB) and `:8081` (`piagent`, the
+GPIO harness, the node's IMU and its health) to the rig host. It assumes nothing
+is installed and takes you to a node that shows up in the rig's fleet header.
 
-This is the build sheet. It assumes nothing is installed and takes you to a node
-that answers `:8080` and `:8081` and shows up in the rig's fleet header.
+The rig host — the machine that runs `rigd` — is a **Mac** or a **Jetson Orin
+NX**. The node procedure is the same for both; where they differ the text says
+so. The whole installation, in order (hardware, host, nodes, clocks, IMUs,
+navigation, strobe, verification), is [`docs/INSTALL.md`](INSTALL.md); this file
+is its detailed reference for the nodes.
 
-**cam3 carries two camera stacks.** As of 2026-08-28 the **Basler a2A4504** is
-cam3's primary camera and the end-goal for testing; the **Sony ILX-LR1** stack
-stays installed and working as the fallback, in case the rig reverts. Both are
-built here, and they coexist on one node — nothing below asks you to choose.
+The examples build the third node, **cam3**; for cam1 or cam2 substitute the
+node's own name and address. cam3 can carry two camera stacks: the Sony ILX-LR1
+stack (the rig's cameras, Part II) and the **Basler a2A4504** (Part III, an
+option that is not part of the two-camera rig). Both can be installed on one
+node and they coexist — nothing below asks you to choose.
 
 | Part | Sections | Applies to |
 |---|---|---|
@@ -30,7 +34,8 @@ Cross-references, not duplicates — read these rather than trusting a paraphras
 |---|---|
 | Fleet table, GPIO pinout, node HTTP APIs, anomaly list | `docs/PROTOCOL.md` |
 | Boat topology, pre-dive checklist, what the UI tells you | `docs/FIELD-RUN.md` |
-| Un-wedging `ilxctl`, the discoveries behind the warnings here | `docs/HANDOFF.md` §2.2, §3 |
+| The whole installation in order | `docs/INSTALL.md` |
+| Un-wedging `ilxctl`, the faults behind the warnings here | §10 below, `README.md` (Operating notes) |
 | Build, `make sdk`, deploy commands, operating notes | `README.md` |
 
 Throughout, **camN** = cam3 and **192.168.1.20N** = 192.168.1.203. The
@@ -53,7 +58,7 @@ hostname.
 | **Basler a2A4504-18umBAS** + **USB 3** cable | The **primary** camera (§11). USB3 Vision, 20.2 MP mono global shutter, IMX541, 4504×4504 Mono8. Must go in one of the Pi 5's **USB 3** ports — measured 360 MB/s. Bus-powered; see §11 on the current ceiling. |
 | Lens covering a **1.1″** sensor | The Basler's format. Without one you get a frame with no scene structure, and every JPEG size measurement off it is meaningless (§13). |
 | **Olive olixVision IMU** + USB-C cable | One per camera, into one of the Pi's USB ports. `deploy.sh node` configures it (§6.1). |
-| A host on the **rig switch** | The Jetson Orin NX that runs rigd, wired to the rig switch. If you work from a laptop, it must be wired too, not on Starlink Wi-Fi — see §4. |
+| A host on the **rig switch** | The machine that runs rigd (a Mac or a Jetson Orin NX), wired to the rig switch. A laptop host must be wired too, not on Starlink Wi-Fi — see §4. |
 
 ### 1.1 GPIO harness pinout
 
@@ -99,7 +104,7 @@ grep 'ubuntu-24.04.4-preinstalled-server-arm64+raspi.img.xz' SHA256SUMS
    the flash completes and the card re-mounts.
 4. Write, then let it verify.
 
-### Route B — command line on the Mac
+### Route B — command line on a Mac
 
 ```sh
 diskutil list external physical        # find the card — check the SIZE
@@ -127,7 +132,7 @@ diskutil eject /dev/disk4
 ## 3. Headless cloud-init on `system-boot`
 
 Ubuntu's raspi image boots cloud-init's NoCloud datasource against the **FAT
-`system-boot` partition** — the small one the Mac mounts. It reads `user-data`,
+`system-boot` partition** — the small one the flashing computer mounts. It reads `user-data`,
 `meta-data` and `network-config` from there on first boot. Editing those three
 files is the whole headless setup; nothing needs a keyboard or a monitor.
 
@@ -158,7 +163,7 @@ users:
     passwd: __PASSWD_HASH__
     groups: [adm, sudo, plugdev, video, dialout, gpio, i2c, spi]
     ssh_authorized_keys:
-      - __MAC_KEY__
+      - __HOST_KEY__
 
 ssh_pwauth: true
 chpasswd:
@@ -168,7 +173,7 @@ chpasswd:
 - The group list matches `deploy/pi-resync/user-data.template` — keep the fleet
   uniform. `plugdev` is the group `deploy/ilxctl.service` names for USB access
   to the body; `dialout` is for serial IMUs.
-- `__MAC_KEY__` is the contents of `~/.ssh/id_ed25519.pub` **on the rigd host**
+- `__HOST_KEY__` is the contents of `~/.ssh/id_ed25519.pub` **on the rigd host**
   — the machine that will run `deploy.sh`. Everything in `deploy/` assumes
   passwordless ssh from that host.
 - `__PASSWD_HASH__` is optional but worth having: it is the only way back in
@@ -238,7 +243,7 @@ Ethernet NIC is necessary but **not sufficient**. The symptom is a node that
 pings from nothing, ssh that hangs, and a rig header stuck one camera short,
 all while the Pi is perfectly healthy.
 
-The Jetson is wired to the rig switch and has no Wi-Fi on that range, so it is not affected. A **laptop** on both networks is. To reach the cameras from a Mac:
+A Jetson host is wired to the rig switch and has no Wi-Fi on that range, so it is not affected. A **laptop** host on both networks is. To reach the cameras from a Mac:
 
 ```sh
 sudo networksetup -setairportpower en0 off      # Wi-Fi OFF; static IP alone is not enough
@@ -349,8 +354,8 @@ next person which `gpiochip` to expect.
 
 ## 6. Install the rig software
 
-Three commands, in this order, from the checkout on the rigd host (the Jetson,
-after `deploy/deploy.sh jetson` has run there once):
+Three commands, in this order, from the checkout on the rigd host (a Mac, or a
+Jetson after `deploy/deploy.sh jetson` has run there once):
 
 ```sh
 cd /path/to/wildsync
@@ -386,7 +391,7 @@ works the same on the Jetson and on a Mac, and leaves a Mac's own `lib/`
 (macOS dylibs for a local `ilxctl` build) untouched.
 
 Never push macOS `.dylib` files to a node: that once produced a node build with
-a missing `libCr_Core.so` that looked like a successful provision (audit
+a missing `libCr_Core.so` that looked like a successful provision (found
 2026-08-27), which is what the refusal exists to prevent.
 
 `ilxctl` is **always built on the node** — the Makefile probes `-mcpu=native`
@@ -434,20 +439,31 @@ still carries the older Yahboom IMU, deploy it with
 
 ### Chrony, after provisioning
 
-The node's clock topology has two layers:
+The node's clock topology has two layers, and which of them apply depends on
+the host:
 
-1. The card's own step (`deploy/pi-resync/user-data.template`) writes a full
-   mesh of peers across `192.168.1.201/.202/.203` plus an orphan local
-   reference, so the nodes stay within about a millisecond of each other with
-   no upstream at all.
-2. `deploy.sh node`, run **from the Jetson** after `deploy.sh jetson`, adds
-   `/etc/chrony/conf.d/20-wildsync-host.conf` pointing the node at the Jetson
-   with `prefer`. The Jetson fires the XR256 on its own clock and the nodes fire
-   the cameras on theirs, so one reference keeps the strobe timing honest.
+1. **The peer mesh — every node, either host.** The card's own step
+   (`deploy/pi-resync/user-data.template`) writes a full mesh of peers across
+   `192.168.1.201/.202/.203` plus an orphan local reference, so the nodes stay
+   within about a millisecond of each other with no upstream at all.
+2. **The Jetson as master — Jetson host only.** `deploy.sh jetson` makes the
+   Jetson a chrony server for 192.168.1.0/24, and `deploy.sh node`, run **from
+   that Jetson**, adds `/etc/chrony/conf.d/20-wildsync-host.conf` pointing the
+   node at it with `prefer`. The Jetson fires the XR256 on its own clock and the
+   nodes fire the cameras on theirs, so one reference keeps the strobe timing
+   honest.
 
-`provision` writes no chrony configuration of its own. Verify per §9:
-`chronyc sources` on a node should show the Jetson selected (`*`) and the
-peers as candidates.
+A **Mac host is deliberately not a chrony master**: nothing on it answers NTP,
+`deploy.sh node` writes no host line when run from it, and the nodes keep only
+the peer mesh. rigd then measures the host's offset from the nodes itself and
+corrects the fire schedule and every capture instant for it
+(`host_clock_offset`; `docs/PROTOCOL.md`, "CLOCK DOMAINS"). Keeping the Mac's
+own clock on network time removes that correction's uncertainty.
+
+`provision` writes no chrony configuration of its own, and removes the
+`wildsync.conf` that earlier versions wrote. Verify per §9: `chronyc sources`
+on a node should show its peers and, with a Jetson host, the Jetson selected
+(`*`).
 
 ---
 
@@ -485,8 +501,8 @@ than letting it be inferred.
 `NODES` is built at import, so **rigd must be restarted** to see the file:
 
 ```sh
-launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd   # macOS host
-sudo systemctl restart rigd                                            # Linux host
+launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd   # Mac host
+sudo systemctl restart rigd                                            # Jetson host
 curl -s localhost:9090/api/fleet | python3 -m json.tool
 ```
 
@@ -602,12 +618,12 @@ What to actually look at:
 | `:8081/gpio/state` | `harness_safe` true — the lines are open-drain-idle, no stuck half-press. `chip` is `gpiochip4` on a Pi 5 (`gpiochip0` on a Pi 4) — discovered, not configured. |
 | `:8081/health` | `imu.present` true (the Olive, §6.1), `gpio.ok` true, `gpio.focus_held` false, `disk_free_mb` sane, `power.undervolt_now` false. `node` is the **hostname** (`piagent.py` sets `NODE = socket.gethostname()`), so it reads `pi-cam3` while rigd calls the node `cam3` — that is expected, not a mismatch. |
 | `:8080/api/status` | `connected` true, `model`, `id` (record the body serial for the fleet table), `slotStatus`, `remainShots`. **`afAllowed` must be `false`** — `true` means the daemon was started with `--allow-autofocus`, which must never happen on a field node. |
-| `:9090/api/fleet` | one entry per camera node (plus `jetson` once the strobe agent is installed); cam3 present with `cam_num` 3. |
+| `:9090/api/fleet` | one entry per camera node (plus `jetson` once the strobe agent is installed on a Jetson host); cam3 present with `cam_num` 3. |
 
 **Clocks.** Every scheduled fire and every `epoch_hw` edge lives on the *node's*
 clock, so inter-node clock skew lands 1:1 in true exposure skew while the rig's
-own skew figures under-report it. The pair budget is **10 ms**. Free-running
-after the Jetson master left the topology, the nodes measured **16.8 ms apart**
+own skew figures under-report it. The pair budget is **10 ms**. Free-running,
+with no master and no peer mesh, the nodes measured **16.8 ms apart**
 (2026-08-20) — outside budget, and invisible in the rig's own numbers. Peered in
 orphan mode they sit at 0.6 ms.
 
@@ -618,8 +634,9 @@ done
 ```
 
 All three must print the **same Reference ID** — the Jetson's address when the
-nodes were deployed from it (§6, Chrony) — which is the one-line proof the
-group has exactly one master. Two distinct refids is a split. After a master
+nodes were deployed from a Jetson host (§6, Chrony), otherwise one node's (the
+mesh elects the lowest address) — which is the one-line proof the group has
+exactly one master. Two distinct refids is a split. After a master
 handover the followers slew rather than step, so give it a minute before
 trusting the budget. rigd's `node_clock_skew` (not `chronyc`) is the detector
 that runs during a survey, and it needs three consecutive scans to raise or
@@ -636,15 +653,45 @@ pre-dive).
 
 | Symptom | Cause / fix |
 |---|---|
-| Camera connects, answers property reads, writes to its own card — but PC image transfer dies mid-frame | `usbfs_memory_mb` is back at the 16 MB default. It **must** be set on the **kernel command line** (`usbcore.usbfs_memory_mb=150` in `/boot/firmware/cmdline.txt`), not in `modprobe.d` — `usbcore` is built into the Pi kernel, so `/etc/modprobe.d/usbfs.conf` is never read and the runtime `echo` silently reverted on every reboot (HANDOFF §3.3). Check `/proc/cmdline`; re-run `deploy.sh provision cam3` and **reboot**. Presents as a broken camera. |
+| Camera connects, answers property reads, writes to its own card — but PC image transfer dies mid-frame | `usbfs_memory_mb` is back at the 16 MB default. It **must** be set on the **kernel command line** (`usbcore.usbfs_memory_mb=150` in `/boot/firmware/cmdline.txt`), not in `modprobe.d` — `usbcore` is built into the Pi kernel, so `/etc/modprobe.d/usbfs.conf` is never read and the runtime `echo` silently reverted on every reboot. Check `/proc/cmdline`; re-run `deploy.sh provision cam3` and **reboot**. Presents as a broken camera. |
 | Body reports every property read-only, hands control priority back, ignores the shutter on **both** USB and GPIO | A Low `FOCUS` line — a permanent half-press. **A released GPIO is not high-Z**: the pad keeps the last requester's bias. `piagent` holds the lines open-drain-idle for exactly this reason; check `harness_safe` in `/gpio/state`. Anything that drove the line by hand (a stray `gpioset`, a crashed test) can leave it there. |
-| `ilxctl` "active" at 0% CPU, camera unusable; `systemctl restart` hangs | Stuck PTP session from an unclean shutdown. **Recovery recipe: `docs/HANDOFF.md` §2.2** — `pkill -9 -x ilxctl`, USB unbind, USB bind, `systemctl start ilxctl`. Note `ilxctl` now binds `:8080` *before* its startup connect (`src/main.cpp`), so the modern symptom is `/api/status` answering with `connected:false` rather than a dead port — but the PTP session still needs the unbind/bind to clear. `deploy/ilxctl.service` sets `RestartPreventExitStatus=SIGKILL` so a deliberate `-9` stays down long enough for the recipe to work. |
-| `node_clock_skew` anomaly | Two nodes disagree beyond the noise floor (warn >5 ms, bad >8 ms), off the RTT-gated median, after 3 consecutive scans. Usually one node lost the peer group — check that all three `chronyc tracking` refids match (§9) and that `provision`'s `wildsync.conf` is not pointing a node at the Mac with `prefer`. A *common-mode* host-vs-node offset is invisible to this check by construction; that one is `host_clock_offset` (turn on network time on the host). |
+| `ilxctl` "active" at 0% CPU, camera unusable; `systemctl restart` hangs | Stuck PTP session from an unclean shutdown. **Recovery recipe: §10.1** — `pkill -9 -x ilxctl`, USB unbind, USB bind, `systemctl start ilxctl`. `ilxctl` binds `:8080` *before* its startup connect (`src/main.cpp`), so the symptom is `/api/status` answering with `connected:false` rather than a dead port — but the PTP session still needs the unbind/bind to clear. `deploy/ilxctl.service` sets `RestartPreventExitStatus=SIGKILL` so a deliberate `-9` stays down long enough for the recipe to work. |
+| `node_clock_skew` anomaly | Two nodes disagree beyond the noise floor (warn >5 ms, bad >8 ms), off the RTT-gated median, after 3 consecutive scans. Usually one node lost the peer group — check that all three `chronyc tracking` refids match (§9) and that no leftover `/etc/chrony/conf.d/wildsync.conf` (written by earlier versions of `provision`, which now removes it) points a node at one host with `prefer`. A *common-mode* host-vs-node offset is invisible to this check by construction; that one is `host_clock_offset` (turn on network time on the host). |
 | `node_clock_unmeasurable` | That node's best `/health` RTT is ≥20 ms, so the 10 ms budget cannot be verified at all. Check the PoE/switch path, not the clock. |
-| Unit is `active`, but "no camera found" / `EnumCameraObjects` fails | USB permissions or the SDK adapter path. There is no udev rule for the Sony body in this tree — see the `SupplementaryGroups=`/`WorkingDirectory=` comments in `deploy/ilxctl.service` and settle it against cam1 (`systemctl show -p User -p SupplementaryGroups ilxctl`). |
+| Unit is `active`, but "no camera found" / `EnumCameraObjects` fails | USB permissions or the SDK adapter path. `deploy.sh node` installs the udev rule for the Sony body (`/etc/udev/rules.d/99-wildsync-sony.rules`, vendor `054c`, group `plugdev`) and adds `ubuntu` to `plugdev`; check both (`ls -l /dev/bus/usb/*/*`, `id ubuntu`) and that the body is in PC Remote mode. The adapter path is the `WorkingDirectory=` of `deploy/ilxctl.service` (`CrError_Adaptor_Create`, 0x8703, reads as "no camera found"). |
 | Header stays `2/3` | The node is in the fleet but not connected — a node fault, not a config one. Work §9 from the top. |
 | Header does not change at all after adding `~/rig/nodes.json` | rigd was not restarted, or the file is unparseable (silently ignored, defaults used), or you edited a checkout rather than `~/rig/nodes.json`. |
 | Node unreachable from the host, but healthy on a screen | §4. Wi-Fi is holding the 192.168.1.0/24 route. |
+
+### 10.1 Un-wedging `ilxctl`
+
+`ilxctl` cannot recover from an unclean shutdown. Kill it mid-SDK-session and the
+camera's PTP session stays stuck; the next start blocks in the SDK connect and
+the process sits `active` at 0% CPU, looking exactly like a dead camera.
+`systemctl restart` also hangs on the stuck stop — `deploy/ilxctl.service` bounds
+that with `TimeoutStopSec=45`, so a `deploy.sh node` against a wedged daemon
+waits up to 45 s at its restart step. It is slow, not stuck.
+
+On the node, find the body on the USB bus (`lsusb -d 054c:` lists Sony devices;
+the recipe below assumes product id `0e90`, so adjust it if the body shows
+another), then:
+
+```sh
+DEV=$(for d in /sys/bus/usb/devices/*/; do [ -f "$d/idVendor" ] || continue;
+  [ "$(cat $d/idVendor)" = 054c ] && [ "$(cat $d/idProduct)" = 0e90 ] && basename $d; done | head -1)
+sudo pkill -9 -x ilxctl; sleep 1
+echo -n "$DEV" | sudo tee /sys/bus/usb/drivers/usb/unbind; sleep 3
+echo -n "$DEV" | sudo tee /sys/bus/usb/drivers/usb/bind;   sleep 4
+sudo systemctl start ilxctl
+```
+
+`RestartPreventExitStatus=SIGKILL` in the unit keeps the deliberate `-9` down
+until the final `systemctl start`; without it systemd would put a new daemon
+back on the still-stuck bus inside those few seconds. The same side effect
+applies to an OOM kill or any other external SIGKILL: the daemon stays down
+until someone starts it, and rigd reports `ILX_DOWN` rather than a silent flap.
+Power-cycling the camera body clears a stuck session as well, and is the first
+thing to try when the body is within reach (field manual, "Recovery").
 
 ---
 ---
@@ -786,7 +833,7 @@ sudo sed -i 's/usbcore\.usbfs_memory_mb=[0-9]*/usbcore.usbfs_memory_mb=1000/' /b
 
 1000 satisfies **both** cameras — Sony's 150 is a minimum, and raising it costs
 the ILX path nothing. It must live on the **kernel command line**, never
-`modprobe.d` (§10, HANDOFF §3.3).
+`modprobe.d` (§10).
 
 `deploy.sh provision` used to hard-set 150, so re-provisioning a dual-camera node
 silently broke Basler transfers while the Sony path looked fine. It now treats
@@ -888,7 +935,7 @@ Three things in it are **contracts with the rest of the rig**, not preferences:
   `run.py:_fmt_fname`. `ingest.py` keys attribution off `cam%d` and the stem, so
   a divergent name silently unpairs frames.
 - **Atomic write** — `.part` → `fsync` → `rename` → `fsync(dir)`, identical to
-  `run.py`'s pull path, for the reasons in §10 and the audit of 2026-08-27.
+  `run.py`'s pull path (`docs/PROTOCOL.md`, "Run integrity").
 - **JPEG before the card** — raw is 20.3 MB; at 2 fps that would be 41 MB/s onto
   the SD card and ~146 GB per hour of host outage.
 

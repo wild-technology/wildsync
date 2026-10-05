@@ -7,9 +7,10 @@ fix one of them in the same commit — never leave them apart.
 
 | Node | Hardware | IP | User | GPIO chip | Camera | Extras |
 |---|---|---|---|---|---|---|
-| rigd host | **macOS (Apple Silicon)** — the Jetson (192.168.1.166) is retired 2026-08-23 | DHCP (.199 at last check) | wild | — | — | iKonvert on /dev/cu.usbserial-B400BIHV, rigd :9090 as a launchd agent. NOT a chrony master: the nodes peer each other (orphan mode) |
-| pi-cam1 | **Pi 5 Model B Rev 1.0** | 192.168.1.201 | ubuntu | **gpiochip4** (pinctrl-rp1, 54 lines) | D516000F467B | Yahboom YB-MRA02 IMU on USB-A; primary node |
-| pi-cam2 | **Pi 4 Model B Rev 1.5** | 192.168.1.202 | ubuntu | **gpiochip0** (pinctrl-bcm2711, 58 lines) | D516000F46F7 | — |
+| rigd host (Mac) | **Apple Silicon Mac** | DHCP | — | — | — | iKonvert on `/dev/cu.usbserial-<iSerial>`, rigd :9090 as a launchd agent. NOT a chrony master: the nodes peer each other (orphan mode). The 2026-08-20 field runs used this host |
+| rigd host (Jetson) | **Jetson Orin NX**, JetPack 6 (Ubuntu 22.04) | 192.168.1.29 (the field manual's assumption) | — | — | — | iKonvert under `/dev/serial/by-id/`, rigd :9090 as a systemd unit, chrony master for the nodes; strobe agent `piagent-strobe` registered as the camera-less node `jetson` |
+| pi-cam1 | **Pi 5 Model B Rev 1.0** | 192.168.1.201 | ubuntu | **gpiochip4** (pinctrl-rp1, 54 lines) | D516000F467B | IMU: Olive olixVision via `olive-bridge` (default), or the Yahboom YB-MRA02 on USB-A (the 2026-08-20 configuration, `WILDSYNC_NODE_IMU=yb`); primary node |
+| pi-cam2 | **Pi 4 Model B Rev 1.5** | 192.168.1.202 | ubuntu | **gpiochip0** (pinctrl-bcm2711, 58 lines) | D516000F46F7 | IMU: Olive olixVision via `olive-bridge` |
 
 > **cam3 removed 2026-08-19.** The empty third slot fired a permanent
 > `node_offline` anomaly and a forever-"2/3" header for hardware that does not
@@ -17,10 +18,10 @@ fix one of them in the same commit — never leave them apart.
 > one-key address override), never a code edit.
 
 > **Renamed 2026-08-16.** The Pi 5 (formerly "cam3") is now **cam1**, the rig's
-> primary: it hosts the IMU, previews global exposure changes, and is the
-> intended stream source. The newly commissioned Pi 4 is **cam2**. Both hold a
-> static address alongside a DHCP lease so a bad netplan cannot strand a node;
-> `~/rig/nodes.json` on the Jetson overrides an address without a code change.
+> primary: it hosts the fleet's orientation source and is the intended stream
+> source. The newly commissioned Pi 4 is **cam2**. Both hold a static address
+> alongside a DHCP lease so a bad netplan cannot strand a node;
+> `~/rig/nodes.json` on the host overrides an address without a code change.
 >
 > **The GPIO chip differs by Pi generation and must never be hard-coded.** Pi 5
 > puts the 40-pin header on `gpiochip4` (pinctrl-rp1) — its `gpiochip0` is an
@@ -58,6 +59,26 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
 - USB single-shot latency 0.44–0.83 s; USB soak 7200/7200 at 2 fps.
 - Host-side USB trigger jitter σ 68.8 ms; camera Interval REC σ 4.7 ms.
 - Inter-camera start skew over USB 0–200 ms → GPIO firing is the fix.
+- `FOCUS_LEAD_MS` (how far ahead of TRIGGER the per-shot FOCUS is asserted)
+  sets the inter-camera skew, measured 2026-08-16 from kernel EXPOSURE-edge
+  timestamps on the live pair. The 80–200 ms plateau is flat; below it the body
+  has not settled when TRIGGER lands, and at 250 ms it appears to re-meter:
+
+  | FOCUS lead | per-body latency sd | mean skew | worst skew |
+  |---|---|---|---|
+  | 40 ms | 2.4 ms | 3.14 ms | 7.22 ms |
+  | 80 ms | 0.5–0.7 ms | 0.59 ms | 2.10 ms |
+  | **120 ms (the rig's setting)** | 0.6–0.8 ms | 0.59 ms | 1.82 ms |
+  | 200 ms | 0.6–0.7 ms | 0.68 ms | 1.91 ms |
+  | 250 ms | 0.9 ms | 1.83 ms | 4.27 ms |
+
+  Host-side firing is already near-perfect (fire lateness +0.1 to +0.3 ms mean,
+  0.4 ms max), so the remaining skew is inside the camera bodies. A long lead
+  is safe only because the rig is always manual focus.
+- `CrCameraErrorCautionStatus` is 1-based (`NoError` = 0x01, `Error` = 0x02):
+  testing it as a bitmask reports 0x01 — NoError — as a caution.
+- Review-size JPEGs are deliberately small (`transsize=1`, 1616x1080, ~320 KB);
+  the survey frame is the RAW on the card.
 - Sony encodings: shutter `(num<<16)|den` (1/200 = 65736); aperture = f×100;
   ISO AUTO = 16777215; drive Single = 1, Continuous Lo = 65540;
   FileType None=0 JPEG=1 RAW=2 RAW+JPEG=3 RAW+HEIF=4 HEIF=5; ImageSize L/M/S=1/2/3;
@@ -185,7 +206,7 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
   `imu` additionally carries `attitude_hz` (ring publishes/s — the sample
   cadence the staleness budget is sized against), `frame_hz` (all decoded
   frames/s — link health), `imu_rate_low` (**changed 2026-08-24:** true when measured `attitude_hz` falls
-  below THIS device's own floor, or `frame_hz` below the 60 Hz HANDOFF figure —
+  below THIS device's own floor, or `frame_hz` below the 60 Hz frame-rate floor —
   60 Hz is the FRAME rate, and this unit emits one quat + one euler per ~25 Hz
   cycle, so its attitude cadence is ~50 Hz by construction and the old fixed
   60 Hz attitude threshold flagged a permanently-sick healthy IMU from the
@@ -286,6 +307,14 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
 
 IMU sample dict: `{epoch, pitch, roll, yaw, heading, ax, ay, az, gx, gy, gz,
 mx, my, mz, temp}` — degrees, g, deg/s; missing fields null.
+
+The Yahboom YB-MRA02 (`rig/imu_yb.py`) was measured at 174 Hz of frames (one
+quaternion and one Euler frame per ~25 Hz device cycle, so ~50 Hz of attitude).
+Stamped at parse time its samples arrived in bursts 0.07 ms apart with gaps of up
+to 35 ms, so "nearest sample" could be tens of ms off; each frame is therefore
+back-dated from the read instant by its byte-time on the wire, which dates it to
+about 1 ms of its wire time; the unit's own fusion lag is unknown. The sample also carries quaternions (`qw..qz`) and
+`pressure_pa`, which `flight_log.csv` does not write.
 
 ## Desired-state convergence (rigd holds one truth)
 
@@ -443,7 +472,7 @@ It is also loud while held: the node's convergence reports `preview:true` (never
 view with a PREVIEW badge and the pending-vs-live diff, and pre-flight **blocks**
 a run start until it is deployed or discarded.
 
-## Observability & AI live-correction hooks
+## Observability: event journal, alerts and diagnostics
 
 Every service writes a structured event journal (JSONL), one object per line:
 ```
@@ -485,12 +514,12 @@ Fleet/hardware alert kinds:
 
 | kind | raised when |
 |---|---|
-| `runs_disk_low` | the **Jetson** volume holding `~/rig-runs` is below 5 GB. This is the volume every transect is written to; a node's `disk_free_mb` is that Pi's PC-save spool and says nothing about it. When it fills, each frame write raises OSError and that frame is **never retried** — no flight_log row, no nav/IMU correlation |
+| `runs_disk_low` | the **host** volume holding the runs directory (`~/rig-runs`, or the open project's `runs/`) is below 5 GB. This is the volume every transect is written to; a node's `disk_free_mb` is that Pi's PC-save spool and says nothing about it. When it fills, each frame write raises OSError and that frame is **never retried** — no flight_log row, no nav/IMU correlation |
 | `card_write_stuck` | `slotWriting` has read `WRITING` continuously for >30 s (critical at >120 s). One frame wedged in the body's write buffer locks the whole property table, stops PC delivery and wedges ilxctl **while `slotStatus` still reads OK** — do not trust slotStatus to catch it |
 | `camera_overheating` | `overheatingLabel` is `pre-overheat` (warn) or `OVERHEATING` (critical); the body shuts itself down mid-transect |
 | `pc_control_lost` | `priorityKeyLabel` reads `Camera position` — PC Remote priority was taken back by the body, so writes are refused and PC save stops delivering. Masquerades as an SDK bug |
 | `preview_pinned` | a settings preview is being held on one camera, so the pair is not matched |
-| `host_clock_offset` | the **host** disagrees with the nodes: the median of the live nodes' filtered offsets is >0.1 s (warn) / >0.5 s (bad). `node_clock_skew` compares the nodes to *each other* and reads 0 for a common-mode host error, which is what hid the measured 187 ms. Action: enable network time on the host (System Settings → General → Date & Time) |
+| `host_clock_offset` | the **host** disagrees with the nodes: the median of the live nodes' filtered offsets is >0.1 s (warn) / >0.5 s (bad). `node_clock_skew` compares the nodes to *each other* and reads 0 for a common-mode host error, which is what hid the measured 187 ms. Action: enable network time on a Mac host (System Settings → General → Date & Time); check `chronyc tracking` on a Jetson host |
 | `node_clock_unmeasurable` | a node's best `/health` RTT is ≥20 ms, so the 10 ms stereo budget cannot be verified on that link. Previously such a node was silently dropped from the comparison and the operator saw an all-clear on a check that was never made |
 
 **Published but NOT yet detected.** These three faults are now *measurable* —
@@ -516,9 +545,9 @@ Every anomaly carries `sev: "bad"|"warn"` alongside `{kind, node, since,
 evidence, suggested_action}`; the UI renders that field rather than pattern-
 matching the kind's spelling.
 
-rigd exposes, for both humans and an automated watcher:
+rigd exposes, for both people and scripts:
 - `GET /api/events?since=<seq>&sev=<min>` → `{next, events:[...]}` — cursor-based,
-  never blocks, bounded page. An automated watcher polls this.
+  never blocks, bounded page. A watcher script polls this.
 - `GET /api/diag` → one self-describing snapshot: versions, every node's monitor
   state + convergence + last error, active run, disk, clock offsets, recent
   anomaly counts by kind, current desired vector. Enough to diagnose a field bug
@@ -547,7 +576,7 @@ read-only per-camera lens readings `focus_mode`, `focus_mode_label`,
 purpose — the raw one is one sample, the filtered one is what every decision is
 made on. Sign convention is **node minus host** throughout.
 
-### rigd HTTP API (Jetson, :9090)
+### rigd HTTP API (host, :9090)
 
 Settings:
 - `GET  /api/settings` → the desired vector plus `_auto` and `_preview`
@@ -635,7 +664,7 @@ in flight_log and run.json for traceability. RAW sidecars, if enabled, keep the
 same stem with the raw extension. `flight_log.csv`'s `filename` column is the
 **renamed** name.
 
-## rigd (Jetson, :9090) — new
+## rigd (host, :9090)
 
 Node monitor state machine per camera node, 2 s poll:
 `OFFLINE → REACHABLE → CAM_CONNECTED` with automatic `/api/connect` retry
@@ -650,7 +679,7 @@ only after 3 consecutive scans. Every scheduled fire and every `epoch_hw` edge
 lives on the NODE's clock, so inter-node clock skew lands 1:1 in true
 exposure skew **while the rig's own skew figures under-report it** — the
 nodes' chrony must share one master (measured 16.8 ms apart free-running on
-2026-08-20 after the Jetson master left the topology). A *common-mode*
+2026-08-20, before the peer mesh was installed). A *common-mode*
 host-vs-node offset is invisible to this check by construction; that is
 `host_clock_offset`, and the conversion applied to both domains is under
 "CLOCK DOMAINS" below.
@@ -839,7 +868,7 @@ host-vs-node offset is invisible to this check by construction; that is
   and the source is kept even under `--move` — and a third-party `<base>.xmp`
   keeps its name while the rig's packet goes to `<base>.wildsync.xmp`.
 
-Transect run layout (Jetson, `~/rig-runs/`):
+Transect run layout (host, `~/rig-runs/`, or the open project's `runs/`):
 
 ```
 runs/260815_1930_transect-01/
@@ -895,37 +924,40 @@ per node, and the quiet window runs until the frame is seen or `CAL_QUIET_S`
 Pi 4, which then listed after the quiet ended and entered the transect as
 survey data.
 
-UI (`rig_ui.html`, served by rigd, **runs with no AI**) is tabbed:
-- **Review** — the existing single-camera captures pane generalised to N cameras
-  side-by-side, newest frame first per camera, per-camera ISO/f/shutter burned
-  in, arrow-key stepping. Dynamically adds/removes camera columns as nodes come
-  and go.
-- **Fleet** — heartbeat strip per node (state, battery, disk, jitter, last
-  frame age) with slick live sparklines, plus the camera-health fields (card
-  write, thermal, live-view status, control priority). Live view here is **off
-  by default** behind an explicit switch.
+UI (`rig_ui.html`, one self-contained page served by rigd) has ten tabs:
+- **Review** — run controls (start and stop a transect, capture one), the card
+  drain panel, and the newest pair side by side with its measured jitter chip
+  and strobe verdict, per-camera ISO/f/shutter burned in, arrow-key stepping. A
+  missing half of a pair is a MISSING panel, never a lone frame. Per-node health
+  strips (state, battery, disk, jitter, last frame age, card write, thermal,
+  control priority). Live view here is **off by default** behind an explicit
+  switch.
 - **Transects** — the run browser: every run newest-first, and for the selected
   one its stereo-pair completeness (complete / incomplete counts, the per-shot
   strip, the gap list with the frame that *did* land), per-camera flight_log
   row counts and capture-source breakdown, a link to each `flight_log.csv`, and
   a side-by-side viewer for the last shots so a missing half of a pair is
-  visible as a MISSING panel, not a number.
-- **Nav** — location plot (track from lat/lon), heading rose, depth readout.
-- **IMU** — live attitude (pitch/roll/yaw) horizon + heading.
-- **Controls** — the one desired-settings panel that drives all cameras, with
-  per-node convergence badges, the EV-bump control, the **Preview on Cam1 /
-  Deploy to fleet** pair beside cam1's live view + histogram, the recording
-  format selects (filetype / imagesize / transsize, marked "no readback"), and
-  read-only panels for the body-menu-only properties and the per-camera lens
-  positions.
-- **Events** — the live event/anomaly stream.
+  visible as a MISSING panel, not a number. Runs recorded against the test
+  simulators are labelled SIMULATED.
+- **Map** — every frame and the boat's trail on an offline UTM canvas.
+- **Controls** — per-camera exposure, focus and zoom, each camera's column under
+  its own live view; the fleet recording format with a per-camera readback and
+  convergence badges; the EV-bump control; read-only panels for the body-menu-
+  only properties; the Strobe panel.
+- **Nav**, **IMU** — live NMEA 2000 data (location plot, heading rose, depth)
+  and live attitude from each camera's IMU.
+- **Calib** — stereo checkerboard and IMU calibration (`rig/rigcal.py`).
+- **Diag** — status log, project and storage, the cameras/cards table, the card
+  drain ("Download images"), Format card, per-run ZIP downloads.
+- **Alerts** — active anomalies plus warn/error history.
+- **Events** — the live event and anomaly stream.
 
 **Live view is gated.** `liveViewJpeg()` takes the same recursive SDK mutex as
 image transfer, so every live-view GET competes with the capture path on a body
 that is mid-survey. No live-view or `/api/shots` request is issued unless its
-tab is both selected AND `document.hidden === false`; the Fleet tab additionally
-requires its switch to be on. One backgrounded browser tab used to pull frames
-from both bodies every 2 s for an entire survey.
+tab is both selected AND `document.hidden === false`; Review's live view
+additionally requires its switch to be on. One backgrounded browser tab used to
+pull frames from both bodies every 2 s for an entire survey.
 
 flight_log.csv header (exact):
 ```
@@ -1047,9 +1079,13 @@ steps applied live (manual → ISO step; auto → servo target shift).
   `TimeAuthority`. No HTTP.
 - `src/*` (camera daemon): fixes only, no API shape changes beyond adding
   `expcomp` + noted fields.
-- `rig/piagent.py`, `rig/rigd.py`, `rig/rig_ui.html`, `rig/deploy.sh`,
-  systemd units (core). Python stdlib only in
-  services; pyserial allowed (apt `python3-serial`).
+- `rig/piagent.py`, `rig/rigd.py`, `rig/rig_ui.html`, `deploy/deploy.sh`, the
+  systemd units and the launchd agent (core). Python standard library only in
+  the services, with two guarded exceptions on the host: pyserial (apt
+  `python3-serial`; the iKonvert and serial IMUs) and Pillow (the EXIF fallback
+  that supplies a capture instant when a frame has no GPIO edge). Both are
+  optional: rigd runs without them and says what is missing. The list of
+  packages is `requirements.txt`.
 
 ---
 
@@ -1200,13 +1236,15 @@ until measured, so intrinsics come entirely from a checkerboard - no priors.
 
 ### Deployed configuration
 
-- The Jetson runs rigd and `piagent-strobe.service` (strobe role), registered
+- A Jetson host runs rigd and `piagent-strobe.service` (strobe role), registered
   in `~/rig/nodes.json` as `"jetson": {"host": "127.0.0.1", "cam_num": 9,
   "optional": true}` with `{"jetson": false}` in `camera_enabled.json`.
 - Camera nodes run `PIAGENT_IMU=olive:udp:9901`, `PIAGENT_IMU2=off`; the Olive
   link is `olive0` (netplan `60-wildsync-olive.yaml`, matched on the
   `cdc_ether` driver).
-- Node chrony prefers the Jetson (`20-wildsync-host.conf`) over the peer mesh.
+- With a Jetson host, node chrony prefers the Jetson (`20-wildsync-host.conf`,
+  written by `deploy.sh node` run from that Jetson) over the peer mesh. A Mac
+  host is not a chrony master and the nodes keep the peer mesh alone.
 
 ### Flight log attitude
 

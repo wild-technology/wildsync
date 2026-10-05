@@ -400,7 +400,7 @@ class NodeMonitor(threading.Thread):
     REACHABLE = "REACHABLE"          # piagent/ilxctl answer, camera not claimed
     CONNECTED = "CAM_CONNECTED"      # camera claimed and controllable
     # piagent answers but ilxctl does not (timeout / refused / garbage): the
-    # daemon is wedged inside an SDK call (HANDOFF §2.2) or dead. This is NOT
+    # daemon is wedged inside an SDK call (docs/PI-SETUP.md §10.1) or dead. This is NOT
     # "camera not claimed": POSTing /api/connect here strands one of ilxctl's
     # HTTP workers per attempt behind the stuck mutex, and the stale cached
     # status kept reporting connected:true so the UI kept requesting live

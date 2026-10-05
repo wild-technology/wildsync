@@ -1,13 +1,11 @@
-# NOTE: this unit did not exist in this repo until cam3 (branch cam3-node).
-# cam1 and cam2 have been running HAND-INSTALLED units since they were built,
-# and nothing in the tree or in git history ever captured them - deploy.sh used
-# to `systemctl restart ilxctl || echo "not installed here"` and docs/HANDOFF.md
-# does not carry the unit either. So this file is a reconstruction from the
-# daemon's own behaviour, not a copy of what is on those nodes. Before assuming
-# the fleet is uniform, diff it against the real thing:
+# deploy.sh node installs this unit on every camera node. cam1 and cam2 were
+# first built with HAND-INSTALLED units that nothing in the tree captured, and
+# this file is a reconstruction from the daemon's own behaviour, not a copy of
+# those. The first deploy to a node that predates it replaces its unit, so diff
+# it against the real thing first and reconcile any difference deliberately -
+# especially User= and the USB permission question noted at SupplementaryGroups=
+# below:
 #   ssh ubuntu@192.168.1.201 'systemctl cat ilxctl'
-# and reconcile any difference deliberately - especially User= and the USB
-# permission question noted at SupplementaryGroups= below.
 
 [Unit]
 Description=Wild Sync ilxctl - Sony ILX-LR1 camera daemon (USB/SDK, :8080)
@@ -16,8 +14,8 @@ Wants=network-online.target
 # There is no unit to order against for "the camera has enumerated on USB":
 # the body draws from the same PoE drop as the Pi and is still powering up
 # when systemd gets here. Nothing is lost by starting early - ilxctl binds
-# :8080 BEFORE its startup connect (HANDOFF 3.x / PROTOCOL "binds :8080
-# BEFORE the startup connect"), a failed startup connect is a log line and
+# :8080 BEFORE its startup connect (docs/PROTOCOL.md, "binds :8080 BEFORE the
+# startup connect"), a failed startup connect is a log line and
 # not an exit, and rigcore re-POSTs /api/connect at any node it sees as
 # REACHABLE (camera not claimed).
 # A missing SDK or a failed build makes ilxctl exit non-zero at once; without
@@ -88,10 +86,11 @@ EnvironmentFile=-/etc/default/ilxctl
 ExecStart=/home/ubuntu/wildsync/build/ilxctl --host 0.0.0.0 --port 8080 --save-dir /home/ubuntu/Pictures/ILX-LR1 $ILXCTL_ARGS
 Restart=always
 RestartSec=5
-# HANDOFF 2.2 (un-wedging a stuck PTP session) is `pkill -9 -x ilxctl`, then a
-# USB unbind/bind, then `systemctl start ilxctl`. Under a plain Restart=
-# policy systemd puts a new daemon back on the still-stuck bus inside those
-# few seconds and the recipe's final start is a no-op against it. Naming
+# The un-wedge recipe for a stuck PTP session (docs/PI-SETUP.md 10.1) is
+# `pkill -9 -x ilxctl`, then a USB unbind/bind, then `systemctl start ilxctl`.
+# Under a plain Restart= policy systemd puts a new daemon back on the
+# still-stuck bus inside those few seconds and the recipe's final start is a
+# no-op against it. Naming
 # SIGKILL here leaves a deliberately -9'd daemon DOWN, while a crash or any
 # non-zero exit still restarts. The recipe works as written.
 # The cost: an OOM kill (or any other external SIGKILL) also leaves the daemon
@@ -104,7 +103,7 @@ RestartPreventExitStatus=SIGKILL
 # to kSdkWait (8 s, camera.cpp) for the SDK mutex - and the lens must never be
 # left driving. Past that it can block for ever: main() joins the
 # startup-connect thread and a wedged SDK::Connect never returns, which is
-# exactly HANDOFF 2.2's "systemctl restart also hangs". 45 s clears the
+# exactly the "systemctl restart also hangs" of docs/PI-SETUP.md 10.1. 45 s clears the
 # bounded worst case with headroom and turns the unbounded one into a
 # systemd SIGKILL instead of a hang.
 # This is derived arithmetic (four bounded 8 s takes on the stop path), not a
@@ -131,8 +130,8 @@ SupplementaryGroups=plugdev
 # units, only in rigd.service. A differently-imaged cam3 needs them re-rendered.
 # Deliberately no Nice=/priority: rigd carries Nice=-10 because it owns the
 # fire schedule, but the shutter is fired on GPIO by piagent. ilxctl is the
-# USB/settings path and is not in the sync-critical loop (HANDOFF 3.1: all
-# remaining skew is inside the camera bodies).
+# USB/settings path and is not in the sync-critical loop (README, "How
+# synchronised capture works": all remaining skew is inside the camera bodies).
 
 [Install]
 WantedBy=multi-user.target

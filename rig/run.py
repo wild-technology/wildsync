@@ -3778,8 +3778,8 @@ class RunManager:
                     #
                     # The deadline is CAL_QUIET_S, not the 1.2 s it used to be.
                     # 1.2 s covers the Small JPEGs the rig ships with (~0.5 s
-                    # to list) but NOT the Original-size frames HANDOFF §3
-                    # names as the target: 14 MB over a Pi 4's USB lists at
+                    # to list) but NOT the Original-size frames (docs/PROTOCOL.md,
+                    # "Measured constants"): 14 MB over a Pi 4's USB lists at
                     # ~1.5-2 s, so the quiet ended, the puller went back on the
                     # node and pulled the calibration frame into the transect
                     # as survey data - all five per node, with skipped_cal

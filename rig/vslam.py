@@ -19,16 +19,16 @@ operator can see live, in one of two modes:
           degeneracy. The inter-camera pose is self-estimated from the
           first pairs; the baseline LENGTH is a rig constant that is
           currently UNMEASURED (default 0.30 m placeholder, loudly flagged
-          until measured — docs/vslam-jetson.md). GPS demotes to a
+          until measured — docs/vslam.md). GPS demotes to a
           cross-check: stats.gps_ratio = stereo length / GPS length.
   auto    stereo when the pair dir exists and >50% of frames pair up by
           capture instant; mono otherwise.
 
-Runs today on the macOS host (CPU); it is finalized on the Jetson Orin Nano,
-where the same VslamEngine can be handed a CUDA backend — everything that
+Runs on the CPU on either rig host (developed and timed on a Mac); on a Jetson
+Orin NX the same VslamEngine can be handed a CUDA backend — everything that
 touches cv2/numpy lives behind the small backend interface (CpuOrbBackend) for
-exactly that swap. See docs/vslam-jetson.md for the finalization plan, the
-calibration procedure and the rigd /api/vslam integration spec.
+exactly that swap. See docs/vslam.md for the Jetson plan, the calibration
+procedure and the rigd /api/vslam integration spec (not implemented).
 
 cv2/numpy may be absent on a fresh host: imports are lazy and every entry
 point degrades to a clean "unavailable: <reason>" status instead of crashing.
@@ -283,8 +283,8 @@ class Intrinsics:
     """Pinhole guess for the review JPEG stream.
 
     Default: 1616x1080 with ~59 deg HFOV -> fx ~ 1429 px. That is a GUESS
-    (spec'd assumption for the ILX-LR1 review stream); real calibration is a
-    Jetson-day task (docs/vslam-jetson.md). The essential matrix is tolerant
+    (spec'd assumption for the ILX-LR1 review stream); a real calibration
+    comes from the Calib tab (docs/vslam.md). The essential matrix is tolerant
     of moderate focal error — the trajectory shape survives, absolute angles
     do not. port_factor: refraction through a flat housing port multiplies
     the effective in-water focal by ~1.33 (stereo_check.py uses the same
@@ -630,7 +630,7 @@ class VslamEngine:
 
     def _tick(self, t0):
         # EMA over tracked frames (still + keyframe): the number the Jetson
-        # fps budget in docs/vslam-jetson.md is checked against.
+        # fps budget in docs/vslam.md is checked against.
         ms = (time.monotonic() - t0) * 1000.0
         ema = self.stats["proc_ms"]
         self.stats["proc_ms"] = ms if ema == 0 else 0.8 * ema + 0.2 * ms
@@ -652,7 +652,7 @@ class StereoVslamEngine(VslamEngine):
     docs/future-tests.md §1: lens/encoder parity unverified), so the 0.30 m
     default is a placeholder and every status/snapshot flags it loudly until
     baseline_calibrated=True. A checkerboard stereo calibration replaces the
-    whole estimate on Jetson day (docs/vslam-jetson.md). All trajectory
+    whole estimate (docs/vslam.md). All trajectory
     DISTANCES scale linearly with baseline error; SHAPE does not.
 
     GPS is a cross-check here, not the scale source: stats.gps_ratio =
@@ -1010,7 +1010,7 @@ def load_stereo_calibration(path=STEREO_CAL_PATH):
     """The Calib tab's saved checkerboard solution, or None.
 
     Returns {"R": 3x3, "T": [3] metres, "baseline_m": float, "K1","d1","K2",
-    "d2", "rms_stereo_px", "date"} - the wire-in docs/vslam-jetson.md
+    "d2", "rms_stereo_px", "date"} - the wire-in docs/vslam.md
     specifies: construct the stereo engine with these extrinsics frozen
     (baseline_calibrated=True) instead of the self-estimate."""
     try:
@@ -1027,7 +1027,7 @@ def load_stereo_calibration(path=STEREO_CAL_PATH):
 class VslamRunner:
     """Threaded watcher: feeds a run dir's review JPEGs to an engine in
     timestamp order as they appear, and keeps the JSON-safe state a rigd
-    /api/vslam endpoint will serve (docs/vslam-jetson.md).
+    /api/vslam endpoint will serve (docs/vslam.md).
 
     mode: 'mono' (cam only), 'stereo' (cam + pair_cam, frames associated by
     capture instant from the filenames), or 'auto' — stereo when the pair

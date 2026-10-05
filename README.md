@@ -3,21 +3,25 @@
 Control software for a multi-camera **Sony ILX-LR1** underwater stereo rig used
 for seafloor photogrammetry.
 
-A **Jetson Orin NX** runs `rigd`, the orchestrator and web UI, and controls a
-fleet of Raspberry Pi camera nodes over Ethernet. Each node drives one ILX-LR1
-over USB through Sony's Camera Remote SDK, fires it through a GPIO trigger
-harness, and reads that camera's **Olive olixVision IMU**. The Jetson schedules
-every camera to expose at one shared instant, fires the **XR256** strobe into
-that instant, pulls the frames, renames them, and writes a per-camera flight log
-binding each frame to position and orientation. Position, heading and GPS time
-come from a **Subsonus** RTK antenna over NMEA 2000, through an **iKonvert**
-gateway on the Jetson's USB.
+A **rig host** runs `rigd`, the orchestrator and web UI, and controls a fleet of
+Raspberry Pi camera nodes over Ethernet. The host is a **Mac** (Apple Silicon)
+or a **Jetson Orin NX**. Each node drives one ILX-LR1 over USB through Sony's
+Camera Remote SDK, fires it through a GPIO trigger harness, and reads that
+camera's IMU (an **Olive olixVision**, or a Yahboom unit on a node set up for
+it). The host schedules every camera to expose at one shared instant, pulls the
+frames, renames them, and writes a per-camera flight log binding each frame to
+position and orientation. Position, heading and GPS time come from a
+**Subsonus** RTK antenna over NMEA 2000, through an **iKonvert** gateway on the
+host's USB. On a Jetson host the **XR256** strobe can be fired into the shared
+instant as well.
 
 ```
                      ┌──────────────────────────────────────────────┐
-   browser ─────────►│ Jetson Orin NX   rigd + web UI :9090         │
-                     │ chrony master · piagent (strobe role) :8081  │──► XR256 (opto board)
+   browser ─────────►│ rig host: Mac or Jetson Orin NX              │
+                     │ rigd + web UI :9090                          │
    Subsonus ─ N2K ─► │ iKonvert on USB                              │
+                     │ Jetson only: chrony master, strobe agent     │──► XR256 (opto board)
+                     │ (piagent, strobe role) :8081                 │
                      └───┬───────────────────────────┬──────────────┘
                          │ Ethernet (rig switch)     │
                ┌─────────▼─────────┐       ┌─────────▼─────────┐
@@ -29,14 +33,36 @@ gateway on the Jetson's USB.
 ```
 
 Each camera shoots through a Sony FE PZ 16–35 mm lens and a Nauticam WACP-C
-water-contact optic in a Sexton housing. The operator's guide is
+water-contact optic in a Sexton housing. To install it, start at
+[`docs/INSTALL.md`](docs/INSTALL.md) (hardware, host, nodes, clocks, IMUs,
+navigation gateway, strobe, verification). The operator's guide is
 [`docs/USER-GUIDE.html`](docs/USER-GUIDE.html) (the field manual) and the boat
 checklist is [`docs/FIELD-RUN.md`](docs/FIELD-RUN.md).
 
+**What has been used in the field.** The 20 August 2026 transects (Narragansett
+Bay) were recorded with a Mac host, a Raspberry Pi beside each camera (Pi 5 on
+cam1, Pi 4 on cam2), one IMU, the static-fix position fallback (no live
+NMEA 2000 in either transect) and no strobe. The Jetson host, a per-camera
+Olive IMU and the XR256 strobe role are supported by the current software, but
+the repository holds no field run recorded with them, and the XR256 has not yet
+been fired with the camera array. [`docs/INSTALL.md`](docs/INSTALL.md) lists
+each configuration with its status.
+
+## Versions
+
+Releases are git tags: `task6-report-2026-08-31` (the state described in the
+31 August 2026 Task 6 report), `v1.0.0` (21 September 2026) and `v1.1.0` (this
+release). [`CHANGELOG.md`](CHANGELOG.md) lists what changed between them and
+explains why commit IDs quoted before 5 October 2026 no longer resolve; refer to
+a version by its tag. Every run records the software that produced it:
+`run.json` carries a `software` object (version, commit, dirty flag), and
+`python3 rig/buildinfo.py` prints the same stamp for a checkout.
+
 ## Measured performance
 
-All figures from the live rig, measured 2026-08-16 against each camera's own
-`EXPOSURE` line (hardware ground truth), not host-side estimates.
+Bench figures, measured on the live rig 2026-08-16 against each camera's own
+`EXPOSURE` line (hardware ground truth), not host-side estimates. The host then
+was a Jetson.
 
 | | |
 |---|---|
@@ -44,11 +70,24 @@ All figures from the live rig, measured 2026-08-16 against each camera's own
 | USB release → exposure | 68–76 ms, sd 5–11 ms, quantised to the camera's ~30 Hz internal tick |
 | **Inter-camera skew, scheduled fire** | **0.59 ms mean, 1.82 ms worst** |
 | Host fire lateness vs scheduled instant | +0.1–0.3 ms mean, 0.4 ms max |
-| Node clock discipline (chrony → Jetson) | ~85 µs RMS |
+| Node clock discipline (chrony → Jetson host) | ~85 µs RMS |
 | IMU (Olive, via olive-bridge) | ~15 Hz attitude stream |
 
 Use the GPIO path for survey work. USB release is the fallback when a node has
 no harness, and costs roughly 30 ms of timing uncertainty.
+
+Field figures, recomputed from the GPIO-edge timestamps recorded in the two
+transects of 2026-08-20 (Mac host; every frame in both runs was stamped from a
+GPIO edge):
+
+| Run | Interval | Pairs | Inter-camera spread, mean / worst |
+|---|---|---|---|
+| `260820_1925_transect-01` | 0.5 s | 336 | 0.95 ms / 4.86 ms |
+| `260820_1919_transect-01` | 2.0 s | 140 | 2.03 ms / 5.36 ms |
+
+The pair budget is 10 ms. The bench worst case (1.82 ms) was measured on a
+characterisation sweep, not on a transect; quote the field worst case for a
+survey.
 
 **The sustained-rate figures are withdrawn.** Every one on record was taken with
 `transsize=Small` — 320 KB review thumbnails, not survey frames — so they say
@@ -78,15 +117,36 @@ Three things worth keeping:
   12.39 ms on the Pi 4 — a silent ~9.6 ms inter-camera skew. The in-process path
   removed it.
 
+### Design rules
+
+- **Manual focus, always.** Autofocus is refused on every path: by `rigd`, and by
+  `ilxctl` itself (HTTP 403) unless it was started with `--allow-autofocus`,
+  which is for the bench and shows as `afAllowed: true` to the whole fleet.
+- **Focus and zoom are per camera.** They are not in the fleet settings vector
+  and the UI offers no "apply focus to fleet", because lens-encoder parity
+  between the two bodies is unmeasured (`docs/future-tests.md` §1).
+- **Empty means empty.** A value the rig did not have is written as an empty
+  cell, never invented; position from the armed static fix is labelled as such.
+- **A camera that drops out pauses the grid** rather than letting the other one
+  shoot the line alone, and resumes only when a probe fire succeeds.
+- **Inter-camera exposure spread budget: 10 ms.** Time comes from GPS (PGN
+  126992/129029) when the NMEA 2000 bus is live and from the host clock
+  otherwise; `time_source` in each flight-log row says which.
+
 ## Layout
 
 ```
-src/            ilxctl — C++ camera daemon (one per node, :8080)
-rig/            Python: rigd (Jetson), piagent (node), nav, run, UI
-rig/tests/      regression + soak suites (no hardware required)
-deploy/         deploy.sh and the systemd units
-third_party/    httplib.h — cpp-httplib, vendored (MIT)
-docs/           PROTOCOL.md (interface contract), HANDOFF.md (state + TODO), hardware notes
+src/               ilxctl — C++ camera daemon (one per node, :8080)
+rig/               Python: rigd (host), piagent (node), nav, run, ingest, UI
+rig/tests/         regression + soak suites (no hardware required)
+deploy/            deploy.sh, the systemd units and the launchd agent
+third_party/       httplib.h — cpp-httplib, vendored (MIT)
+docs/              INSTALL.md (start here), PROTOCOL.md (interface contract),
+                   FIELD-RUN.md, PI-SETUP.md, the field manual, hardware notes
+requirements.txt   Python packages beyond the standard library
+LICENSE            MIT
+THIRD_PARTY_NOTICES.md, sbom.spdx.json   third-party components
+CHANGELOG.md       what changed in each version
 ```
 
 `docs/PROTOCOL.md` is the contract every component is built against — node HTTP
@@ -98,42 +158,51 @@ a process boundary.
 
 | Process | Host | Port | Language | Owns |
 |---|---|---|---|---|
-| `rigd` | Jetson | 9090 | Python 3, stdlib | fleet state, desired settings, runs, web UI, nav (iKonvert) |
-| `piagent` (strobe role) | Jetson | 8081 | Python 3, stdlib | the XR256 trigger line, nothing else (`PIAGENT_ROLE=strobe`) |
+| `rigd` | rig host (Mac or Jetson) | 9090 | Python 3 | fleet state, desired settings, runs, web UI, nav (iKonvert) |
+| `piagent` (strobe role) | Jetson host only | 8081 | Python 3, stdlib | the XR256 trigger line, nothing else (`PIAGENT_ROLE=strobe`) |
 | `ilxctl` | each Pi | 8080 | C++17 | the camera over USB via Sony's SDK — settings, live view, image transfer |
 | `piagent` | each Pi | 8081 | Python 3, stdlib | GPIO harness (FOCUS/TRIGGER/EXPOSURE), the node's IMU, node health |
 | `olive-bridge` | each Pi | — | Python 3, stdlib | relays the Olive IMU's stream (`olive0`, 192.168.7.100:5500) to piagent on UDP 9901 |
 
-All are systemd units with `Restart=always`. `rigd` talks to the node services
-over plain HTTP; nothing else crosses a machine boundary. On the Jetson, the
-strobe agent is registered with rigd as the node `jetson` (localhost, camera
-switched off) by `deploy.sh strobe`.
+On a Jetson host `rigd` and the strobe agent are systemd units; on a Mac `rigd`
+is a launchd agent (`deploy/rigd.launchd.plist`). The node services are systemd
+units. All restart automatically. `rigd` talks to the node services over plain
+HTTP; nothing else crosses a machine boundary. On a Jetson host the strobe agent
+is registered with rigd as the node `jetson` (localhost, camera switched off) by
+`deploy.sh strobe`.
 
 State on disk:
 
 | Path | Host | What |
 |---|---|---|
-| `~/wildsync-projects/<name>/` | Jetson | one folder per project: transects (`run.json`, `events.log`, `nmea_raw.log`, a `camN/` per camera with renamed frames + `flight_log.csv`), drained RAWs, exports |
-| `~/rig/desired.json` | Jetson | the fleet's agreed settings vector, survives restart |
-| `~/rig/rigd.jsonl` | Jetson | rolling structured event journal |
-| `~/rig/nodes.json` | Jetson | node address overrides and extra nodes, e.g. `{"cam3": {"host": "192.168.1.203", "cam_num": 3}}` |
-| `~/rig/camera_enabled.json` | Jetson | per-camera on/off, e.g. `{"jetson": false}` |
-| `~/rig/strobe.json` | Jetson | strobe node, delta and pulse settings |
+| `~/wildsync-projects/<name>/` | rig host | one folder per project: transects (`run.json`, `events.log`, `nmea_raw.log`, `SHA256SUMS`, a `camN/` per camera with renamed frames + `flight_log.csv`), drained RAWs, exports. Transects from before projects existed are in `~/rig-runs`, drained RAWs in `~/rig-raw` |
+| `~/rig/desired.json` | rig host | the fleet's agreed settings vector, survives restart |
+| `~/rig/rigd.jsonl` | rig host | rolling structured event journal |
+| `~/rig/nodes.json` | rig host | node address overrides and extra nodes, e.g. `{"cam3": {"host": "192.168.1.203", "cam_num": 3}}` |
+| `~/rig/camera_enabled.json` | rig host | per-camera on/off, e.g. `{"jetson": false}` |
+| `~/rig/strobe.json` | rig host | strobe node, delta and pulse settings |
+| `~/rig/static_fix.json` | rig host | the position used when no live NMEA 2000 is available |
 | `~/Pictures/ILX-LR1/` | each Pi | the PC-save spool the camera writes into; rigd pulls each frame and then deletes it |
 
 ## Requirements
 
-**Jetson Orin NX:** JetPack 6 (Ubuntu 22.04, Python 3.10 — the code also runs
-on 3.9 and on the 3.12 the nodes use). `deploy.sh jetson` installs the rest:
-`python3-serial` (nav), `python3-pil` (EXIF fallback for capture times — easy to
-miss, and without it frames with no GPIO edge get the command time instead),
-`python3-numpy`, `python3-opencv` (calibration, VSLAM) and `chrony`.
+**Mac host:** macOS on Apple Silicon with Python 3 and the packages in
+[`requirements.txt`](requirements.txt) (`python3 -m pip install -r
+requirements.txt`). No camera is attached to the host, so a Mac that only runs
+`rigd` does not build `ilxctl`; it stages the Linux SDK for the nodes (below).
+
+**Jetson Orin NX host:** JetPack 6 (Ubuntu 22.04, Python 3.10 — the code also
+runs on 3.9 and on the 3.12 the nodes use). `deploy.sh jetson` installs the
+rest: `python3-serial` (nav), `python3-pil` (EXIF fallback for capture times —
+easy to miss, and without it frames with no GPIO edge get the command time
+instead), `python3-numpy`, `python3-opencv` (calibration, VSLAM) and `chrony`.
 `deploy.sh strobe` adds `python3-libgpiod` and `gpiod`.
 
 **Camera nodes:** Ubuntu 24.04 server, Python 3.12, `python3-libgpiod`
 (v1.6.3 API), `gpiod` tools, `build-essential`, `libusb-1.0-0`, `libxml2`,
-`chrony` — all installed by `deploy.sh provision`. Services are stdlib-only by
-policy; see `docs/PROTOCOL.md`.
+`chrony` — all installed by `deploy.sh provision`. The node services use the
+Python standard library only (pyserial where a node reads a serial IMU); see
+`docs/PROTOCOL.md`.
 
 **Sony Camera Remote SDK (v2.02.00):** proprietary, supplied by Sony under its
 own licence agreement (linked from <http://www.sony.net/CameraRemoteSDK/>), and
@@ -148,79 +217,36 @@ and to provision them; a development build on a Mac needs the macOS package.
 **Python packages beyond the standard library:** listed in
 [`requirements.txt`](requirements.txt), grouped by the part of the system that
 imports them. Where `deploy.sh` installs them it uses apt packages (see
-Jetson Orin NX and Camera nodes above), not pip; `pip install -r requirements.txt`
-is for a macOS or other development host.
+the Jetson host and Camera nodes above), not pip; `pip install -r
+requirements.txt` is for a Mac or other development host.
 
-`rigd` also runs on macOS (bench and development; `rig/tests/devrig.py` runs
-the full UI against two fake cameras on any host). On a Mac, stage the node SDK
-with `make sdk-linux CRSDK_DIR=/path/to/RemoteCli` (the RemoteCli folder of the
-Linux64ARMv8 package), and install rigd as a launchd agent from
-`deploy/rigd.launchd.plist` instead of `deploy.sh jetson`.
+`rig/tests/devrig.py` runs the full UI against two fake cameras on any host,
+with no hardware.
 
 ## Install
 
-Everything below runs from a checkout on the Jetson unless it says otherwise.
-
-### 1. The Jetson
-
-Flash JetPack 6, wire the Jetson to the rig switch, and give it a fixed address
-on 192.168.1.0/24 (the field manual assumes `192.168.1.29`). Then:
+[`docs/INSTALL.md`](docs/INSTALL.md) is the installation and configuration guide,
+in order: hardware, the Sony SDK and `ilxctl`, the host (Mac with launchd, or
+Jetson with systemd), provisioning and deploying the camera nodes, clocks, IMUs,
+the navigation gateway, the strobe, and verification. The commands in short:
 
 ```sh
-git clone https://github.com/wild-technology/wildsync.git ~/wildsync
-cd ~/wildsync
+git clone https://github.com/wild-technology/wildsync.git ~/wildsync && cd ~/wildsync
 make sdk-linux CRSDK_DIR=/path/to/RemoteCli   # Sony SDK for the nodes (Linux64ARMv8 package)
-deploy/deploy.sh jetson        # deps, chrony master for the rig, rigd service
+deploy/deploy.sh jetson                       # Jetson host only: deps, chrony master, rigd service
+                                              # (Mac host: launchd agent, INSTALL.md section 3)
+deploy/deploy.sh trust     cam1               # per node: push this host's ssh key
+deploy/deploy.sh provision cam1               # per node: SDK, usbfs, chrony, build tools
+deploy/deploy.sh node      cam1               # per node: build ilxctl, units, start services
+WILDSYNC_STROBE_LINE=<offset> deploy/deploy.sh strobe   # Jetson host with an XR256
 ```
 
-`deploy.sh jetson` prints the UI address when rigd is up. Plug the iKonvert
-into a Jetson USB port; rigd finds it under `/dev/serial/by-id/`. Its DIP
-switches must all be ON (RAW mode) or nav stays silent.
-
-### 2. Each camera node
-
-Build the SD card and first boot per [`docs/PI-SETUP.md`](docs/PI-SETUP.md)
-(§2–§5), plug the camera and its Olive IMU into the Pi, then from the Jetson:
-
-```sh
-deploy/deploy.sh trust     cam1    # push the Jetson's ssh key (asks for the Pi password)
-deploy/deploy.sh provision cam1    # SDK, usbfs, chrony, build tools
-deploy/deploy.sh node      cam1    # build ilxctl, udev rules, Olive link, start services
-```
-
-Repeat for `cam2` (and `cam3` if fitted). `node` ends with
-`ilxctl: active   piagent: active`. It also points the node's chrony at the
-Jetson and makes the Olive the node's IMU. `ilxctl` is **always built on the
-node**: the Makefile probes `-mcpu=native`, so a binary built elsewhere SIGILLs.
-
-### 3. The XR256 strobe
-
-Wire the trigger board and 24 V supply per
-[`docs/xr256-jetson-trigger.md`](docs/xr256-jetson-trigger.md). Set the chosen
-header pin to GPIO with `sudo /opt/nvidia/jetson-io/jetson-io.py`, find its line
-offset with `gpioinfo`, then:
-
-```sh
-WILDSYNC_STROBE_LINE=<offset> deploy/deploy.sh strobe
-```
-
-This installs `piagent-strobe.service` (active-high, for the board's rising-edge
-input), registers the Jetson with rigd as the camera-less node `jetson`, and
-restarts rigd. Measure the pin's boot-time state before connecting the board
-(brief §2.2): it must not pulse during a power cycle.
-
-### 4. First run
-
-Open `http://192.168.1.29:9090` (or `localhost:9090` on the Jetson). The header
-should read **2/2 cameras**. Then follow the field manual's pre-dive checklist.
-
-### Updating
-
-`deploy.sh node camN` ships `src/*` and the node's Python files, rebuilds
-`ilxctl` on the node and restarts its services. rigd runs from this checkout,
-so after a `git pull` on the Jetson a rigd change takes effect on
-`sudo systemctl restart rigd` (and the strobe agent on
-`sudo systemctl restart piagent-strobe`).
+`ilxctl` is **always built on the node**: the Makefile probes `-mcpu=native`, so
+a binary built elsewhere SIGILLs. `deploy.sh node camN` also ships `src/*` and
+the node's Python files, so it is the update command too; rigd runs from the
+checkout, so a rigd change takes effect when rigd is restarted
+(`sudo systemctl restart rigd` on a Jetson, `launchctl kickstart -k
+gui/$(id -u)/org.wildtechnology.wildsync.rigd` on a Mac).
 
 ## Building `ilxctl`
 
@@ -262,7 +288,11 @@ curl -s localhost:9090/api/anomalies | python3 -m json.tool
 curl -s 192.168.1.201:8081/gpio/state | python3 -m json.tool
 ```
 
-Logs: `journalctl -u rigd -f` (and `-u piagent-strobe`) on the Jetson, `journalctl -u ilxctl -f` /
+The rig's own diagnostics are the first stop — `/api/diag`, `/api/anomalies`,
+`/gpio/state` and the event journal — before logging in to a machine.
+
+Logs: `journalctl -u rigd -f` (and `-u piagent-strobe`) on a Jetson host,
+`~/rig/rigd-launchd.log` on a Mac host, `journalctl -u ilxctl -f` /
 `-u piagent -f` on a node. Structured events also land in `~/rig/rigd.jsonl` and
 are served cursor-style from `GET /api/events?since=<seq>`.
 
@@ -279,15 +309,15 @@ python3 rig/tests/navtest.py               # nav integration over a real pty
 python3 rig/navlog.py --selftest           # raw NMEA log + replay
 ```
 
-All of these must pass. `soaktest` includes the per-file audit suites
-(`rig/tests/audit_*.py`); its one hardware-dependent check, `ilxctl builds
-(make)`, needs the Sony SDK staged.
+All of these must pass: each ends with `ALL PASS` or `PASS` and exits 0 when it
+is green. The number of checks grows with the suites, so none is quoted here.
+`soaktest` includes the per-file audit suites (`rig/tests/audit_*.py`); its one
+hardware-dependent check, `ilxctl builds (make)`, needs the Sony SDK staged.
 
 
 ## Operating notes
 
-Each of these has already cost a day. None of them look like what they are —
-every one presents as a software fault.
+Each of these presents as a software fault and is not one.
 
 - **A released GPIO is not high-Z.** The pad keeps the last requester's bias, and
   a Low `FOCUS` line is a permanent half-press: the camera reports every property
@@ -301,18 +331,20 @@ every one presents as a software fault.
   and `EXPOSURE` edges still land, so it looks exactly like a software fault.
   `slotStatus` still reads `OK`, because the card is *recognised* fine; it is the
   write that is hung. Read `slotWriting` instead. A 61 MP RAW is ~60–125 MB, so
-  sustained RAW-to-card needs a card that can actually take it.
+  sustained RAW-to-card needs a card that can actually take it (a V60/UHS-II
+  card is the rig's standard; about 250 rapid fires preceded the stall seen on
+  2026-08-16, so keep bench test batches modest and watch `slotWriting`).
 - **`usbfs_memory_mb` must be at least 150 (1000 on a Basler node), and it does not persist by itself.** The 16 MB
   Linux default drops the SDK's transfer session; the camera still connects, still
   answers property reads and still writes to its own card, so it presents as a
   broken camera. It is set on the kernel command line — `modprobe.d` does nothing
   here, because `usbcore` is built into the Pi kernel.
 - **`ilxctl` cannot recover from an unclean shutdown.** The camera's PTP session
-  stays stuck and the next start blocks before binding :8080. Recover with a USB
-  unbind/rebind — see `docs/HANDOFF.md` §2.2.
+  stays stuck and the next start blocks in the SDK connect. Recover with a USB
+  unbind/rebind — see `docs/PI-SETUP.md` §10.1.
 
-See `docs/HANDOFF.md` for current fleet state, open work and the discoveries
-behind these notes; `docs/future-tests.md` for what still needs measuring.
+`docs/PI-SETUP.md` §10 lists the node faults and their fixes; `docs/future-tests.md`
+lists what still needs measuring.
 
 ## Licence
 

@@ -8,12 +8,13 @@ One rigd runs on the Jetson. It:
     state a body rebooted into;
   * runs transects — synchronized capture, per-camera pull + rename + flight
     log, with nav and IMU stamped onto every frame;
-  * exposes a structured event/diag/anomaly surface for humans and for an AI
-    watcher to observe field faults and correct them live;
-  * serves a tabbed web UI (review / fleet / nav / imu / controls / events)
-    that runs with no AI in the loop.
+  * exposes a structured event/diag/anomaly surface for people and for watcher
+    scripts to observe field faults and correct them live;
+  * serves a tabbed web UI (review / transects / map / controls / nav / imu /
+    calib / diag / alerts / events) that needs nothing but a browser.
 
-Stdlib only, plus rig/nav.py (which itself needs pyserial). nav is optional:
+Standard library, plus rig/nav.py (which itself needs pyserial) and Pillow for
+the EXIF fallback that stamps a frame with no GPIO edge. nav is optional:
 without it, runs still work and the flight log simply carries empty nav columns.
 """
 
@@ -638,7 +639,7 @@ class Anomalies:
                     "ilxctl not answering (piagent is) - camera daemon wedged",
                     {"error": status.get("error"),
                      "last_seen_s": snap.get("age_s")},
-                    "the SDK session is stuck (HANDOFF §2.2): power-cycle the "
+                    "the SDK session is stuck (docs/PI-SETUP.md §10.1): power-cycle the "
                     "camera body first; if ilxctl still does not answer, on "
                     "the node: sudo pkill -9 -x ilxctl, USB unbind/bind, "
                     "sudo systemctl start ilxctl (or pull the Pi's PoE for "
@@ -713,8 +714,8 @@ class Anomalies:
                     sev="bad"))
             # The body answers but its property table is gone: no writable
             # map, no ISO, slotWriting unreported. That is the card-stall
-            # aftermath (HANDOFF §2.1: one frame the card will not accept
-            # locks the whole table) or a half-dead SDK session — NOT ten
+            # aftermath (README, Operating notes: one frame the card will not
+            # accept locks the whole table) or a half-dead SDK session — NOT ten
             # fields that each need attention. Say the one true thing and
             # hush the per-field divergence while it lasts.
             # A locked property table (the card-stall aftermath): the body
@@ -1421,7 +1422,7 @@ class Rig:
                          node=node)
         return {"ok": True, "cancelling": node}
 
-    # The wedge (HANDOFF §2.2, reproduced live 2026-08-23 on cam2): a body
+    # The wedge (docs/PI-SETUP.md §10.1, reproduced live 2026-08-23 on cam2): a body
     # whose transfer subsystem is stuck never publishes "card index ready", so
     # drain.py's _wait_index gives up after 90 s - twice, because it retries -
     # and the whole auto-drain after every Stop burns 3 minutes and achieves

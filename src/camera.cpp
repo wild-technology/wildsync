@@ -322,7 +322,7 @@ std::string crErrorString(CrInt32u err) {
 // invented divergence alarm. That argument is right about the lie and wrong
 // about the trade: SetDeviceProperty, SendCommand, the choice-list read the
 // X3 validation added, cardList/cardDelete and live view all took the mutex
-// unconditionally, so a body wedged inside an SDK call (HANDOFF 2.1: one
+// unconditionally, so a body wedged inside an SDK call (a stuck card write: one
 // frame the card will not accept locks the property table while slotStatus
 // still reads OK) stranded one httplib worker per request. The pool is
 // max(8, hw-1) = 8 on a Pi 4, and rigd's reconcile pushes into a body that
@@ -797,8 +797,8 @@ bool Camera::disconnect(std::string* err) {
     // X7: bounded. Releasing the handle is exactly what a wedged SDK will not
     // let us do, and blocking here stranded the worker of the one request an
     // operator reaches for to recover the node. Say so instead; the session
-    // stays open, which HANDOFF 2.2 already resolves with a daemon restart
-    // plus a USB rebind.
+    // stays open, which docs/PI-SETUP.md 10.1 already resolves with a daemon
+    // restart plus a USB rebind.
     SdkHold hold(*this, "disconnect", kSdkWait);
     if (!hold) {
         if (err) *err = hold.error();

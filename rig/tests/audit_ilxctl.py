@@ -8,7 +8,7 @@ audit live at the HTTP surface, before the SDK is reached:
 
 X2  /api/connect during a connect already in flight walked into enumerate()
     and blocked on the SDK mutex behind it - for ever against the wedged
-    SDK::Connect of HANDOFF 2.2, and httplib serves requests from a fixed
+    SDK::Connect of docs/PI-SETUP.md 10.1, and httplib serves requests from a fixed
     thread pool, so eight of those and the daemon stopped answering
     /api/status too (the bind-before-connect fix defeated).  Camera-less the
     same serialization is measurable and the pool exhaustion is reproducible:
@@ -41,8 +41,9 @@ X1/X6 (tripwires) contract C2's readback keys and the card-list
 X7  The X2 pass bounded only the READ side of the SDK mutex.  Every property
     WRITE (setProp/setPropForced/sendCmd), the choice-list read the X3
     validation added, cardList/cardDelete, live view and disconnect still took
-    it with a plain lock_guard, so a body wedged inside an SDK call (HANDOFF
-    2.1) stranded one httplib worker per request until the pool of 8 was gone
+    it with a plain lock_guard, so a body wedged inside an SDK call (a stuck
+    card write, README Operating notes) stranded one httplib worker per request
+    until the pool of 8 was gone
     and the node answered nothing at all - /api/status included, which was the
     one thing still diagnosing it correctly.  Now: the ACQUISITION is bounded
     (the call itself is not, so a slow write still returns its real result), a

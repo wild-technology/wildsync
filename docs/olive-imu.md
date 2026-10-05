@@ -1,37 +1,74 @@
-# Olive olixVision X1 — second IMU: bring-up runbook + fusion roadmap
+# Olive olixVision X1 IMU — setup, configuration and fusion roadmap
 
-Written 2026-08-27, the night before first power-up. The unit is physically
-mounted at cam2 but not yet cabled, so **everything below the "software in
-place" section is a plan against an unconfirmed wire format** — the driver was
-built tolerant for exactly that reason, and the first job tomorrow is to let
-it tell us what the device actually speaks.
+Each camera carries an **Olive Robotics olixVision X1** IMU on its node, and each
+camera's `flight_log.csv` takes its attitude from that camera's own IMU. (The
+2026-08-20 field transects used one Yahboom YB-MRA02 on cam1 instead: its
+solution is in both cameras' logs. The Olives were first run on the rig on
+2026-08-27.) This file covers how the Olive connects, how it is installed and
+checked, the driver's configuration, and the fusion design that is **not yet
+implemented**.
 
-## Software in place tonight
+## How it connects
+
+The unit's USB-C is a CDC-Ethernet gadget, not a serial port. `deploy.sh node`
+pins it on the node as interface `olive0` (Pi `192.168.7.2/24`, unit
+`192.168.7.100`, a subnet of its own that cannot collide with the rig's
+192.168.1.0/24), matched on the `cdc_ether` driver in
+`/etc/netplan/60-wildsync-olive.yaml`. The unit serves, among others, a web UI on
+80, ssh on 22, JupyterLab on 8888, and WebSocket streams on 5400, 5500, 5530 and
+7070. **Port 5500 is the sensor stream**: protobuf-framed binary messages
+carrying quaternion, accelerometer (m/s²), gyro (rad/s), magnetometer (mG) and
+identity strings (`AHRS`, `x1-pro`). The ROS 2 / DDS path the unit advertises
+needs a DDS stack the Pi image cannot build, so it is not used.
+
+`rig/olive_ws_bridge.py` (`deploy/olive-bridge.service`, installed on every node;
+it idles harmlessly where no Olive exists) decodes that stream without a schema,
+converts it to the rig's units (degrees, g, deg/s) and sends one flat JSON
+datagram per sample to `udp://127.0.0.1:9901`. `piagent` reads it through its
+Olive driver (`rig/imu_olive.py`) and serves it like any other IMU. The unit's own
+clock is wrong by about two years, so samples carry the arrival epoch only.
 
 | piece | what it does |
 |---|---|
-| `rig/imu_olive.py` | driver; same duck-typed interface as `imu_yb.ImuReader` (`probe()`, `read()/latest()/window()`, `rate_hz()/frame_rate_hz()/rate_measured()`, `rejected_frames()`, `last_attitude_epoch()`, `checksum_state()`, `orientation_frozen_s()`); three transports (serial CDC-ACM, UDP, sim) behind one tolerant codec |
-| `rig/piagent.py` | a second IMU slot `Imu2` (the acquire/health machinery of `Imu`, parameterized); config via `PIAGENT_IMU2`; new `GET /imu2/latest` and `GET /imu2/window?t0=&t1=`; `/health` `imu` section gains a nested `imu2` sub-object |
-| `rig/tests/audit_piagent.py` | P10 section: absent-by-default byte-compatibility, endpoint shapes, wedged-slot isolation, spec parsing, per-slot floors, an end-to-end sim acquisition, garbage-ingest safety. Suite: **104 passed, 0 failed** offline |
+| `rig/olive_ws_bridge.py`, `deploy/olive-bridge.service` | the WebSocket-to-UDP relay above |
+| `rig/imu_olive.py` | the driver; the same duck-typed interface as `imu_yb.ImuReader` (`probe()`, `latest()`/`window()`, `rate_hz()`/`frame_rate_hz()`, `rejected_frames()`, `last_attitude_epoch()`, `checksum_state()`, `orientation_frozen_s()`); three transports (serial CDC-ACM, UDP, simulated) behind one tolerant codec |
+| `rig/piagent.py` | two IMU slots: the primary (`/imu/*`) and a second (`/imu2/*`), each with the full acquire/health machinery; `/health`'s `imu` section reports both |
+| `deploy/deploy.sh node` | writes `/etc/default/piagent` so the Olive is the node's IMU (below) |
+| `rig/tests/audit_piagent.py` | offline tests for the slots: endpoint shapes, wedged-slot isolation, spec parsing, per-slot floors, an end-to-end simulated acquisition, garbage-ingest safety |
 
-**Byte-compatibility contract:** with the olive absent, every pre-existing
-payload (`/imu/latest`, `/imu/window`, `/health`'s `imu` keys) is unchanged —
-the only addition anywhere is the `imu2` sub-object inside `imu` and the two
-new endpoints. rigd, run.py and flight_log need **no changes** for tonight's
-deploy; they keep reading the YB exactly as before.
+## Installing and checking
 
-### Why `/imu2/*` endpoints and not an `imu2` key inside `/imu/*`
+`deploy/deploy.sh node camN` configures the Olive: the `olive0` link, the bridge
+unit and `PIAGENT_IMU=olive:udp:9901` with `PIAGENT_IMU2=off` in
+`/etc/default/piagent`, which puts the Olive on the primary slot. For a node that
+still carries the Yahboom unit, `WILDSYNC_NODE_IMU=yb deploy/deploy.sh node camN`
+leaves the Yahboom primary and puts the Olive on the second slot
+(`PIAGENT_IMU2=olive:udp:9901`). The check, from `docs/PI-SETUP.md` §6.1:
 
-`/imu/latest`'s success payload **is** the bare sample dict (no envelope), so
-there is nowhere to hang a sub-object without polluting the key namespace
-`flight_log` reads by name. Worse, rigd elects the fleet's **master
-orientation source** by probing `/imu/latest` on every node and taking the
-first answer with an `epoch` — if cam2's olive answered there, master
-election would become a race between the two units. Separate endpoints keep
-the olive invisible to that election until the host is explicitly taught
-about it.
+```sh
+ssh ubuntu@192.168.1.20N 'ip -br addr show olive0; systemctl is-active olive-bridge'
+curl -s 192.168.1.20N:8081/health | python3 -c "import sys,json; print(json.load(sys.stdin)['imu'])"
+```
 
-### Config: `PIAGENT_IMU2`
+`present: true` with an `attitude_hz` around 15 is healthy. If the unit is not
+found, check its USB-C cable and `systemctl status olive-bridge` on the node. The
+IMU tab shows each Olive live, and the Calib tab's **Calibrate both** records the
+gyro bias, accelerometer norm and mounting attitude of each IMU from a ten-second
+still window (refused if anything moves; saved to `~/rig/imu_calibration.json`).
+The Olive's AHRS stream reports a zeroed gyro at rest, which is its own on-device
+bias correction.
+
+**Physical check.** With the boat still, `|(ax,ay,az)|` should be about 1 g and
+roll and pitch near the mount's true attitude; rotate the housing by hand and
+watch roll, pitch and yaw move in the right sense, in degrees. `unit_mode` in the
+sample should read `si` or `rig`; `unknown` means the unit gate could not see
+gravity and the numbers are unverified pass-through.
+
+## Configuration: `PIAGENT_IMU` and `PIAGENT_IMU2`
+
+Set in the piagent service environment (`/etc/default/piagent`) and restart
+piagent; the slot re-probes every ~4 s, so plugging a unit in brings it online
+with no configuration.
 
 | value | behaviour |
 |---|---|
@@ -42,149 +79,62 @@ about it.
 | `olive:udp` / `olive:udp:9901` | UDP listener on the given port (default from `OLIVE_UDP_PORT`, 9901) |
 | `olive:sim` | synthetic stream (offline testing) |
 
-Set it in the piagent service environment (same mechanism as `PIAGENT_PORT`),
-restart piagent — or set nothing: auto-probe re-runs every ~4 s, so simply
-plugging the unit in should bring it online with **zero config**.
+`PIAGENT_IMU` selects the primary-slot driver: unset or `yb` keeps the Yahboom
+reader on `/imu/*`; `olive[:spec]` (the same spec forms) puts the Olive on the
+primary slot and turns slot 2 off. Run the driver by hand with `python3 rig/imu_olive.py` (add a device, `udp:9901`
+or `sim`): `present: true` with the codec and rates, or `present: false` with the
+tail of the undecoded stream as `raw_tail_hex`.
 
-## Bring-up tomorrow
+### Why `/imu2/*` is a separate endpoint
 
-### Case A — USB-C into cam2's Pi (CDC-ACM serial)
+`/imu/latest`'s success payload **is** the bare sample dict (no envelope), so
+there is nowhere to hang a sub-object without polluting the key namespace
+`flight_log` reads by name. And rigd elects the fleet's **master orientation
+source** by probing `/imu/latest` on every node and taking the first answer with
+an `epoch`; a unit answering there would turn master election into a race. With
+the second slot absent every pre-existing payload is byte-identical.
 
-1. Cable the unit; on cam2's Pi: `ls /dev/ttyACM*` and `dmesg | tail -20`.
-   No ttyACM ⇒ cable/power problem (or the unit's USB is configured as
-   network-only — see the ROS note below), stop here and fix that first.
-2. Probe by hand before trusting the automation:
-   `python3 ~/rig/imu_olive.py` (or with the device:
-   `python3 ~/rig/imu_olive.py /dev/ttyACM0`). Three possible outcomes:
-   * `present: true` with `codec`, `sample_rate_hz`, `frame_rate_hz`, then 20
-     live sample lines — done, skip to step 4.
-   * `present: false` with a note `N bytes seen ... undecoded` and a
-     `raw_tail_hex` — **this is the designed outcome for a format the codec
-     has not met.** Copy the hex tail; the codec cascade and where to extend
-     it are in the next section. Nothing needs a redeploy to keep probing.
-   * `no data` — the port enumerates but streams nothing: the unit likely
-     needs its streaming mode enabled in Olive's own configuration (olixOS
-     web UI / `olix` CLI over the same USB network interface). Configure it
-     to stream IMU data on the serial CDC or as UDP, then re-probe.
-3. If the by-hand probe decodes, piagent's auto-probe will too (same code).
-   The slot re-probes every ~4 s; watch it come online:
-   `curl -s cam2:8081/health | python3 -m json.tool` → `imu.imu2.present`.
-   While it is still absent, `imu.imu2.probe.notes` / `.probe.raw_tail_hex`
-   carry the last probe's evidence, so this is diagnosable from the host
-   without a shell on the Pi.
-4. Verify payloads:
-   * `curl -s cam2:8081/imu2/latest` → a sample dict (shape below).
-   * `curl -s "cam2:8081/imu2/window?t0=$(date +%s -d '-10 sec')&t1=$(date +%s)"`
-     → `{present:true, samples:[...]}` (ring holds ≥ 60 s).
-   * `/health` `imu.imu2`: `attitude_hz`, `frame_hz`, `imu_rate_low`,
-     `rejected_frames`, `checksum` (which for the olive carries the codec
-     lock, `unit_mode`, error counters and — while undecoded — the raw tail).
-5. **Physical sanity, do not skip:** with the boat still, `|(ax,ay,az)| ≈
-   1 g` and roll/pitch near the mount's true attitude; rotate the housing by
-   hand and watch roll/pitch/yaw move in the right sense and in degrees;
-   `unit_mode` should read `si` (ROS-native stream) or `rig` — if it reads
-   `unknown`, the unit-inference gate could not see gravity and the numbers
-   are pass-through: treat them as unverified.
+## Sample shape (`/imu/latest`, `/imu2/latest`, window entries)
 
-Port-sharing note: imu_yb's own probe scans `/dev/ttyACM*` too (every ~4 s,
-0.5 s dwell). imu_olive opens its port `exclusive=True`, so once the olive
-reader holds the port the YB probe fails instantly instead of siphoning
-bytes. If the olive probe itself reports `could not exclusively lock`, the
-other slot's dwell was mid-flight — it clears on the next probe cycle.
+Same keys as the YB where the quantity is the same — flight_log's readers need
+nothing new: `epoch, pitch, roll, yaw, heading` (deg), `ax, ay, az` (g),
+`gx, gy, gz` (dps), `mx, my, mz` (as received; units unverified), `temp` (°C),
+`pressure_pa` (null — no barometer claimed), `qw..qz` (when the stream carries
+quaternions), `fresh`. Olive extras: `src` (transport), `unit_mode`, `device_ts`
+(when the stream carries one).
 
-### Case B — Ethernet to the host (UDP raw streaming)
+**Timestamping caveat.** Olive epochs are ARRIVAL-stamped (the read/recvfrom
+instant). Unlike imu_yb there is no measured wire cadence to count byte-times
+against, so these are good to a few ms on an idle Pi and worse under load. Do not
+bind them to capture instants at better than ~10 ms. The flight log takes the
+nearest sample within 100 ms.
 
-The X1 is ROS 2 native. The rig deliberately runs **no DDS stack** on the
-nodes, so the Ethernet path is either the unit's raw/UDP streaming mode or a
-minimal bridge:
+## The tolerant codec
 
-1. Preferred: configure the unit (olixOS) to stream IMU data as UDP to the
-   listener's IP, port 9901. The codec accepts JSON, `$`-CSV, or a bare
-   float32/float64 vector per datagram (a leading 4-byte CDR encapsulation
-   header is skipped automatically).
-2. Fallback bridge (if only ROS 2 topics are available): on any machine that
-   can see the unit's DDS domain, ~20 lines of rclpy — subscribe
-   `sensor_msgs/Imu`, `json.dumps` the fields, `sock.sendto` one line per
-   message to the listener. The driver's JSON mapper already understands the
-   ROS message shape (`orientation{x,y,z,w}`, `angular_velocity{x,y,z}`,
-   `linear_acceleration{x,y,z}`) verbatim.
-3. Who listens: any piagent with `PIAGENT_IMU2=olive:udp:9901` serves it on
-   its `/imu2/*` — point the unit at that node. If instead the stream should
-   terminate on the run host itself, `imu_olive.py` runs standalone anywhere
-   (`python3 rig/imu_olive.py udp:9901`); wiring a host-side slot into rigd
-   is deliberately NOT built tonight — decide after we see which transport
-   the hardware favours. **Watch the subnet trap** (memory:
-   rig-network-subnet-collision) before assuming the datagrams can reach the
-   host at all.
-
-### Case C — no hardware at all (works today)
-
-`PIAGENT_IMU2=olive:sim` or `python3 rig/imu_olive.py sim` exercises the
-whole path: NMEA-style CSV in SI units → checksum verify → unit inference →
-rig-unit samples at ~50 Hz. This is what the audit suite runs.
-
-## The tolerant codec — what it accepts, where to fix a wrong guess
-
-Candidate encodings audition until one produces `LOCK_N=4` consecutive good
-records; the winner is then enforced and failures become counted rejects:
+`rig/imu_olive.py` accepts several encodings, auditioned until one produces
+`LOCK_N=4` consecutive good records; the winner is then enforced and failures
+become counted rejects:
 
 * `json` — one object per line/datagram, keys by name (ROS shapes included)
 * `nmea_csv` — `$TAG,f1,...*hh`, XOR checksum **verified when present**
 * `csv` — bare comma-separated floats
 * `bin_u8` / `bin_u16` — `[len][len bytes of float32]` over the byte stream
-* `udp_f32` / `udp_f64` — a bare float vector per datagram (CDR header
-  skipped)
+* `udp_f32` / `udp_f64` — a bare float vector per datagram (CDR header skipped)
 
-Unlabeled numeric records use ONE documented field-order guess
-(`_map_numeric`): `[device_ts?] [qw qx qy qz | roll pitch yaw] [ax ay az]
-[gx gy gz] [mx my mz] [temp]` — quaternion claimed only at unit norm within
-1e-3 (a fusion output is normalized; a loose band let euler records
-masquerade). Units are inferred from gravity (`_UnitGate`): median |accel| of
-the first 16 inertial records ≈ 1 ⇒ already g/deg/dps, ≈ 9.8 ⇒ SI
-(rad, m/s², rad/s), converted before anything is published. Samples are
-**buffered until the verdict** so maybe-radians can never reach a consumer.
-
-When tomorrow's stream disagrees with a guess, each has exactly one home:
-
-| wrong guess | fix in `rig/imu_olive.py` |
-|---|---|
-| field order | `_map_numeric` |
-| bare-list quaternion element order | `_vec` (the `n == 4` branch) |
-| units | `_UnitGate` (or force by post-lock config once known) |
-| framing | add the real frame spec to `_Codec` and let it win the audition |
-
-Every decode failure increments `rejected_frames()`; `checksum_state()`
-carries `algo` (locked codec), `unit_mode`, `errors`/`last_error`,
-`bytes_seen`, and `raw_tail_hex` while undecoded. **A rising reject count
-with a locked codec means a wrong guess is being caught by the plausibility
-gates — that is the signal to go read the raw tail, not to loosen the gate.**
-
-## Sample shape (`/imu2/latest`, `/imu2/window` entries)
-
-Same keys as the YB where the quantity is the same — flight_log's readers
-need nothing new: `epoch, pitch, roll, yaw, heading` (deg), `ax, ay, az`
-(g), `gx, gy, gz` (dps), `mx, my, mz` (as received; units unverified),
-`temp` (°C), `pressure_pa` (null — no baro claimed yet), `qw..qz` (when the
-stream carries quaternions), `fresh`. Olive extras: `src` (transport),
-`unit_mode`, `device_ts` (when the stream carries one).
-
-**Timestamping caveat, do not forget it:** olive epochs are ARRIVAL-stamped
-(the read/recvfrom instant). Unlike imu_yb there is no measured wire cadence
-to count byte-times against yet, so these are bring-up-grade epochs — a few
-ms on an idle Pi, worse under load. Do not bind them to capture instants at
-better than ~10 ms until the device_ts correlation below is done.
-
-## Post-bring-up tightening (in order)
-
-1. Measure the real cadences; tighten `Imu2.FRAME_FLOOR_HZ` (now a
-   deliberately-slack 10 Hz) and `PROBE_BAND` in `rig/piagent.py` from the
-   probe figures, the same way the YB's floors were derived from its own
-   measured normal.
-2. Map `device_ts` (if present) against arrival time over a few minutes:
-   constant slope + offset ⇒ convert to wall time and replace arrival
-   epochs, imu_yb-style honesty about the residual.
-3. Confirm mag units/frame and whether the X1's fusion already uses it.
-4. Decide the Ethernet-vs-serial question on measured jitter, not taste.
+The bridge emits JSON, which is what the rig uses. Unlabeled numeric records use
+one documented field order (`_map_numeric`): `[device_ts?] [qw qx qy qz | roll
+pitch yaw] [ax ay az] [gx gy gz] [mx my mz] [temp]`, with a quaternion claimed
+only at unit norm within 1e-3. Units are inferred from gravity (`_UnitGate`):
+median |accel| of the first 16 inertial records ≈ 1 ⇒ already g/deg/dps, ≈ 9.8 ⇒
+SI (rad, m/s², rad/s), converted before anything is published; samples are
+buffered until the verdict so maybe-radians never reach a consumer. If a stream
+disagrees with a guess, each has one home in `rig/imu_olive.py`: field order in
+`_map_numeric`, bare-list quaternion order in `_vec`, units in `_UnitGate`,
+framing in `_Codec`. Every decode failure increments `rejected_frames()`;
+`checksum_state()` carries the locked codec, `unit_mode`, error counters and, while
+undecoded, the raw tail. **A rising reject count with a locked codec means a
+plausibility gate is catching a wrong guess — read the raw tail, do not loosen the
+gate.**
 
 ## Fusion roadmap — yb IMU + Olive IMU + magnetic heading + GPS
 
@@ -193,7 +143,7 @@ better than ~10 ms until the device_ts correlation below is done.
 | source | quantities | rate | clock | where it enters |
 |---|---|---|---|---|
 | YB-MRA02 (cam1 Pi) | roll/pitch/yaw(+quat), accel g, gyro dps, mag raw, baro | ~50 Hz attitude / ~174 Hz frames | node clock, wire-dated to ~1 ms + fusion lag unknown | `/imu/window` (host converts node→host epoch via rigcore offsets) |
-| Olive X1 (cam2 Pi or host) | same keys; quality/rate TBD (expect 100–400 Hz) | TBD | arrival-stamped (see caveat) | `/imu2/window` |
+| Olive X1 (each camera's Pi) | same keys; about 15 Hz attitude as received at piagent | as received | arrival-stamped (see caveat) | `/imu/window` (primary slot) or `/imu2/window` |
 | Boat heading | PGN 127250 vessel heading (+deviation, variation when the sender knows them) | ~10 Hz | host at NMEA arrival | `rig/nav.py` NavReader |
 | GPS | PGN 129025 lat/lon rapid (~10 Hz), 129029 full GNSS (1 Hz, alt + fix quality), 129026 COG/SOG (~10 Hz) | 1–10 Hz | host; TimeAuthority disciplines from 126992 | `rig/nav.py` |
 
@@ -264,8 +214,9 @@ rule as every wire change in this repo.
 
 ### Phases (each independently useful)
 
-* **Phase 0 — tonight's code already does it:** both IMUs ring-buffered and
-  served; a run records both raw streams. No fusion, no risk.
+* **Phase 0 — in place:** each IMU is ring-buffered and served by its node, and
+  each camera's flight log takes attitude from its own node's IMU. No fusion, no
+  risk.
 * **Phase 1 — offline:** a standalone script replays a run's flight_log +
   `/imu2` ring dump + navlog through the ESKF; validate against
   `stereo_check` reprojection before anything touches the live path.
@@ -280,17 +231,17 @@ devices already run their own onboard fusion — the host's job is exactly the
 part a complementary filter cannot do (bias estimation, absolute heading,
 position, and cross-IMU consistency with honest covariances).
 
-## Open questions for tomorrow
+## Open items
 
-1. Which transport does the unit actually present — CDC-ACM serial, USB
-   network interface, or Ethernet-only ROS 2? (Determines Case A vs B.)
-2. What does it stream un-configured, if anything — and what does the raw
-   tail look like if the codec doesn't lock? (Paste the hex into the next
-   session; the codec cascade is built to be extended in one place.)
-3. Real rates and units (`unit_mode` verdict), then tighten the floors.
-4. Does its stream carry a device timestamp, and is it disciplined?
-5. Where should the UDP stream terminate if Case B wins — a camera Pi
-   (served via `/imu2/*` like tonight's plumbing assumes) or the run host
-   (needs the standalone-reader decision)?
-6. Mounting rotation `R_12` between the two IMU housings — survey at the
+1. **Device timestamp.** The unit's own clock is ~2 years wrong, so samples carry
+   arrival epochs only. Whether the stream carries a usable device timestamp that
+   could be correlated with arrival time (constant slope + offset) is not
+   established.
+2. **Rate and floors.** Measure the real cadence over a long run and tighten
+   `Imu2.FRAME_FLOOR_HZ` (a deliberately slack 10 Hz) and `PROBE_BAND` in
+   `rig/piagent.py` from it, as the YB's floors were derived from its own
+   measured normal.
+3. **Magnetometer.** Units and frame of the `mx..mz` values, and whether the X1's
+   own fusion uses them, are unconfirmed.
+4. **Mounting rotation `R_12`** between the two IMU housings: survey it at the
    dock; the fusion's cross-IMU residual needs it first.

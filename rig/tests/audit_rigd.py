@@ -1259,7 +1259,7 @@ def t_ingest_report(h):
                   evs[0].get("sev") == "warn" and "0 matched" in evs[0]["msg"]
                   and "169 unmatched" in evs[0]["msg"],
                   json.dumps(evs[0])[:190])
-            check("...and carries the totals for the AI watcher to read",
+            check("...and carries the totals for a watcher to read",
                   ((evs[0].get("ctx") or {}).get("ingest") or {})
                   .get("cards") == 169, json.dumps(evs[0].get("ctx"))[:160])
         check("/api/drain shows the ingest result beside 'deleted from card'",

@@ -263,8 +263,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=gp
 # USB access for ilxctl, which runs as `ubuntu` (deploy/ilxctl.service), not
 # root. /dev/bus/usb/* is root-only for writes on Ubuntu Server and a system
 # service gets no seat ACL, so without this a fresh node starts ilxctl cleanly
-# and then finds no camera. Sony's vendor ID (054c, from the HANDOFF 2.2
-# unbind recipe) is matched without a product ID because the body enumerates
+# and then finds no camera. Sony's vendor ID (054c, as in the unbind recipe of
+# docs/PI-SETUP.md 10.1) is matched without a product ID because the body enumerates
 # with a different product ID per USB mode.
 echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="054c", GROUP="plugdev", MODE="0660"' | \
   sudo tee /etc/udev/rules.d/99-wildsync-sony.rules >/dev/null
@@ -283,7 +283,8 @@ sudo cp /tmp/ilxctl.service /etc/systemd/system/ilxctl.service
 # StartLimitBurst=5 with RestartSec=5 means a fast-exiting ilxctl burns its
 # five starts in ~25 s and systemd then REFUSES manual starts with
 # "start-limit-hit" - which breaks this deploy and, worse, the last step of
-# HANDOFF 2.2's un-wedge recipe. Clear the counter before every restart.
+# the un-wedge recipe of docs/PI-SETUP.md 10.1. Clear the counter before every
+# restart.
 sudo systemctl reset-failed ilxctl 2>/dev/null || true
 # IMU selection, rendered on the deploying host (see WILDSYNC_NODE_IMU above).
 sudo cp /tmp/wildsync-piagent.env /etc/default/piagent
@@ -320,7 +321,7 @@ sudo systemctl enable piagent
 sudo systemctl restart piagent   # enable --now is a no-op on a running unit: the new file was never loaded
 sudo systemctl enable ilxctl >/dev/null 2>&1
 # Against a WEDGED daemon this now waits out TimeoutStopSec=45 instead of
-# hanging for ever (HANDOFF 2.2). It is slow, not stuck - do not Ctrl-C it.
+# hanging for ever (docs/PI-SETUP.md 10.1). It is slow, not stuck - do not Ctrl-C it.
 sudo systemctl restart ilxctl
 sleep 4
 echo "  ilxctl: $(systemctl is-active ilxctl)   piagent: $(systemctl is-active piagent)"

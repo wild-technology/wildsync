@@ -19,7 +19,7 @@ fine. Frames are read back from the node spools exactly like the Review tab
 reads them; nothing here touches the cards.
 
 The saved artifact (~/rig/stereo_calibration.json) is the wire-in the stereo
-VSLAM documents (docs/vslam-jetson.md): K/dist per camera, R, T, baseline.
+VSLAM documents (docs/vslam.md): K/dist per camera, R, T, baseline.
 vslam.load_stereo_calibration() consumes it.
 
 IMU CALIBRATION

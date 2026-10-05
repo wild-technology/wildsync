@@ -4,19 +4,19 @@ Research brief for triggering the **Smart Vision Lights XR256** strobe from a
 **Jetson Orin NX** acting as the rig's command/control computer, so that one
 flash exposes both ILX-LR1 bodies on sync.
 
-> **Scope change.** `docs/harness-and-strobe.md` and `docs/strobe-trigger.md`
-> declared the XR256 out of scope in favour of the Bolt VB-22. This brief
-> reverses that: the XR256 is back in scope, and the trigger moves off cam1's Pi
-> onto the Jetson — wiring anything to either Pi is difficult in the field. The
-> VB-22 analysis is not wasted: the *topology* it settled carries over intact.
+> **Scope.** The XR256 is the rig's strobe, and its trigger is on the Jetson
+> host, not on a camera Pi — wiring anything to either Pi is difficult in the
+> field. It replaces the earlier Bolt VB-22 contact-closure design
+> (`docs/strobe-trigger.md`, still supported by `piagent`); the *topology* that
+> design settled carries over intact.
 > Datasheet: `docs/XR256_Datasheet.pdf` (SVL, Rev 2020/06/15).
 
-**Status 2026-09-21:** software in place — `piagent` runs on the Jetson in its
+**Status:** software in place (2026-09-21) — `piagent` runs on the Jetson in its
 strobe role (`PIAGENT_ROLE=strobe`, active-high line for this board), installed
 by `deploy/deploy.sh strobe`, which registers the Jetson with rigd as the
-camera-less node `jetson` (README, Install §3). The bench tests in §6 still
-gate field use. Originally (2026-08-26) research only. The two
-mandatory hardware items are a **trigger interface board** (a bare Jetson GPIO
+camera-less node `jetson` (`docs/INSTALL.md`, "The strobe node"). The bench tests
+in §6 still gate field use, and the XR256 has not yet been fired with the camera
+array. The two mandatory hardware items are a **trigger interface board** (a bare Jetson GPIO
 cannot trigger this light) and a **regulated 24 V supply** sized for the
 light's recharge bursts.
 
@@ -199,8 +199,7 @@ second light, not a longer pulse.
 
 ## 5. Software work list
 
-Status as of 2026-09-21 — items 1–4 and 6 are done; 5 is a bench measurement
-(§6 test 7):
+Items 1–4 and 6 are done; 5 is a bench measurement (§6 test 7):
 
 1. **Strobe node concept.** *Done:* `deploy.sh strobe` adds `jetson` to
    `~/rig/nodes.json` with its camera off. `set_strobe` validates `node` against the camera
@@ -235,10 +234,8 @@ Status as of 2026-09-21 — items 1–4 and 6 are done; 5 is a bench measurement
    verify the Jetson's `late_ms` distribution under survey load matches the
    Pis' sub-ms behaviour (§6 test 7).
 6. **Docs.** *Done:* FIELD-RUN and the field manual carry the XR256 setup
-   and use. `harness-and-strobe.md` and `strobe-trigger.md` both declare the
-   XR256 out of scope; revise once this brief is accepted. `FIELD-RUN.md`
-   known-limits (§"No strobe yet", recycle ceiling, battery telemetry) change
-   materially with this light.
+   and use, and `harness-and-strobe.md` and `strobe-trigger.md` describe both
+   lights.
 
 The shutter conflict flagged in FIELD-RUN carries over unchanged: the fleet
 default is 1/200, strobe work wants **1/30 or slower**; `set_strobe` already

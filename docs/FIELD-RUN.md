@@ -1,21 +1,23 @@
 # Field run — checklist and operating guide
 
 The drive-it-on-the-boat sheet. The operator's guide is the field manual,
-`docs/USER-GUIDE.html`; installing from scratch is `README.md` (Install) and
-`docs/PI-SETUP.md`. rigd runs on the Jetson; each camera's Pi runs ilxctl +
-piagent + olive-bridge; the Jetson also fires the XR256.
+`docs/USER-GUIDE.html`; installing from scratch is `docs/INSTALL.md`. rigd runs
+on the rig host, which is a **Jetson Orin NX** (the reference configuration
+below) or a **Mac**; each camera's Pi runs ilxctl + piagent + olive-bridge. On a
+Jetson host the Jetson also fires the XR256. Where the two hosts differ, the
+text says so.
 
 ## Topology
 
 | | |
 |---|---|
-| rigd host | Jetson Orin NX, 192.168.1.29, systemd `rigd`, UI at http://192.168.1.29:9090 (`localhost:9090` on the Jetson) |
-| strobe | XR256, triggered from a Jetson GPIO through the opto board; systemd `piagent-strobe`; appears in the fleet as the camera-less node `jetson` |
+| rigd host | **Jetson Orin NX:** 192.168.1.29, systemd `rigd`, UI at http://192.168.1.29:9090 (`localhost:9090` on the Jetson). **Mac:** launchd agent `org.wildtechnology.wildsync.rigd`, UI at `http://localhost:9090`, log `~/rig/rigd-launchd.log` |
+| strobe | XR256, triggered from a Jetson GPIO through the opto board; systemd `piagent-strobe`; appears in the fleet as the camera-less node `jetson`. Jetson host only. It has never been connected or fired in a field run; the XR256 has not yet been fired with the camera array |
 | cam1 | Pi 5, 192.168.1.201, **on its own 802.3at Mode-A PoE injector** (NOT the switch) |
 | cam2 | Pi 4, 192.168.1.202, on the Ubiquiti 2.5G PoE switch |
 | IMUs | one Olive olixVision per camera, on that camera's Pi (USB-C, `olive0`); each camera's flight log carries its own IMU's attitude |
-| clocks | the Jetson is the chrony master; the Pis follow it and peer each other as a fallback (~0.6 ms apart with no upstream) |
-| nav | Subsonus RTK antenna on the NMEA 2000 backbone → iKonvert → Jetson USB (`/dev/serial/by-id/usb-FTDI_…`); **iKonvert DIP switches all ON for RAW mode** or nav stays silent |
+| clocks | **Jetson host:** the Jetson is the chrony master; the Pis follow it and peer each other as a fallback. **Mac host:** not a master; the Pis peer each other (~0.6 ms apart with no upstream) and rigd corrects for the host's offset |
+| nav | Subsonus RTK antenna on the NMEA 2000 backbone → iKonvert → the host's USB (`/dev/serial/by-id/usb-FTDI_…` on a Jetson, `/dev/cu.usbserial-…` on a Mac); **iKonvert DIP switches all ON for RAW mode** or nav stays silent |
 
 **Why cam1 is on an injector:** two nodes firing in sync drew more than the
 switch's PoE budget and it dropped a port every time (measured; not a Pi
@@ -27,7 +29,7 @@ the port power-cycle events.
 ## Pre-dive checklist
 
 1. **Power the injector and the switch; confirm both nodes.** UI header shows
-   `2/2 cameras`. Or, on the Jetson:
+   `2/2 cameras`. Or, on the host:
    `curl -s localhost:9090/api/fleet | python3 -m json.tool`.
    **Open or create the project** on the first screen (one per campaign). Its
    transects, drained RAWs and exports live under
@@ -69,17 +71,18 @@ the port power-cycle events.
    will say "STATIC fix in use"; that is a choice, hit Start anyway.
    **IMUs:** the IMU tab shows both Olives live (~15 Hz). If one is absent,
    check its USB-C cable and `systemctl status olive-bridge` on that Pi.
-6. **Disk.** The project folder on the Jetson wants room: a Small JPEG is
+6. **Disk.** The project folder on the host wants room: a Small JPEG is
    ~200 KB, a LossLessL RAW ~30-35 MB, and the drain now also pulls each shot's
    full-size **card JPEG** beside its RAW — budget roughly twice what a
    RAW-only drain used to need. `df -h ~`. The `runs_disk_low` anomaly fires
    under 5 GB. The Diag tab's cameras/cards table converts each body's
    remaining shots into GB: cam1's card is ~64 GB class and cam2's ~512 GB, so
    swap cam1 to a matching V60 512 GB for long lines.
-7. **Host clock.** On the Jetson, `chronyc tracking` should show it
-   synchronised and `chronyc clients` should list both Pis. The Jetson's clock
-   is the reference every shot **and the strobe** are scheduled against. An
-   earlier, undisciplined host measured 187 ms behind NTP and drifting
+7. **Host clock.** On a Jetson host, `chronyc tracking` should show it
+   synchronised and `chronyc clients` should list both Pis; on a Mac host,
+   network time must be on (System Settings → General → Date & Time). The
+   host's clock is the reference every shot **and the strobe** are scheduled
+   against. An undisciplined Mac host measured 187 ms behind NTP and drifting
    ~60 ppm; the rig corrects the fire schedule and every frame timestamp for a
    host offset and says so once per run ("host clock is X ms off the nodes"),
    but the correction carries its own RTT/2 uncertainty into `time_err_ms`. A
@@ -99,7 +102,8 @@ the port power-cycle events.
    Take one frame with the strobe disabled to check ambient, then Capture one
    with it enabled: the chip between the frames must read **LIT**. Point the
    light away from people on deck. `systemctl status piagent-strobe` on the
-   Jetson if the node `jetson` is missing from the fleet.
+   Jetson if the node `jetson` is missing from the fleet. Skip this item on a
+   rig without the strobe: leave Controls → Strobe disabled.
 9. **Calibration.** Calib tab, **in the water** (the WACP-C changes the focal
    length, so an in-air calibration is wrong underwater): checkerboard corner
    counts and square size, follow the amber guidance to green, Compute, Save.
@@ -116,7 +120,7 @@ the port power-cycle events.
 - Live preview and small-JPEG delivery run together at 2 Hz with the RAW
   landing on the card — verified 30/30 pairs, 0.4 ms skew, 1 ms preview.
 - Each delivered JPEG is **deleted from the Pi the instant it is verified on
-  the Jetson**, so the Pi spool never fills. The RAW stays on the card. Shooting
+  the host**, so the Pi spool never fills. The RAW stays on the card. Shooting
   RAW+JPEG, the JPEG carries the flight_log row and the RAW is archived beside
   it under the same stem — frame counts count exposures, not files.
 - **A camera that drops out pauses the grid within 3 shots** rather than letting
@@ -195,6 +199,24 @@ It is pulled off the card **between runs**:
   Two new artefacts: `<base>.wildsync.xmp` when a third-party sidecar already
   owns `<base>.xmp`, and `<base>.conflict-<sha8>.ARW` when the destination
   already holds different bytes (nothing overwritten, source kept).
+- **Hashes.** The drain records each file it lands, with the SHA-256 that
+  matched the Pi's, in `<dest>/SHA256SUMS` (default `~/rig-raw/SHA256SUMS`)
+  before that shot's card delete. Ingest adds `raw_sha256` and `jpg_sha256`
+  columns to `ingest_manifest.csv` and writes a `SHA256SUMS` in the run folder
+  (every frame and, once the run is final, its records). Check a run any time
+  with `python3 rig/ingest.py --verify <run_id>` (exit 0 all match, 1 a file
+  failed or is missing, 2 no `SHA256SUMS`); `shasum -a 256 -c SHA256SUMS` reads
+  the same file. A run that was never ingested has no `SHA256SUMS` until
+  `python3 rig/ingest.py --write-sums <run_id>` records one, and that records
+  the files as they are at that moment. Details: `docs/PROTOCOL.md`, "Run
+  provenance".
+- **What recorded a run.** `run.json` carries a `software` object (version,
+  commit, dirty flag, `git describe`) written at run start, and `events.log` a
+  `software:` line. A run recorded against the test simulators is marked
+  `"simulated": true` in `run.json` and shown as SIMULATED in Transects; a run
+  without the marker was recorded against real nodes. `time_source` in the
+  flight log and `run.json` is `gps` or `host` (the host's own clock); runs
+  recorded before v1.1.0 say `jetson` for `host`.
 
 **If a drain reports "card index not ready" / hangs:** the body's transfer
 subsystem is wedged (happens after many mode switches in a session).
@@ -212,7 +234,7 @@ convenient or when a card is filling.
 |---|---|
 | `node_rebooted` | a Pi lost power mid-run (PoE). Check the injector/switch. |
 | `node_undervoltage` | a Pi's rail is sagging under load. Power. |
-| `ilx_down` | camera daemon wedged. Power-cycle the body (HANDOFF §2.2). |
+| `ilx_down` | camera daemon wedged. Power-cycle the body, or un-wedge it (`docs/PI-SETUP.md` §10.1). |
 | `body_locked` | property table gone — the card-stall signature. Reformat/replace the card. Suppressed while the node reports `busy:true` or sits in transfer mode (a drain), where an absent property table is normal and means nothing. |
 | `card_missing` | no card in that body. Insert one. |
 | `capture_paused` | a node stopped answering fires, went OFFLINE, or answers `/health` but refuses a probe fire; the run is holding, not shooting the other camera alone. It resumes only when a probe fire on that node actually works. |
@@ -220,7 +242,7 @@ convenient or when a card is filling.
 | `camera_clock_wrong` | the body clock is days off (expected; ingest corrects the archive). |
 | `nav_gateway_down` | no live NMEA. If a static fix is armed it is a note, not a fault. |
 | `nav_no_fix` | **recording with no position.** The static fix is armed at run *start* only, so a bus that drops mid-line leaves those rows' lat/long EMPTY — they cannot be placed afterwards. Fix the bus and restart the line. |
-| `host_clock_offset` | the Jetson's clock is off the nodes (checklist §7). Check `chronyc tracking` on the Jetson. |
+| `host_clock_offset` | the host's clock is off the nodes (checklist §7). Check `chronyc tracking` on a Jetson host; turn network time on for a Mac host. |
 | `imu_stall` | no IMU sample near a capture instant; that camera's attitude columns are left empty. Check its Olive (checklist §5). |
 | `node_clock_unmeasurable` | that node's link is too slow (RTT ≥20 ms) to verify the 10 ms stereo budget. Check the PoE/switch path. |
 
@@ -255,7 +277,7 @@ which is deliberately suppressed while the node says `busy`).
 ## Recovery one-liners
 
 ```
-# on the Jetson: fleet + anomalies
+# on the host: fleet + anomalies
 curl -s localhost:9090/api/fleet | python3 -m json.tool
 curl -s localhost:9090/api/anomalies | python3 -m json.tool
 # a node's health / power / IMU
@@ -263,12 +285,13 @@ curl -s 192.168.1.201:8081/health | python3 -m json.tool
 # cancel a running card drain (stops between shots; never loses an original)
 curl -s -X POST localhost:9090/api/drain/cancel
 # restart rigd (finalises any active run first; the unit allows 60 s for it)
-sudo systemctl restart rigd
-# restart the strobe agent
+sudo systemctl restart rigd                                            # Jetson host
+launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd   # Mac host
+# restart the strobe agent (Jetson host)
 sudo systemctl restart piagent-strobe
 # an Olive IMU gone quiet (on that Pi)
 sudo systemctl restart olive-bridge
-# un-wedge a camera daemon (on the Pi) — see HANDOFF §2.2
+# un-wedge a camera daemon (on the Pi) — docs/PI-SETUP.md §10.1
 # power-cycle the camera body to clear a stuck transfer/PTP session
 ```
 

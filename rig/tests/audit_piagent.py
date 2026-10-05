@@ -818,7 +818,7 @@ def suite(opts):
     isim.shutdown()
 
     # The tolerant driver itself: bytes it cannot decode must be COUNTED and
-    # SHOWN (that hex tail is tomorrow's bring-up evidence), never raised out
+    # SHOWN (that hex tail is the bring-up evidence), never raised out
     # of the ingest path or published as samples.
     ro = imu_olive.ImuReader(port="sim")
     ro._tr = imu_olive.SimTransport()        # transport identity only

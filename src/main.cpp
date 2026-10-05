@@ -261,7 +261,7 @@ void guarded(httplib::Response& res, Fn fn) {
     // X2: every camera operation below takes m_sdkMutex unconditionally, so
     // one that arrives while a connect is in flight blocks its HTTP worker
     // for as long as the SDK holds the lock - forever, against the wedged
-    // SDK::Connect of HANDOFF 2.2. Nothing it could do would work anyway:
+    // SDK::Connect of docs/PI-SETUP.md 10.1. Nothing it could do would work anyway:
     // during the handshake SDK::Connect has already handed back a handle but
     // OnConnected has not fired, so the write goes to a half-open session
     // (the live-rig 6 s SetDeviceProperty stall). Refuse at the door.
@@ -1006,7 +1006,7 @@ int main(int argc, char** argv) {
     });
 
     // TEST ONLY (--test-sdk-hold). A body wedged inside an SDK call is the
-    // fault X7 is about (HANDOFF 2.1), and nothing camera-less reproduces it:
+    // fault X7 is about (a stuck card write), and nothing camera-less reproduces it:
     // with no camera every SDK entry point returns "not connected" in
     // microseconds, and the in-process fakes hold no mutex at all. This takes
     // the SDK mutex on a detached thread for a bounded number of ms so the
@@ -1028,7 +1028,7 @@ int main(int argc, char** argv) {
     // Bind :8080 FIRST, connect in the background. A stuck PTP session used
     // to block SDK::Connect before the port was ever bound, so the daemon sat
     // "active" at 0% CPU answering nothing and looked exactly like a dead
-    // camera (HANDOFF §2.2). Now /api/status answers from the first second;
+    // camera (docs/PI-SETUP.md §10.1). Now /api/status answers from the first second;
     // connected:false + the log line tells the truth while the SDK waits.
     std::thread startupConnect;
     if (autoConnect) {

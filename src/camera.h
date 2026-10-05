@@ -90,7 +90,7 @@ public:
 
     // TEST ONLY (ilxctl --test-sdk-hold): hold the SDK mutex for ms on a
     // detached thread, imitating a body wedged inside an SDK call. There is
-    // no other way to reproduce HANDOFF 2.1 off the hardware - the fakes
+    // no other way to reproduce a stuck card write off the hardware - the fakes
     // answer every property call instantly and hold no mutex.
     void holdSdkForTest(int ms);
 

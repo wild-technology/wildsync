@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """imu_olive — driver for the Olive Robotics olixVision X1 IMU (second unit).
 
-WRITTEN BLIND (2026-08-27): the unit is mounted at cam2 but not yet cabled, so
-its wire format could not be confirmed against hardware the way imu_yb's was.
-Everything here is therefore built around one rule: when this driver cannot
-decode what the device says, it must SHOW the operator the raw bytes rather
-than silently publish nothing — probe() and checksum_state() both carry a hex
-tail of the undecoded stream, so tomorrow's bring-up starts from "here is what
-it speaks", not from a blank {present:false}.
+The driver was written before the unit's wire format could be confirmed on
+hardware (it was first seen on 2026-08-27), so it is built around one rule:
+when it cannot decode what the device says, it must SHOW the operator the raw
+bytes rather than silently publish nothing — probe() and checksum_state() both
+carry a hex tail of the undecoded stream, so a bring-up starts from "here is
+what it speaks", not from a blank {present:false}.
 
-The unit is ROS 2 native (USB-C, enumerating as CDC-ACM) and can be configured
-for a raw streaming mode, so it will appear either as /dev/ttyACM* on cam2's
-Pi or as UDP datagrams to the Jetson host. Three transports behind one codec:
+The unit is ROS 2 native. On the rig its USB-C is a CDC-Ethernet gadget and
+rig/olive_ws_bridge.py relays its stream as UDP datagrams to the node's own
+piagent (docs/olive-imu.md); the driver also accepts a serial CDC-ACM port.
+Three transports behind one codec:
 
     SerialTransport  /dev/ttyACM* via pyserial (lazy import). CDC-ACM ignores
                      baud, so 115200 is nominal. Opened EXCLUSIVE: imu_yb's
@@ -42,7 +42,7 @@ The codec is deliberately tolerant. Candidate encodings, tried until one
 Numeric records use ONE documented field-order guess (see _map_numeric):
 [device_ts?][qw qx qy qz | roll pitch yaw][ax ay az][gx gy gz][mx my mz][temp]
 — a guess is unavoidable offline, so it is written down here, surfaced as the
-locked codec name in /health, and cheap to correct tomorrow in one place.
+locked codec name in /health, and cheap to correct in one place.
 
 Units: samples are published in the rig's units (degrees, g, dps) with the
 SAME key names as imu_yb, so flight_log needs no changes. A ROS-native stream
@@ -58,9 +58,8 @@ Timestamping is ARRIVAL-BASED (the read/recvfrom instant): unlike imu_yb
 there is no measured wire cadence to count byte-times against, and pretending
 otherwise would fabricate precision. This is a bring-up-grade epoch — good to
 a few ms on an idle Pi, worse under load — and refining it (device_ts
-correlation, cadence model) is explicitly tomorrow's work once the real
-stream is on a bench. Do not feed these epochs into anything that needs
-better than ~10 ms until then.
+correlation, cadence model) has not been done. Do not feed these epochs into
+anything that needs better than ~10 ms.
 
 Public interface — the imu_yb duck-type, exactly (piagent's Imu slot calls
 these and only these):
@@ -166,7 +165,7 @@ def _map_numeric(vals):
     that). A leading 4-tuple of unit norm with every element <= 1 is a
     quaternion — self-checking, so it can never be confused with euler+ax.
     Everything else is positional. If the real device disagrees, this ONE
-    function is where tomorrow's fix goes, and until then the per-field
+    function is where the fix goes, and until then the per-field
     plausibility gates below keep a wrong guess from publishing garbage as
     attitude (the reject count and raw tail in /health show it instead)."""
     v = list(vals)

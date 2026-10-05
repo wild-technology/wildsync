@@ -4,11 +4,13 @@ What each lead on the ILX-LR1 power/control harness does, how `FOCUS`, `TRIGGER`
 and `EXPOSURE` behave electrically, and what the sync-speed and flash-timing
 measurements say.
 
-> **Scope.** This is the **camera harness** reference. The strobe sections that
-> once lived here covered a Smart Vision Lights XR256, which is **out of scope** —
-> the rig uses a Bolt VB-22 speedlight on a contact-closure sync port, and none of
-> the XR256's 24 V / 20 A constraints carry over. Those sections have been removed.
-> For the strobe as actually built, see **`docs/strobe-trigger.md`**.
+> **Scope.** This is the **camera harness** reference. The rig's strobe is the
+> Smart Vision Lights XR256, triggered from the host's GPIO through an opto board
+> (**`docs/xr256-jetson-trigger.md`**, which carries its 24 V / 20 A constraints).
+> An earlier design, a Bolt VB-22 speedlight on a contact-closure sync port fired
+> from a camera Pi's GPIO (**`docs/strobe-trigger.md`**), is still supported by
+> `piagent`; the bench measurements in §4.1 below were made with that speedlight
+> and describe any short flash, not only that one.
 
 **Sources**
 
@@ -509,10 +511,10 @@ Sony's own documented topology splits the interfaces by role — power/control
 connector for power, `FOCUS`, `TRIGGER` and `EXPOSURE`; micro HDMI for live
 view; USB Type-C for SDK control.
 
-> **Updated.** This section originally drove the harness from the Jetson. The rig
-> as built puts a Raspberry Pi at each camera: the Jetson schedules one shared
-> absolute instant and each Pi busy-waits to it on a chrony-disciplined clock
-> (~85 µs RMS), so the GPIO lines are local to each node. See `docs/PROTOCOL.md`.
+> **Note.** The harness is driven from a Raspberry Pi at each camera, not from the
+> host: the host schedules one shared absolute instant and each Pi busy-waits to
+> it on a chrony-disciplined clock (~85 µs RMS measured with a Jetson host as the
+> master), so the GPIO lines are local to each node. See `docs/PROTOCOL.md`.
 
 Per camera node:
 
@@ -528,22 +530,23 @@ Per camera node:
   PoE ──▶ Pi;  12 V ──▶ camera pins 3 / 2   camera grounds tie at pin 2 only
 ```
 
-Strobe, cam1 only — a Bolt VB-22 on its own isolated battery, fired from a
-scheduled GPIO pulse rather than off `EXPOSURE`, so it is placed against the
-instant BOTH cameras expose at:
+Strobe, contact-closure design (cam1 only) — a Bolt VB-22 on its own isolated
+battery, fired from a scheduled GPIO pulse rather than off `EXPOSURE`, so it is
+placed against the instant BOTH cameras expose at (the XR256 is fired the same
+way, from the host: `docs/xr256-jetson-trigger.md`):
 
 ```
   Pi GPIO BCM26 (open-drain, header pin 37) ──▶ sync CENTRE
   Pi GND        (header pin 39)             ──▶ sync SHELL
 ```
 
-Four wins over the current USB-only design:
+Four wins over a USB-only design:
 
 1. **Deterministic release** — GPIO instead of a PTP round trip removes the 0.5 s
    floor and the dependency on a healthy USB session.
-2. **A real capture timestamp** — `EXPOSURE` tapped into a Jetson input gives a
-   hardware-timed exposure event to align against IMU / DVL / NMEA 2000, far
-   better than timestamping `OnCompleteDownload`.
+2. **A real capture timestamp** — `EXPOSURE` tapped into a Pi input (`gpiomon`
+   on BCM22) gives a hardware-timed exposure event to align against IMU / NMEA
+   2000, far better than timestamping `OnCompleteDownload`.
 3. **Sync that is actually synchronous** — the strobe fires off the shutter, not
    off software.
 4. **Blur decoupled from shutter speed** — a 20–250 µs flash sets the effective

@@ -4,9 +4,10 @@
 #   deploy/pi-resync/install.sh /Volumes/system-boot
 #
 # Fills the template from the card's own existing user-data (password hash and
-# the Jetson key are carried over unchanged) plus this host's ~/.ssh/id_ed25519.pub,
-# backs up the originals, and bumps the cloud-init instance-id so the node
-# re-runs the users + chrony steps on its next boot. Run once per card.
+# the key already on the card are carried over unchanged) plus this host's
+# ~/.ssh/id_ed25519.pub, backs up the originals, and bumps the cloud-init
+# instance-id so the node re-runs the users + chrony steps on its next boot.
+# Run once per card.
 set -euo pipefail
 V="${1:-/Volumes/system-boot}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -16,16 +17,16 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 [ -f "$HOME/.ssh/id_ed25519.pub" ] || { echo "no ~/.ssh/id_ed25519.pub on this host - run ssh-keygen -t ed25519"; exit 1; }
 
 HASH="$(grep -m1 '^[[:space:]]*passwd:' "$V/user-data" | sed 's/^[[:space:]]*passwd:[[:space:]]*//')"
-JKEY="$(grep -m1 'ssh-ed25519' "$V/user-data" | sed 's/^[[:space:]]*-[[:space:]]*//')"
-MKEY="$(cat "$HOME/.ssh/id_ed25519.pub")"
-[ -n "$HASH" ] && [ -n "$JKEY" ] || { echo "could not read the existing passwd/key from $V/user-data"; exit 1; }
+CKEY="$(grep -m1 'ssh-ed25519' "$V/user-data" | sed 's/^[[:space:]]*-[[:space:]]*//')"
+HKEY="$(cat "$HOME/.ssh/id_ed25519.pub")"
+[ -n "$HASH" ] && [ -n "$CKEY" ] || { echo "could not read the existing passwd/key from $V/user-data"; exit 1; }
 
 cp "$V/user-data" "$V/user-data.bak-$STAMP"
 cp "$V/meta-data" "$V/meta-data.bak-$STAMP"
 
 # awk, not sed: the hash contains $ and / which sed's s/// would mangle.
-awk -v h="$HASH" -v j="$JKEY" -v m="$MKEY" '
-  { gsub(/__PASSWD_HASH__/, h); gsub(/__JETSON_KEY__/, j); gsub(/__MAC_KEY__/, m); print }
+awk -v h="$HASH" -v c="$CKEY" -v k="$HKEY" '
+  { gsub(/__PASSWD_HASH__/, h); gsub(/__CARD_KEY__/, c); gsub(/__HOST_KEY__/, k); print }
 ' "$HERE/user-data.template" > "$V/user-data"
 printf 'instance-id: wildsync-resync-%s\n' "$STAMP" > "$V/meta-data"
 
