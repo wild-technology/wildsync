@@ -134,19 +134,25 @@ miss, and without it frames with no GPIO edge get the command time instead),
 `chrony` — all installed by `deploy.sh provision`. Services are stdlib-only by
 policy; see `docs/PROTOCOL.md`.
 
-**Sony Camera Remote SDK:** not redistributed here. You need the **Linux
-aarch64 (Linux64ARMv8)** package from Sony, both to build `ilxctl` and to
-provision the nodes.
+**Sony Camera Remote SDK (v2.02.00):** proprietary, supplied by Sony under its
+own licence agreement (linked from <http://www.sony.net/CameraRemoteSDK/>), and
+not part of this repository: neither its headers (`include/CRSDK/`) nor its
+libraries (`lib/`, `lib-linux/`) are tracked. Obtain the package from Sony,
+unzip it, unzip the `RemoteCli.zip` inside it, and stage it with
+`make sdk CRSDK_DIR=/path/to/RemoteCli` (see
+[Building `ilxctl`](#building-ilxctl)). The code was built against v2.02.00. The
+nodes need the **Linux aarch64 (Linux64ARMv8)** package, both to build `ilxctl`
+and to provision them; a development build on a Mac needs the macOS package.
 
 `rigd` also runs on macOS (bench and development; `rig/tests/devrig.py` runs
 the full UI against two fake cameras on any host). On a Mac, stage the node SDK
-with `make sdk-linux`, and install rigd as a launchd agent from
+with `make sdk-linux CRSDK_DIR=/path/to/RemoteCli` (the RemoteCli folder of the
+Linux64ARMv8 package), and install rigd as a launchd agent from
 `deploy/rigd.launchd.plist` instead of `deploy.sh jetson`.
 
 ## Install
 
 Everything below runs from a checkout on the Jetson unless it says otherwise.
-The repository is private: authenticate first (`gh auth login`, or a deploy key).
 
 ### 1. The Jetson
 
@@ -156,7 +162,7 @@ on 192.168.1.0/24 (the field manual assumes `192.168.1.29`). Then:
 ```sh
 git clone https://github.com/wild-technology/wildsync.git ~/wildsync
 cd ~/wildsync
-make sdk-linux CRSDK_DIR=/path/to/unpacked/Linux64ARMv8-package   # Sony SDK for the nodes
+make sdk-linux CRSDK_DIR=/path/to/RemoteCli   # Sony SDK for the nodes (Linux64ARMv8 package)
 deploy/deploy.sh jetson        # deps, chrony master for the rig, rigd service
 ```
 
@@ -208,6 +214,27 @@ should read **2/2 cameras**. Then follow the field manual's pre-dive checklist.
 so after a `git pull` on the Jetson a rigd change takes effect on
 `sudo systemctl restart rigd` (and the strobe agent on
 `sudo systemctl restart piagent-strobe`).
+
+## Building `ilxctl`
+
+`ilxctl` is C++17 and builds with `make` on macOS (Apple Silicon, clang) and on
+Linux aarch64 (g++). On the rig it is always built on the node by
+`deploy.sh node`; to build it on a development machine:
+
+```sh
+# once per checkout, and again after unpacking a different SDK release
+make sdk CRSDK_DIR=/path/to/RemoteCli    # headers -> include/CRSDK/, libraries -> lib/
+make                                     # -> build/ilxctl, SDK libraries staged beside it
+```
+
+`CRSDK_DIR` is the unpacked `RemoteCli` folder (the one that holds `app/CRSDK`
+and `external/crsdk`) from the Sony package that matches the machine you build
+on: the macOS package on a Mac, the Linux64ARMv8 package on Linux aarch64. This
+is the same command on both. `make` stops with a pointer back to `make sdk` if
+the SDK is not staged. `make sdk-linux` is the variant for a Mac that
+provisions Pi nodes: it stages the Linux libraries into `lib-linux/` (and the
+headers) without disturbing the Mac's own `lib/`. Everything `make sdk` and
+`make sdk-linux` stage is git-ignored.
 
 ## Working on it
 

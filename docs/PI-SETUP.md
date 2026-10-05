@@ -373,10 +373,15 @@ REFUSING provision: no Linux aarch64 libCr_Core.so to send.
 ```
 
 ```sh
-make sdk-linux CRSDK_DIR=/path/to/unpacked/Linux64ARMv8-package
+make sdk-linux CRSDK_DIR=/path/to/RemoteCli    # RemoteCli folder of the Linux64ARMv8 package
 ```
 
-This stages the `.so` files into `lib-linux/`, which `provision` prefers. It
+The SDK is Sony's proprietary package (v2.02.00) and is not in this repository:
+obtain it from Sony, unzip it, and unzip the `RemoteCli.zip` inside; that
+`RemoteCli` folder is `CRSDK_DIR`. The command stages the `.so` files into
+`lib-linux/`, which `provision` prefers, and the SDK headers into
+`include/CRSDK/`, which `provision` also pushes because the node builds
+`ilxctl` from them (`provision` refuses to run when either is missing). It
 works the same on the Jetson and on a Mac, and leaves a Mac's own `lib/`
 (macOS dylibs for a local `ilxctl` build) untouched.
 

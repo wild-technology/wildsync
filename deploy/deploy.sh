@@ -70,8 +70,17 @@ provision_node() {
     echo "  REFUSING provision: no Linux aarch64 libCr_Core.so to send." >&2
     echo "  Looked in $REPO/lib-linux and $REPO/lib." >&2
     echo "  Sony ships PLATFORM-SPECIFIC packages and the Mac one will not do:" >&2
-    echo "    make sdk-linux CRSDK_DIR=/path/to/CrSDK_..._Linux64ARMv8" >&2
+    echo "    make sdk-linux CRSDK_DIR=/path/to/RemoteCli   # from the Linux64ARMv8 package" >&2
     echo "  (see docs/PI-SETUP.md), or provision from a Linux host." >&2
+    return 1
+  fi
+  # The node builds ilxctl from include/CRSDK, which is not tracked in git: it
+  # is staged from Sony's package by `make sdk` or `make sdk-linux`. Without it
+  # the rsync below would succeed and the node build would then fail.
+  if [ ! -f "$REPO"/include/CRSDK/CameraRemote_SDK.h ]; then
+    echo "  REFUSING provision: the Sony SDK headers are not staged in $REPO/include/CRSDK." >&2
+    echo "  They are not part of this repository. Stage them from the SDK package:" >&2
+    echo "    make sdk-linux CRSDK_DIR=/path/to/RemoteCli   # from the Linux64ARMv8 package" >&2
     return 1
   fi
   echo "  SDK source: $sdklib"

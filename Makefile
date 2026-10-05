@@ -2,6 +2,19 @@
 #
 # Builds on macOS (Apple Silicon) and Linux (aarch64, e.g. Jetson Orin).
 #
+# The Sony Camera Remote SDK is proprietary and is not part of this repository:
+# neither its headers (include/CRSDK/) nor its libraries (lib/, lib-linux/) are
+# tracked. The code was built against v2.02.00. Download the package for the
+# build platform from Sony under Sony's licence agreement, unzip it, unzip the
+# RemoteCli.zip inside it, then stage the headers and libraries and build:
+#
+#   make sdk CRSDK_DIR=/path/to/RemoteCli    # macOS arm64 or Linux aarch64
+#   make
+#
+# CRSDK_DIR is the unpacked RemoteCli folder (the one holding app/CRSDK and
+# external/crsdk) of the package that matches THIS host: the macOS package on a
+# Mac, the Linux64ARMv8 package on a Linux aarch64 machine.
+#
 # The Camera Remote SDK ships as prebuilt shared libraries that resolve their
 # siblings through an rpath relative to the loading binary, so the build stages
 # the SDK next to the executable on both platforms:
@@ -61,13 +74,16 @@ STAGED   := $(patsubst lib/%,$(BUILD)/%,$(SDK_LIBS)) $(BUILD)/.adapters
 all: sdk-check $(BIN) $(STAGED)
 
 # The Sony SDK is not redistributed with this repo. Point CRSDK_DIR at an
-# unpacked RemoteCli/SimpleCli package to populate include/CRSDK and lib/.
+# unpacked RemoteCli (or SimpleCli) folder to stage the headers into
+# include/CRSDK/ and the libraries for this host into lib/. All of it is
+# git-ignored; run it again after unpacking a different SDK release.
 CRSDK_DIR ?= ../RemoteCli
 
 sdk:
 	@test -d "$(CRSDK_DIR)/app/CRSDK" || { \
 	  echo "Not found: $(CRSDK_DIR)/app/CRSDK"; \
-	  echo "Unpack the Camera Remote SDK and re-run:  make sdk CRSDK_DIR=/path/to/RemoteCli"; \
+	  echo "Download the Camera Remote SDK from Sony, unzip it and the RemoteCli.zip"; \
+	  echo "inside it, then re-run:  make sdk CRSDK_DIR=/path/to/RemoteCli"; \
 	  exit 1; }
 	@mkdir -p include lib
 	@cp -R "$(CRSDK_DIR)/app/CRSDK" include/
@@ -93,37 +109,47 @@ endif
 # that gap: it always copies .so, never $(DYLIB_EXT), and writes to a separate
 # directory so the host's own lib/ is untouched and `make` here keeps working.
 #
-# Sony ships PLATFORM-SPECIFIC packages: point CRSDK_DIR at the unpacked
-# Linux64ARMv8 one, not the Mac one. The headers are identical across both
-# (verified byte-for-byte, 2026-08-28) so this target does not touch include/.
+# Sony ships PLATFORM-SPECIFIC packages: point CRSDK_DIR at the RemoteCli folder
+# unpacked from the Linux64ARMv8 one, not the Mac one. The headers in the two
+# packages are identical (verified byte-for-byte, 2026-08-28). They are staged
+# here too, because deploy.sh pushes include/ to the node along with the
+# libraries and the node builds ilxctl from them: a Mac that only ever
+# provisions nodes has no other reason to have run `make sdk`. If include/CRSDK
+# is already staged from the Mac package it is rewritten with the same files.
 #
-#   make sdk-linux CRSDK_DIR=/path/to/unpacked/CrSDK_..._Linux64ARMv8
+#   make sdk-linux CRSDK_DIR=/path/to/RemoteCli    # the Linux64ARMv8 package
 #   deploy/deploy.sh provision cam3
 sdk-linux:
 	@test -d "$(CRSDK_DIR)/external/crsdk" || { \
 	  echo "Not found: $(CRSDK_DIR)/external/crsdk"; \
-	  echo "Unpack the LINUX ARMv8 Camera Remote SDK and re-run:"; \
-	  echo "  make sdk-linux CRSDK_DIR=/path/to/unpacked/CrSDK_..._Linux64ARMv8"; \
+	  echo "Unzip the LINUX ARMv8 Camera Remote SDK and the RemoteCli.zip inside it,"; \
+	  echo "then re-run:  make sdk-linux CRSDK_DIR=/path/to/RemoteCli"; \
 	  exit 1; }
 	@test -f "$(CRSDK_DIR)/external/crsdk/libCr_Core.so" || { \
 	  echo "$(CRSDK_DIR) has no libCr_Core.so - that is the MAC or Windows"; \
 	  echo "package. The nodes are aarch64 Linux; get the Linux64ARMv8 package."; \
 	  exit 1; }
-	@mkdir -p lib-linux
-	# cp -R into an EXISTING directory recurses into it, so a second run
-	# produced lib-linux/CrAdapter/CrAdapter and deploy.sh then rsynced the
-	# nest to the node. Remove the destination first; the .so copies below
-	# overwrite in place and are already idempotent.
+	@test -d "$(CRSDK_DIR)/app/CRSDK" || { \
+	  echo "Not found: $(CRSDK_DIR)/app/CRSDK (the SDK headers)"; \
+	  echo "CRSDK_DIR must be the unpacked RemoteCli folder."; \
+	  exit 1; }
+	@mkdir -p include lib-linux
+	@cp -R "$(CRSDK_DIR)/app/CRSDK" include/
+# cp -R into an EXISTING directory recurses into it, so a second run
+# produced lib-linux/CrAdapter/CrAdapter and deploy.sh then rsynced the
+# nest to the node. Remove the destination first; the .so copies below
+# overwrite in place and are already idempotent.
 	@cp "$(CRSDK_DIR)"/external/crsdk/*.so lib-linux/
 	@rm -rf lib-linux/CrAdapter
 	@cp -R "$(CRSDK_DIR)/external/crsdk/CrAdapter" lib-linux/
-	@echo "Linux aarch64 SDK staged in lib-linux/ from $(CRSDK_DIR)"
+	@echo "Linux aarch64 SDK staged from $(CRSDK_DIR): headers in include/CRSDK/, libraries in lib-linux/"
 	@echo "  $$(ls lib-linux/*.so lib-linux/CrAdapter/*.so 2>/dev/null | wc -l | tr -d ' ') shared objects"
 
 sdk-check:
 	@test -f include/CRSDK/CameraRemote_SDK.h && test -f lib/libCr_Core.$(DYLIB_EXT) || { \
-	  echo "The Sony Camera Remote SDK is missing (it is not redistributed here)."; \
-	  echo "Run:  make sdk CRSDK_DIR=/path/to/unpacked/RemoteCli"; \
+	  echo "The Sony Camera Remote SDK is not staged (it is not redistributed here)."; \
+	  echo "Get it from Sony, unzip it and the RemoteCli.zip inside it, then run:"; \
+	  echo "  make sdk CRSDK_DIR=/path/to/RemoteCli"; \
 	  exit 1; }
 
 $(BUILD)/obj/%.o: src/%.cpp | $(BUILD)/obj
