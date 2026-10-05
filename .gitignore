@@ -23,6 +23,10 @@ __pycache__/
 *.jsonl
 .DS_Store
 
+# Software stamp written by deploy/deploy.sh (rig/buildinfo.py --write). It
+# describes one deployed tree, so it is never committed.
+BUILD_INFO.json
+
 # Vendor documentation trees (1.5 GB, keep local only)
 docs/basler-frame-grabber-documentation-v29-en/
 docs/basler-product-documentation-v133-en/

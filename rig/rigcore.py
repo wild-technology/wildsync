@@ -2318,6 +2318,8 @@ class RunBrowser:
         pairs, shots_full = self._pairs(frames, cams, doc, index)
         detail["pairs"] = pairs
         detail["strobe"] = doc.get("strobe")
+        # Absent (null) on runs recorded before v1.1.0.
+        detail["software"] = doc.get("software")
         with self._lock:
             if len(self._cache) > 16:
                 self._cache.clear()

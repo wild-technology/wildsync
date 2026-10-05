@@ -44,6 +44,24 @@ try:
 except ImportError:            # raw NMEA logging is optional
     navlog = None
 
+# The software stamp every run records. Guarded like navlog: a tree missing
+# this file must still run, with the stamp reading "unknown".
+try:
+    import buildinfo
+except ImportError:
+    buildinfo = None
+
+
+def _software_stamp():
+    """rig/buildinfo.py's process-wide stamp; never raises."""
+    try:
+        if buildinfo is not None:
+            return buildinfo.stamp()
+    except Exception:  # noqa: BLE001 - a stamp must never stop a run
+        pass
+    return {"version": "unknown", "commit": "unknown", "dirty": None,
+            "describe": "unknown", "source": "none"}
+
 FLIGHT_HEADER = [
     "filename", "datetime", "lat", "long", "xutm", "yutm", "utm_zone",
     "depth_from_xplore9", "pitch", "roll", "yaw", "heading_mag_xplore",
@@ -1399,6 +1417,10 @@ class RunManager:
         # override for tests; None means "ask the fleet".
         self.imu_node = imu_node
         self._imu_node_cache = None
+        # Which software records every run (run.json "software"). Resolved
+        # once, here, at rigd start-up: a run start only copies it, so git
+        # being slow or absent can never delay or fail a transect.
+        self.software = _software_stamp()
         self._lock = threading.Lock()
         # (offset, measured_at) for fleet_clock_offset(). Its own lock: the
         # pull workers read it while holding nothing, and taking the run lock
@@ -1941,6 +1963,7 @@ class RunManager:
             self._cap_stop = threading.Event()
             run = {"run_id": rid, "root": root, "label": label,
                    "started": now, "config": config,
+                   "software": dict(self.software),
                    "time_off": time_off, "time_src": time_src,
                    "nodes": [m.name_ for m in live],
                    "events_fh": events_fh, "nmea_fh": nmea_fh,
@@ -1972,6 +1995,14 @@ class RunManager:
                              nodes=run["nodes"], run_id=rid,
                              time_source=time_src,
                              gps_offset_s=round(time_off, 3))
+            sw = run["software"]
+            self.events.emit(
+                "info", "software",
+                "software: wildsync %s, commit %s%s (%s), from %s"
+                % (sw.get("version"), sw.get("commit"),
+                   " + local changes" if sw.get("dirty") is True else "",
+                   sw.get("describe"), sw.get("source")),
+                run_id=rid, **sw)
             if not PIL_AVAILABLE:
                 self.events.emit(
                     "warn", "run",
@@ -4053,6 +4084,8 @@ class RunManager:
         doc = {"run_id": run["run_id"], "label": run["label"],
                "started": run["started"], "nodes": run["nodes"],
                "config": run["config"],
+               # The code that recorded this run (rig/buildinfo.py).
+               "software": run.get("software"),
                # Read without get_strobe(): callers already hold self._lock.
                "strobe": dict(self.strobe),
                # The correction actually applied to every datetime and filename

@@ -1170,7 +1170,7 @@ class Rig:
         threading.Thread(target=self._anomaly_loop, daemon=True).start()
         self.events.emit("info", "lifecycle", "rigd up", port=PORT,
                          nodes=[m.name_ for m in self.monitors],
-                         nav=bool(self.nav))
+                         nav=bool(self.nav), software=self.runmgr.software)
 
     def _recover_runs(self):
         """Finalise runs left open by a crash, a kill, or a power cut.
@@ -1743,7 +1743,9 @@ class Rig:
     def diag(self):
         return {
             "ts": time.time(),
-            "rigd": {"port": PORT, "nav": bool(self.nav)},
+            "rigd": {"port": PORT, "nav": bool(self.nav),
+                     # what every run started now will record in run.json
+                     "software": self.runmgr.software},
             # Full gateway health, not just present/absent: which port it
             # resolved, whether bytes are actually arriving, and the last error.
             "nav": (self.nav.health() if self.nav else {"present": False}),

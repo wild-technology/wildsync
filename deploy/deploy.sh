@@ -218,6 +218,14 @@ deploy_node() {
   scp -q "$REPO"/deploy/piagent.service ubuntu@"$ip":/tmp/piagent.service
   scp -q "$REPO"/deploy/olive-bridge.service ubuntu@"$ip":/tmp/olive-bridge.service
   scp -q "$REPO"/deploy/ilxctl.service ubuntu@"$ip":/tmp/ilxctl.service
+  # The node's tree has no .git, so record which commit was deployed to it
+  # (rig/buildinfo.py; read it with: cat ~/wildsync/BUILD_INFO.json).
+  if python3 "$REPO"/rig/buildinfo.py --write /tmp/wildsync-build-info.json >/dev/null 2>&1; then
+    scp -q /tmp/wildsync-build-info.json ubuntu@"$ip":/home/ubuntu/wildsync/BUILD_INFO.json
+  else
+    echo "  WARNING: $REPO is not a git checkout - no BUILD_INFO.json for $name" >&2
+  fi
+  rm -f /tmp/wildsync-build-info.json
   # Which IMU serves this node's /imu/* (and so its flight-log attitude). The
   # rig's IMUs are Olive olixVision units, one per camera, relayed by
   # olive-bridge to localhost UDP. Override per run for a Yahboom node:
@@ -341,6 +349,15 @@ deploy_jetson() {
   # placeholders, never a hardcoded machine.
   sed "s|__REPO__|$REPO|g; s|__USER__|$(id -un)|g" \
     "$REPO"/deploy/rigd.service | sudo tee /etc/systemd/system/rigd.service >/dev/null
+  # The software stamp every run records (run.json "software"). rigd asks git
+  # first; BUILD_INFO.json is what it falls back to when git cannot answer
+  # (no .git beside the code, git missing, or git refusing the checkout).
+  if sw="$(python3 "$REPO"/rig/buildinfo.py --write "$REPO"/BUILD_INFO.json 2>/dev/null)"; then
+    echo "  software: $sw"
+  else
+    echo "  WARNING: $REPO is not a git checkout, so BUILD_INFO.json was not written;" >&2
+    echo "  runs record an existing $REPO/BUILD_INFO.json, or the software as unknown" >&2
+  fi
   sudo systemctl daemon-reload
   sudo systemctl enable rigd >/dev/null 2>&1
   # enable --now is a NO-OP on an already-running unit: redeploys silently

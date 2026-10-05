@@ -10,6 +10,11 @@ P1  time_source. The host-clock label is "host". Runs recorded before v1.1.0
     and every reader must still accept it: the run browser, ingest, and the
     helpers the two labels are tested through.
 
+P2  software stamp. Every run records the code that made it: run.json
+    "software" {version, commit, dirty, describe, source} and one events.log
+    line, resolved once at start-up from git, else BUILD_INFO.json, else
+    "unknown" - and nothing about resolving it may hang or fail a run.
+
 Hermetic: in-process fakes on loopback only, temp run roots, never ~/rig or
 ~/rig-runs.
 
@@ -234,8 +239,141 @@ def _p1_time_source(opts):
 
 
 # ---------------------------------------------------------------------------
+# P2 — the software stamp
+# ---------------------------------------------------------------------------
+def _git(*args):
+    import subprocess
+    try:
+        p = subprocess.run(["git", "-C", os.path.dirname(RIG)] + list(args),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.decode().strip() if p.returncode == 0 else None
+
+
+def _p2_software_stamp(opts):
+    sect("P2 software stamp: run.json 'software' and one events.log line, "
+         "from git, else BUILD_INFO.json, else 'unknown'")
+    import subprocess
+    import buildinfo
+    s = buildinfo.resolve()
+    head = _git("rev-parse", "HEAD")
+    desc = _git("describe", "--tags", "--always", "--dirty")
+    if head:
+        check("in a checkout the stamp comes from git and names HEAD",
+              s["source"] == "git" and s["commit"] == head, json.dumps(s))
+        check("describe and dirty agree with git describe --dirty",
+              s["describe"] == desc
+              and s["dirty"] is desc.endswith("-dirty"),
+              "%s vs %s" % (s["describe"], desc))
+    else:
+        soaktest.note("git unavailable here: the git branch of the software "
+                      "stamp was not exercised")
+    check("the stamp carries the release version",
+          s["version"] == buildinfo.VERSION == "1.1.0", s["version"])
+
+    # A tree with no .git: "unknown", then whatever BUILD_INFO.json says.
+    tree = _tmp()
+    os.makedirs(os.path.join(tree, "rig"))
+    shutil.copy(os.path.join(RIG, "buildinfo.py"), os.path.join(tree, "rig"))
+    u = buildinfo.resolve(tree)
+    check("no .git and no BUILD_INFO.json -> 'unknown', not a guess",
+          u["commit"] == "unknown" and u["describe"] == "unknown"
+          and u["dirty"] is None and u["source"] == "none", json.dumps(u))
+    if head:
+        bi = os.path.join(tree, "BUILD_INFO.json")
+        w = buildinfo.write(bi)
+        f = buildinfo.resolve(tree)
+        check("BUILD_INFO.json written from git is what a .git-less tree "
+              "reports",
+              w is not None and f["source"] == "build-info"
+              and f["commit"] == head and f["describe"] == desc,
+              json.dumps(f))
+        with open(bi, "w") as fh:
+            fh.write("{torn")
+        check("a corrupt BUILD_INFO.json falls through to 'unknown'",
+              buildinfo.resolve(tree)["source"] == "none")
+
+        # rig/ copied inside some OTHER repository must not take its commit.
+        outer = _tmp()
+        subprocess.run(["git", "init", "-q", outer],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", outer, "-c", "user.name=t",
+                        "-c", "user.email=t@example.invalid", "commit", "-q",
+                        "--allow-empty", "-m", "outer"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        inner = os.path.join(outer, "vendor", "wildsync")
+        os.makedirs(os.path.join(inner, "rig"))
+        check("a tree nested inside another repository is not stamped with "
+              "that repository's commit",
+              buildinfo.from_git(inner) is None
+              and buildinfo.resolve(inner)["source"] == "none",
+              json.dumps(buildinfo.resolve(inner)))
+        shutil.rmtree(outer, ignore_errors=True)
+    shutil.rmtree(tree, ignore_errors=True)
+
+    # A git that hangs: bounded by the timeout, then the fallback.
+    fake = _tmp()
+    with open(os.path.join(fake, "git"), "w") as fh:
+        fh.write("#!/bin/sh\nexec sleep 20\n")
+    os.chmod(os.path.join(fake, "git"), 0o755)
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake + os.pathsep + old_path
+    try:
+        t0 = time.time()
+        h = buildinfo.resolve(os.path.dirname(RIG), timeout=0.5)
+        dt = time.time() - t0
+    finally:
+        os.environ["PATH"] = old_path
+    check("a hung git costs at most its timeout and never raises",
+          dt < 3.0 and h["source"] in ("build-info", "none"),
+          "%.2f s, source %s" % (dt, h["source"]))
+    shutil.rmtree(fake, ignore_errors=True)
+
+    env, r, root = _short_run("p2-software")
+    try:
+        doc = json.load(open(os.path.join(root, "run.json")))
+        sw = doc.get("software") or {}
+        check("run.json carries the software stamp",
+              set(sw) >= {"version", "commit", "dirty", "describe", "source"}
+              and sw == env.runmgr.software, json.dumps(sw))
+        with open(os.path.join(root, "events.log")) as fh:
+            lines = [ln for ln in fh if " software " in ln]
+        check("events.log has exactly one software line, naming the commit",
+              len(lines) == 1 and sw.get("commit", "?") in lines[0],
+              "".join(lines)[:200])
+        rb = rigcore.RunBrowser()
+        check("the run browser's detail carries the stamp",
+              rb.detail(r["run_id"]).get("software") == sw)
+        old = env.runmgr.software
+        env.runmgr.software = buildinfo.unknown()
+        try:
+            r2 = env.runmgr.start({"label": "p2-unknown", "calibrate": False})
+            env.runmgr.stop()
+        finally:
+            env.runmgr.software = old
+        doc2 = json.load(open(os.path.join(r2.get("root", ""), "run.json")))
+        check("an unresolvable stamp still records a run, as 'unknown'",
+              r2.get("ok") is True
+              and (doc2.get("software") or {}).get("commit") == "unknown",
+              json.dumps(doc2.get("software")))
+    finally:
+        env.close()
+    with open(os.path.join(os.path.dirname(RIG), "deploy", "deploy.sh")) as fh:
+        dsh = fh.read()
+    with open(os.path.join(os.path.dirname(RIG), ".gitignore")) as fh:
+        gi = fh.read()
+    check("deploy.sh writes BUILD_INFO.json for the host and the nodes, and "
+          "git ignores it",
+          dsh.count("rig/buildinfo.py --write") == 2
+          and "BUILD_INFO.json" in gi.split())
+
+
+# ---------------------------------------------------------------------------
 def suite(opts):
     _p1_time_source(opts)
+    _p2_software_stamp(opts)
 
 
 if __name__ == "__main__":

@@ -845,7 +845,8 @@ Transect run layout (Jetson, `~/rig-runs/`):
 runs/260815_1930_transect-01/
   run.json            journal: config, nodes, events, per-frame index (last
                       2000), alerts, the timebase and clock offsets applied,
-                      and per-shot sync quality
+                      per-shot sync quality, and the software stamp (see
+                      "Run provenance")
   index.jsonl         the COMPLETE frame index, one JSON object per line,
                       appended as each frame is indexed — readers prefer this
   nmea_raw.log        every serial line, prefixed epoch
@@ -1207,3 +1208,52 @@ Each camera's `flight_log.csv` rows take attitude from **that camera's own
 node** when its `/health` reports `imu.present`; otherwise from the fleet IMU
 node as before. The 23-column header is unchanged. `rigcal` resolves each
 camera's IMU endpoint from its `/health` (`/imu`, else `/imu2`).
+
+## Run provenance (v1.1.0)
+
+What a run directory records about the software and equipment that produced
+it. Every key below is **additive**: a run recorded before v1.1.0 simply lacks
+it, and every reader treats the absence as described here.
+
+### Software stamp
+
+`run.json` gains a top-level **`software`** object, written at run start:
+
+```
+"software": {"version": "1.1.0",
+             "commit": "<40-hex commit>" | "unknown",
+             "dirty": true | false | null,
+             "describe": "<git describe --tags --always --dirty>" | "unknown",
+             "source": "git" | "build-info" | "none"}
+```
+
+`rig/buildinfo.py` resolves it **once, when rigd starts** (RunManager
+construction); a run start only copies it, so git can never delay or fail a
+transect. The order is:
+
+1. **git** in the tree rigd runs from, when that tree is its own checkout
+   (`git rev-parse --show-toplevel` must be the tree itself) and git answers
+   within 2 s per call. `dirty` is true when tracked files differ from HEAD;
+   untracked files do not count — the same rule as `describe --dirty`.
+2. **`BUILD_INFO.json`** at the top of the tree, for a tree with no `.git` or
+   where git cannot answer. `deploy/deploy.sh jetson` writes it beside rigd,
+   and `deploy/deploy.sh node <camN>` writes `~/wildsync/BUILD_INFO.json` on the
+   node as the record of what was deployed there. By hand:
+   `python3 rig/buildinfo.py --write BUILD_INFO.json` (from a git checkout).
+   The file is ignored by git.
+3. otherwise **`"unknown"`** for `commit` and `describe`, `dirty: null`.
+
+`source` says which of the three answered. `version` is
+`rig/buildinfo.VERSION`. `python3 rig/buildinfo.py` prints the stamp this tree
+would record.
+
+`events.log` gets one line at run start, kind `software`:
+`software: wildsync 1.1.0, commit <hash>[ + local changes] (<describe>), from <source>`.
+The same object is in `GET /api/diag` (`rigd.software`), in the rigd journal's
+`rigd up` event, and in `GET /api/run/detail` (`software`, null for older runs).
+
+### time_source
+
+`host` (no GPS correction; the rigd host's clock) or `gps`. Runs recorded
+before v1.1.0 carry the legacy `jetson` for `host`; see the flight_log section
+above. Readers use `rigcore.HOST_TIME_SOURCES` / `rigcore.is_host_time_source()`.
