@@ -192,7 +192,7 @@ class EventLog:
     # PROTOCOL.md calls ~/rig/rigd.jsonl "rolling", but nothing ever rolled it.
     # Measured at 188 bytes/event with the rig merely idling, and every reconcile
     # cycle, node transition and anomaly writes more: a multi-day deployment
-    # fills the Jetson's root volume - which is the SAME volume ~/rig-runs writes
+    # fills the host's root volume - which is the SAME volume ~/rig-runs writes
     # every transect frame to, so an unbounded journal ends a survey. Cap it and
     # keep exactly one previous generation, so the last ~32 MB of history
     # survives while the disk cannot be consumed.
@@ -338,10 +338,10 @@ def http_bytes(url, timeout=20, cap=64 * 1024 * 1024):
 def free_mb(path):
     """Free megabytes on the volume holding `path`, or None if unreadable.
 
-    Nothing in the rig measured the JETSON's free space - the "Disk" field in
+    Nothing in the rig measured the HOST's free space - the "Disk" field in
     the UI and the disk_low detector both report a Pi's PC-save spool - yet
-    ~/rig-runs on the Jetson is where every transect actually lands. A full
-    Jetson volume is not caught in advance: each frame's write raises OSError,
+    ~/rig-runs on the host is where every transect actually lands. A full
+    host volume is not caught in advance: each frame's write raises OSError,
     is counted as a pull_fail, and is NEVER retried (the frame is added to the
     worker's `seen` set before the download), so those frames get no flight_log
     row and no nav/IMU correlation. Cheap enough (one statvfs) to call from the
@@ -2085,7 +2085,7 @@ def _flight_dt_epoch(s):
     try:
         # timegm, not mktime: the column is UTC (run.py stamps it with
         # time.gmtime), and inverting it through local time would shift every
-        # frame by the Jetson's timezone offset - which on a boat is whatever
+        # frame by the host's timezone offset - which on a boat is whatever
         # the last person to set it chose.
         base = calendar.timegm((2000 + yy, mo, dd, hh, mi, ss, 0, 1, 0))
     except (ValueError, OverflowError):

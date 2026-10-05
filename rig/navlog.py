@@ -31,7 +31,7 @@ file stays greppable and line-oriented.
 Usage
 -----
     import navlog, nav
-    log = navlog.open_run_log("/home/wildtech/rig-runs/260816_0100_transect-01")
+    log = navlog.open_run_log("~/rig-runs/260816_0100_transect-01")
     reader = nav.NavReader()
     reader.set_raw_hook(log)          # duck-typed: uses log.write_line()
     ...

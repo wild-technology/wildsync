@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""rigd — the Jetson-side orchestrator and web UI for the camera fleet.
+"""rigd — the host-side orchestrator and web UI for the camera fleet.
 
-One rigd runs on the Jetson. It:
+One rigd runs on the rig host. It:
   * monitors every camera node and reconnects them automatically;
   * holds ONE desired settings vector and continuously converges every camera
     onto it, so the pair is always identically configured regardless of what
@@ -39,10 +39,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("RIGD_PORT", "9090"))
 UI_PATH = os.path.join(HERE, "rig_ui.html")
 
-# Free space on the JETSON volume below which a transect is at risk. Nothing
+# Free space on the HOST volume below which a transect is at risk. Nothing
 # measured this before: the disk_low detector and the UI's "Disk" field both
 # report a Pi's PC-save spool, while every transect is written to ~/rig-runs on
-# the Jetson. A full Jetson volume is not survivable in-run - each frame's write
+# the host. A full host volume is not survivable in-run - each frame's write
 # raises OSError and the frame is never retried, so it gets no flight_log row
 # and no nav/IMU correlation, permanently - so the warning has to come early.
 # Sized on the worst case: at transsize=0 a delivered JPEG measured 14.1 MB, so
@@ -967,7 +967,7 @@ class Anomalies:
                 "in Controls, Deploy to fleet or Discard. Frames taken now are "
                 "a mismatched stereo pair, and a run start will drop the "
                 "preview; it also expires on its own"))
-        # The Jetson volume the transects are actually written to.
+        # The host volume the transects are actually written to.
         # ---- clock domains (contract C1) ----------------------------------
         # Every scheduled fire epoch, every GPIO edge epoch/epoch_hw and every
         # piagent /health time.epoch is on the NODE clock; the fire scheduler,
@@ -1078,7 +1078,7 @@ class Anomalies:
         if isinstance(free, (int, float)) and free < RUNS_DISK_LOW_MB:
             out.append(self._a(
                 "runs_disk_low", None,
-                "Jetson runs volume low (%d MB free)" % free,
+                "Host runs volume low (%d MB free)" % free,
                 {"free_mb": free, "path": rigcore.RUNS_DIR,
                  # Both the format the fleet runs today and the one a survey
                  # actually wants, because the difference is 44x.
@@ -1735,7 +1735,7 @@ class Rig:
                 pass
             try:
                 ta = getattr(self.nav, "time_authority", None)
-                # gps_epoch() always returns a value (Jetson time when there is
+                # gps_epoch() always returns a value (host time when there is
                 # no fix), so it cannot tell us whether GPS is really flowing —
                 # source() does. Only claim GPS time when a fresh fix is held.
                 if ta and ta.source() == "gps":

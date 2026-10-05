@@ -126,7 +126,7 @@ and what stops working without it).
 ### 3a. Mac host (launchd)
 
 ```sh
-python3 -m pip install -r requirements.txt
+/opt/homebrew/bin/python3 -m pip install -r requirements.txt   # the interpreter the launchd job runs
 mkdir -p ~/rig
 sed "s|__REPO__|$(pwd)|g; s|__HOME__|$HOME|g" deploy/rigd.launchd.plist \
   > ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
@@ -177,8 +177,11 @@ user with the host's ssh key, and the static address `192.168.1.20N` alongside a
 DHCP lease. `docs/PI-SETUP.md` §2–§5 is the step-by-step, including the first
 boot and the one trap worth reading before you start: **a fresh Pi boots months
 in the past** (no RTC battery), and `apt` then fails on every repository (§5.1).
-For a card that has already booted, `deploy/pi-resync/install.sh
-/Volumes/system-boot` re-applies the ssh key and the clock topology.
+Those cloud-init files do not write the nodes' chrony peer mesh
+(`/etc/chrony/conf.d/10-wildsync.conf`). Run `deploy/pi-resync/install.sh
+/Volumes/system-boot` on every card, new or already booted: it writes the mesh
+and re-applies the ssh key. `deploy.sh provision` warns when a node has no mesh
+file.
 
 Then fit the card, connect the node to the rig switch, apply PoE, connect the
 camera (USB and harness) and the IMU, and set the camera body to PC Remote. Set
@@ -193,6 +196,11 @@ deploy/deploy.sh trust     cam1    # push the host's ssh key (asks for the Pi pa
 deploy/deploy.sh provision cam1    # SDK, usbfs, chrony, build tools
 deploy/deploy.sh node      cam1    # build ilxctl, udev rules, Olive link, start services
 ```
+
+On a Jetson host, run `deploy/deploy.sh jetson` (section 3b) before
+`deploy.sh node`: `node` points a node's chrony at the host only when the host
+is already the rig's chrony server. If a node was deployed first, run `node` for
+it again.
 
 Repeat for `cam2` (and `cam3` if fitted). `deploy/deploy.sh all` runs `node` for
 every reachable node and then `jetson`; use it from a Jetson host only, since
