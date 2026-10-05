@@ -932,14 +932,20 @@ instant is gpiomon's pipe-read stamp, so `time_err_ms` carries the documented
 read excursion (0.25 s) instead of the clock error, and consumers that treat
 `gpio_edge` as hardware-timed — the strobe verdict, the "measured" pair spread
 — correctly decline it. `time_source` =
-`gps|jetson`. The 23 columns are unchanged. **Behaviour change 2026-08-23:**
+`gps|host`: `host` means the rigd host's own clock, with no GPS correction.
+Runs recorded before v1.1.0 wrote the legacy label `jetson` for the same thing,
+whatever machine the host was (the 2026-08-20 transects were recorded on a Mac);
+every reader accepts both, and nothing writes `jetson` any more. The same
+values appear in `run.json` (`time.source`, `time.live_source`), `/api/runs`,
+`/api/fleet`, `/api/diag` and the nav reader's `time_source`. The 23 columns
+are unchanged. **Behaviour change 2026-08-23:**
 `time_err_ms` on a `gpio_edge` row is no longer `0.0` — it carries the
 host↔node offset's own uncertainty (half the best RTT in the filter window,
 typically well under 1 ms). `exif` and `command` rows add the same term.
 
 Time model: GPS time (PGN 126992/129029) when the N2K network is live →
-`gps_offset = gps - jetson`; all log stamps corrected by it. No fix → offset 0,
-`time_source=jetson`. Camera EXIF offset measured per node at run start
+`gps_offset = gps - host`; all log stamps corrected by it. No fix → offset 0,
+`time_source=host` (legacy runs: `jetson`). Camera EXIF offset measured per node at run start
 (calibration frame: fire, read EXIF DateTimeOriginal+SubSec, diff vs
 GPIO exposure edge when available, else command epoch + 20 ms). Frame capture
 instant preference: GPIO EXPOSURE fall edge > corrected EXIF > command time.

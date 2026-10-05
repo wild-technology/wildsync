@@ -109,7 +109,7 @@ def test_full_stack(tmpdir):
     time.sleep(0.4)
     ok("gateway_online on a control line alone", nr.gateway_online)
     ok("off-bus gateway yields no fix", nr.fix_at()["valid"] is False)
-    ok("no GPS yet -> jetson", nr.time_authority.source() == "jetson")
+    ok("no GPS yet -> host", nr.time_authority.source() == "host")
 
     os.write(master, mkline(129025, pgn_129025()))
     os.write(master, mkline(128267, pgn_128267()))
@@ -158,9 +158,9 @@ def test_full_stack(tmpdir):
 
     sect("3. GPS going stale must hand authority back to the Jetson")
     nr.time_authority._fed_local = time.time() - (nav.TimeAuthority.STALE_S + 0.2)
-    ok("stale -> jetson", nr.time_authority.source() == "jetson")
+    ok("stale -> host", nr.time_authority.source() == "host")
     ok("stale -> offset dropped", nr.time_authority.offset_to() == 0.0)
-    ok("flight_row reports jetson", nr.flight_row()["time_source"] == "jetson")
+    ok("flight_row reports host", nr.flight_row()["time_source"] == "host")
 
     sect("4. gateway unplugged mid-run")
     seen = nr._line_count
@@ -268,7 +268,7 @@ def test_wrong_baud():
     ok("thread survived binary garbage", nr._thread.is_alive())
     ok("garbage produced no fix", nr.snapshot()["valid"] is False)
     ok("garbage produced no GPS authority",
-       nr.time_authority.source() == "jetson")
+       nr.time_authority.source() == "host")
     nr.stop()
     os.close(master)
 
@@ -287,7 +287,7 @@ def test_absent():
     ok("dead reader: every nav column None",
        all(row[k] is None for k in nav.FLIGHT_LOG_KEYS), row)
     ok("dead reader: not valid", row["valid"] is False)
-    ok("dead reader: jetson time", row["time_source"] == "jetson")
+    ok("dead reader: host time", row["time_source"] == "host")
     ok("dead reader: health is a dict", isinstance(dead.health(), dict))
     print("    resolver on this box:", nav.find_ikonvert_port())
 

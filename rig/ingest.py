@@ -809,6 +809,8 @@ def _selftest():
             with open(os.path.join(card, stem + ".ARW"), "wb") as fh:
                 fh.write(b"RAW" * 100)
             os.makedirs(os.path.join(root, "cam%d" % cam), exist_ok=True)
+            # "jetson": a run recorded before v1.1.0 carries the legacy
+            # host-clock label, and ingest must keep reading it.
             fl[cam].append({"filename": fn, "lat": "41.4237752", "long": "-71.4537835",
                             "xutm": "294952.55", "yutm": "4588707.83", "utm_zone": "19T",
                             "pitch": "1.2", "roll": "-9.8", "heading_imu": "170.7",
@@ -837,6 +839,7 @@ def _selftest():
     assert len(arws) == 4 and len(xmps) == 4, (arws, xmps)
     x = open(xmps[0]).read()
     assert "<exif:GPSLatitude>41,25.426512N" in x and "<wildsync:capture_epoch>" in x, x[:400]
+    assert "<wildsync:time_source>jetson</wildsync:time_source>" in x, x
     assert os.path.exists(os.path.join(root, "ingest_manifest.csv"))
     # idempotent
     out2 = ingest(card, runs_dir=runs, log=lambda *a: None)

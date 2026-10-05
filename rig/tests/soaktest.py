@@ -264,7 +264,7 @@ class FakeNav:
         s = {k: None for k in NAV_KEYS}
         s.update({"local_epoch": at, "epoch": at, "age_s": None,
                   "valid": False, "stale": True, "gateway_online": True,
-                  "time_source": "gps" if self.fix else "jetson"})
+                  "time_source": "gps" if self.fix else "host"})
         if self.fix:
             s.update(NAV_FIX)
             s.update(valid=True, stale=False, age_s=0.05)
@@ -1108,8 +1108,10 @@ def suite_runmgr(opts):
               and rowa[idx["datetime"]][:6] ==
               time.strftime("%y%m%d", time.gmtime(t_a)),
               rowa[idx["datetime"]])
-        check("time_source is recorded", rowa[idx["time_source"]] in
-              ("gps", "jetson"), rowa[idx["time_source"]])
+        # "host" since v1.1.0; the legacy "jetson" label is read, never written.
+        check("time_source is recorded as gps or host",
+              rowa[idx["time_source"]] in ("gps", "host"),
+              rowa[idx["time_source"]])
         # gpio_edge_soft: a real EXPOSURE edge whose node could not stamp it
         # in the kernel, so its instant is the pipe-read stamp and its error
         # bar is the read excursion rather than the clock offset. A separate
@@ -1708,7 +1710,7 @@ def suite_pull(opts):
         n0 = len(rows())
         real_now = env.timesync.now
         fixed = time.time()
-        env.timesync.now = lambda: (fixed, "jetson")
+        env.timesync.now = lambda: (fixed, "host")
         DUPS = ("ILXDUP1.JPG", "ILXDUP2.JPG")
         a.add_frame(epoch=fixed, name=DUPS[0], exif=False)
         a.add_frame(epoch=fixed, name=DUPS[1], exif=False)
@@ -2302,7 +2304,7 @@ def soak(seconds, opts):
 # it. So an import failure becomes one FAILing check named after the suite and
 # every other suite still runs.
 AUDIT_SUITES = ["run", "rigcore", "rigd", "drain", "ui", "piagent", "ilxctl",
-                "nav", "verify"]
+                "nav", "verify", "provenance"]
 
 
 def _audit_suite(name):

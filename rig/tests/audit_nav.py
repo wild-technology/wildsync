@@ -172,11 +172,11 @@ def _n1_confirmation_still_guarded(opts):
     # one sender, one frame: still not authority
     ta = nav.TimeAuthority()
     feed(ta, 129029, gnss(now + 2.0), now, src=7)
-    check("single frame is still jetson", src_at(ta, now) == "jetson")
+    check("single frame is still host", src_at(ta, now) == "host")
     # same sender disagreeing with itself: still refused
     feed(ta, 129029, gnss(now + 1.0 + 40.0), now + 1.0, src=7)   # off 40.0
-    check("self-disagreeing pair stays jetson",
-          src_at(ta, now + 1.0) == "jetson")
+    check("self-disagreeing pair stays host",
+          src_at(ta, now + 1.0) == "host")
     # then agreeing with itself twice: confirmed
     feed(ta, 129029, gnss(now + 2.0 + 40.0), now + 2.0, src=7)   # off 40.0
     check("self-agreeing pair confirms", src_at(ta, now + 2.0) == "gps")
@@ -189,7 +189,7 @@ def _n1_confirmation_still_guarded(opts):
     feed(tb, 129029, gnss(now + 5.0), now, src=1)
     feed(tb, 129029, gnss(now + 1.0 + 5.0), now + 1.0, src=2)
     check("cross-sender agreement alone does not confirm",
-          src_at(tb, now + 1.0) == "jetson", str(tb.status()))
+          src_at(tb, now + 1.0) == "host", str(tb.status()))
     # no disagreement dict when senders agree within tolerance
     tc = nav.TimeAuthority()
     for i in range(4):
@@ -264,7 +264,7 @@ def _n2_latency_bound(opts):
 def _n1_starvation_is_measurable(opts):
     """The starvation N1 removes must still be REPORTABLE when it happens for
     another reason (a single sender that never agrees with itself), so rigd
-    can raise nav_time_unconfirmed instead of silently running on jetson."""
+    can raise nav_time_unconfirmed instead of silently running on host time."""
     sect("audit N1: unconfirmed starvation is exposed as a duration")
     now = time.time()
     ta = nav.TimeAuthority()
@@ -278,8 +278,8 @@ def _n1_starvation_is_measurable(opts):
           st.get("unconfirmed_for_s") is not None
           and abs(st["unconfirmed_for_s"] - 11.0) < 0.1,
           str(st.get("unconfirmed_for_s")))
-    check("still jetson while unconfirmed",
-          src_at(ta, now + 11.0) == "jetson", str(st.get("source")))
+    check("still host while unconfirmed",
+          src_at(ta, now + 11.0) == "host", str(st.get("source")))
     tb = nav.TimeAuthority()
     for i in range(4):
         feed(tb, 129029, gnss(now + i + 3.0), now + i, src=3)
@@ -327,7 +327,7 @@ def _n3_replay_clock(opts):
         t_late = t0 + 1.2 + nav.TimeAuthority.STALE_S + 1.0
         fx2 = rd.fix_at(t_late)
         check("staleness honored relative to the replayed epoch",
-              fx2["time_source"] == "jetson" and fx2["gps_offset_s"] == 0.0,
+              fx2["time_source"] == "host" and fx2["gps_offset_s"] == 0.0,
               "%s %s" % (fx2["time_source"], fx2["gps_offset_s"]))
         # the instant-less views (snapshot/health/gateway_online) have no
         # epoch to judge at, so replay parks the reader's judgement clock at
@@ -352,13 +352,13 @@ def _n3_replay_clock(opts):
         restored = set_clock(rd, None)
         check("set_clock(None) restores the wall clock",
               restored and rd.gateway_online is False
-              and rd.time_authority.source() == "jetson",
+              and rd.time_authority.source() == "host",
               "set_clock present: %r" % restored)
         rd2 = reader()
         replay_nofreeze(path, rd2)
         check("freeze_clock=False keeps wall-clock judgement",
               rd2.gateway_online is False
-              and rd2.time_authority.source() == "jetson")
+              and rd2.time_authority.source() == "host")
         check("freeze_clock=False still reproduces fix_at at the instant",
               rd2.fix_at(t_cap)["time_source"] == "gps",
               str(rd2.fix_at(t_cap)["time_source"]))
@@ -382,7 +382,7 @@ def _n3_live_pulled_frame(opts):
           fx["time_source"] == "gps" and abs(fx["gps_offset_s"] - 2.0) < 0.05,
           "%s %s" % (fx["time_source"], fx["gps_offset_s"]))
     check("but the authority is stale NOW (wall clock)",
-          rd.time_authority.source() == "jetson")
+          rd.time_authority.source() == "host")
 
 
 def _n3_offset_step_not_backdated(opts):

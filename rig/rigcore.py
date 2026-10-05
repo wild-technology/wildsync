@@ -1937,14 +1937,29 @@ class SettingsManager:
 
 
 # ---------------------------------------------------------------------------
-# Time authority: GPS (from nav) with Jetson fallback, plus per-node EXIF offset.
+# Time authority: GPS (from nav) with host-clock fallback, plus per-node EXIF
+# offset.
 # ---------------------------------------------------------------------------
+# The time_source label for "no GPS time; stamps are the rigd host's clock".
+# Runs recorded before v1.1.0 wrote "jetson" for the same thing, whatever the
+# host actually was (the 20 Aug 2026 transects were recorded on a Mac). New
+# runs write "host"; every reader must accept both.
+HOST_TIME_SOURCE = "host"
+LEGACY_HOST_TIME_SOURCE = "jetson"
+HOST_TIME_SOURCES = (HOST_TIME_SOURCE, LEGACY_HOST_TIME_SOURCE)
+
+
+def is_host_time_source(v):
+    """True for the host-clock label, current or legacy."""
+    return v in HOST_TIME_SOURCES
+
+
 class TimeSync:
     def __init__(self, events):
         self.events = events
         self._lock = threading.Lock()
-        self.gps_offset = 0.0        # gps_epoch - jetson_epoch
-        self.source = "jetson"
+        self.gps_offset = 0.0        # gps_epoch - host_epoch
+        self.source = HOST_TIME_SOURCE
         self.exif_offset = {}        # node -> (camera_epoch - true_epoch)
 
     def feed_gps(self, gps_epoch):
@@ -1957,7 +1972,7 @@ class TimeSync:
     def clear_gps(self):
         with self._lock:
             self.gps_offset = 0.0
-            self.source = "jetson"
+            self.source = HOST_TIME_SOURCE
 
     def now(self):
         with self._lock:

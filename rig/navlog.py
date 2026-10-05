@@ -297,9 +297,10 @@ def replay(path, reader, use_recorded_time=True, limit=None,
     WHAT FAILED: this docstring promised the recorded run's behaviour, but
     every "now" judgement — TimeAuthority freshness, gateway_online — was made
     against TODAY's time.time().  Replaying yesterday's log therefore always
-    reported time_source='jetson', gps_offset_s=0.0 and gateway_online=False,
-    so a "wrong datetime" or "dropped to jetson mid-run" field report could
-    not be reproduced at a desk at all.
+    reported the host-clock time_source (then labelled 'jetson'),
+    gps_offset_s=0.0 and gateway_online=False, so a "wrong datetime" or
+    "dropped to host time mid-run" field report could not be reproduced at a
+    desk at all.
 
     WHY THIS SHAPE: two complementary halves.  (1) nav.fix_at(t) now judges
     at `t` itself, so per-frame lookups — what run.py's flight_log rows

@@ -301,7 +301,7 @@ def test_exif_and_pull(node):
             w.writerow(run.FLIGHT_HEADER)
             row = {k: "" for k in run.FLIGHT_HEADER}
             row.update({"filename": fname, "datetime": run._fmt_dt(epoch),
-                        "capture_source": "exif", "time_source": "jetson"})
+                        "capture_source": "exif", "time_source": "host"})
             w.writerow([row[k] for k in run.FLIGHT_HEADER])
         with open(path) as fh:
             rows = list(csv.reader(fh))

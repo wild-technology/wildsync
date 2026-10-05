@@ -9,7 +9,7 @@ the rig needs, and exposes:
                       time-indexed history ring, .snapshot() for rigd,
                       .fix_at(epoch) for run.py's per-image flight_log row,
                       .set_raw_hook() for nmea_raw.log
-    TimeAuthority     GPS-time authority (PGN 126992 / 129029) with Jetson
+    TimeAuthority     GPS-time authority (PGN 126992 / 129029) with host-clock
                       fallback, per PROTOCOL.md's time model
     latlon_to_utm     pure WGS84 -> UTM forward transform (no external geo libs)
     parse_pdgy / decode_pgn    pure parser layer, unit-testable offline
@@ -583,13 +583,20 @@ def latlon_to_utm(lat, lon):
 
 
 # ---------------------------------------------------------------------------
-# TimeAuthority — GPS time (126992/129029) with Jetson fallback
+# TimeAuthority — GPS time (126992/129029) with host-clock fallback
 # ---------------------------------------------------------------------------
+
+# time_source when no GPS time word holds: the rigd host's own clock. Runs
+# recorded before v1.1.0 carry the legacy label "jetson" for the same thing;
+# readers accept both (rigcore.HOST_TIME_SOURCES).
+HOST_SOURCE = "host"
+LEGACY_HOST_SOURCE = "jetson"
+
 
 class TimeAuthority:
     """PROTOCOL.md time model: when GPS time is flowing, gps_offset = gps -
-    jetson and all stamps are corrected by it; otherwise offset 0 and
-    time_source = 'jetson'.
+    host and all stamps are corrected by it; otherwise offset 0 and
+    time_source = 'host' (legacy runs: 'jetson').
 
     source() returns "gps" ONLY when ALL of these hold:
 
@@ -922,9 +929,9 @@ class TimeAuthority:
 
     def source(self, now=None):
         """'gps' when a confirmed, satellite-sourced time word covers the
-        instant `now` (default: the wall clock), else 'jetson'."""
+        instant `now` (default: the wall clock), else 'host'."""
         with self._lock:
-            return "gps" if self._fresh(now) else "jetson"
+            return "gps" if self._fresh(now) else HOST_SOURCE
 
     def offset_to(self, local_epoch=None):
         """Seconds to ADD to a local (Jetson) epoch to express it in GPS time.
@@ -967,7 +974,7 @@ class TimeAuthority:
                             or self._cand_local - self._fed_local
                             > self.STALE_S))
             return {
-                "source": "gps" if fresh else "jetson",
+                "source": "gps" if fresh else HOST_SOURCE,
                 "offset_s": self._offset if fresh else 0.0,
                 "raw_offset_s": self._offset,
                 "age_s": (None if self._fed_local is None
@@ -980,7 +987,7 @@ class TimeAuthority:
                 # accepted feeds keep arriving but nothing has confirmed for
                 # longer than the stale bound (or ever): the exact starvation
                 # the per-sender candidates exist to prevent — surfaced so
-                # rigd can alarm on it instead of silently running on jetson
+                # rigd can alarm on it instead of silently running on host time
                 "candidate_pending": pending,
                 # How much accepted feed has run without confirming: last
                 # accepted feed minus last confirmation (minus the FIRST
@@ -1409,7 +1416,7 @@ class NavReader:
         and then every "now" test — gateway_online, snapshot(), health(),
         TimeAuthority freshness — was made against TODAY's time.time(), so a
         desk reproduction of a field report always came back
-        'jetson'/offline/stale no matter what the log contained.
+        'host'/offline/stale no matter what the log contained.
 
         WHY THIS SHAPE: fix_at() already judges at the instant it is asked
         about (which is the correct live behaviour too, and what run.py's
@@ -1874,7 +1881,7 @@ class NavReader:
             valid          True only when lat AND lon are present and fresh
             stale          not valid
             ages           {pgn: seconds} per contributing PGN
-            time_source    'gps' | 'jetson'
+            time_source    'gps' | 'host'
             gateway_online bool
 
         Never raises; a dead gateway yields valid=False with every value None,
@@ -1886,7 +1893,7 @@ class NavReader:
         exposure gets the authority that held at the exposure, and
         navlog.replay() of yesterday's log followed by fix_at(t_cap)
         reproduces the judgements the live run made — replaying with today's
-        wall clock used to force time_source='jetson' and gateway_online=False
+        wall clock used to force time_source='host' and gateway_online=False
         on every replayed instant.
         """
         at = self._now() if epoch is None else float(epoch)
@@ -2195,13 +2202,13 @@ def _selftest(verbose=True):
                 "method_str": _GNSS_METHOD.get(method), "sats": sats}
 
     ta = TimeAuthority()
-    check("TA starts on jetson", ta.source(), "jetson")
+    check("TA starts on host", ta.source(), HOST_SOURCE)
     check("TA offset 0", ta.offset_to(now), 0.0)
     check("TA age None", ta.age_s(), None)
 
     # a SINGLE good frame must not be enough
     truthy("TA accepts good 129029", ta.feed(129029, gnss(dt=2.5), now))
-    check("TA one frame is still jetson", ta.source(), "jetson")
+    check("TA one frame is still host", ta.source(), HOST_SOURCE)
     # a second frame one second later, still 2.5 s ahead of local -> agrees
     truthy("TA accepts 2nd 129029",
            ta.feed(129029, gnss(dt=2.5, at=now + 1.0), now + 1.0))
@@ -2211,7 +2218,7 @@ def _selftest(verbose=True):
 
     # staleness: past STALE_S the Jetson takes over and the offset is dropped
     ta._fed_local = time.time() - (TimeAuthority.STALE_S + 0.5)
-    check("TA stale -> jetson", ta.source(), "jetson")
+    check("TA stale -> host", ta.source(), HOST_SOURCE)
     check("TA stale offset dropped", ta.offset_to(), 0.0)
     ta._fed_local = time.time() - (TimeAuthority.STALE_S - 0.5)
     check("TA just-fresh -> gps", ta.source(), "gps")
@@ -2235,7 +2242,7 @@ def _selftest(verbose=True):
         t = TimeAuthority()
         truthy("TA refuses %s (feed)" % name, not t.feed(pgn, dec, now))
         t.feed(pgn, dec, now + 1.0)
-        check("TA refuses %s (source)" % name, t.source(), "jetson")
+        check("TA refuses %s (source)" % name, t.source(), HOST_SOURCE)
 
     # an absurd offset is refused even from a nominally good fix
     t = TimeAuthority()
@@ -2246,7 +2253,7 @@ def _selftest(verbose=True):
     t = TimeAuthority()
     t.feed(129029, gnss(dt=2.0, at=now), now)
     t.feed(129029, gnss(dt=40.0, at=now + 1.0), now + 1.0)
-    check("TA disagreeing pair stays jetson", t.source(), "jetson")
+    check("TA disagreeing pair stays host", t.source(), HOST_SOURCE)
     t.feed(129029, gnss(dt=40.0, at=now + 2.0), now + 2.0)
     check("TA agreeing pair confirms", t.source(), "gps")
     check("TA settles on the confirmed offset", t.offset_to(), 40.0, 1e-6)
@@ -2373,7 +2380,7 @@ def _selftest(verbose=True):
     # 129029's time word came from a real fix, but only one of them arrived,
     # so the two-strike rule keeps us on the Jetson clock.
     check("snapshot time_source after 1 gnss frame", snap["time_source"],
-          "jetson")
+          HOST_SOURCE)
 
     # legacy key set must not have regressed
     for k in ("epoch", "time_source", "gps_offset_s", "gateway_online", "lat",
@@ -2404,7 +2411,7 @@ def _selftest(verbose=True):
     truthy("fix_at ancient epoch is invalid", not old["valid"])
     check("fix_at ancient lat is None", old["lat"], None)
     check("fix_at ancient depth is None", old["depth_from_xplore9"], None)
-    check("fix_at ancient time_source", old["time_source"], "jetson")
+    check("fix_at ancient time_source", old["time_source"], HOST_SOURCE)
 
     # a reader that never saw a byte must report cleanly, not crash
     dead = NavReader(port="/dev/null", auto_reopen=False)
@@ -2416,7 +2423,7 @@ def _selftest(verbose=True):
     truthy("dead reader flight_row all None",
            all(drow[k] is None for k in FLIGHT_LOG_KEYS))
     truthy("dead reader health", isinstance(dead.health(), dict))
-    check("dead reader time_source", drow["time_source"], "jetson")
+    check("dead reader time_source", drow["time_source"], HOST_SOURCE)
 
     # gateway_online must decay: it is derived from the last receive time
     nr._last_rx = time.time() - (NavReader.ONLINE_S + 1.0)

@@ -1549,7 +1549,7 @@ class RunManager:
         try:
             gnow, src = self.timesync.now()
         except Exception:  # noqa: BLE001
-            return 0.0, "jetson"
+            return 0.0, rigcore.HOST_TIME_SOURCE
         return gnow - t0, src
 
     def time_base(self):

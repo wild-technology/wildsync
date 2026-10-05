@@ -861,7 +861,7 @@ class FakeReader:
              "heading_mag_deg": None, "sog_mps": None, "sats": None,
              "valid": False, "stale": True, "local_epoch": at, "epoch": at,
              "age_s": None, "gateway_online": self.gateway_online,
-             "time_source": "gps" if self.fix else "jetson"}
+             "time_source": "gps" if self.fix else "host"}
         if self.fix:
             r.update(lat=40.5, lon=-105.5, long=-105.5, valid=True,
                      stale=False, age_s=0.05, sats=9)
