@@ -4,7 +4,7 @@ All notable changes to Wild Sync are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Dates are commit
 dates.
 
-## [Unreleased] - will become 1.1.0
+## [1.1.0] - 2026-10-07
 
 ### Added
 - `LICENSE`: MIT licence.
