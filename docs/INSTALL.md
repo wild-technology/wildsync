@@ -45,7 +45,7 @@ was the one in use on 2026-08-20.
 | **Rig host** | a Mac (Apple Silicon) or a Jetson Orin NX, wired to the rig switch |
 | Rig switch and PoE | a PoE switch for the nodes. cam1 is on its own 802.3at injector, cam2 on the switch: two nodes firing in sync overran the switch's PoE budget and it dropped a port every time until cam1 was isolated (`docs/FIELD-RUN.md`, Topology; `docs/PI-SETUP.md` §8) |
 | 12 V supply for the camera bodies | 10–18 V DC at the camera connector, at least 40 W momentary (`docs/harness-and-strobe.md` §2) |
-| Navigation | a Subsonus RTK antenna on an NMEA 2000 backbone and a Digital Yacht **iKonvert** gateway to the host's USB (`docs/iKonvertManual.pdf`) |
+| Navigation | a Subsonus RTK antenna on an NMEA 2000 backbone and a Digital Yacht **iKonvert** gateway to the host's USB ([product page](https://digitalyacht.co.uk/product/ikonvert-nmea-2000-to-usb/), [quick start guide](https://digitalyachtamerica.com/download/ikonvert-usb-quick-start-guide-v2_02/?wpdmdl=5667)) |
 | Strobe (optional) | an XR256, its trigger interface board and a regulated 24 V supply (`docs/xr256-jetson-trigger.md`) |
 
 ### Network

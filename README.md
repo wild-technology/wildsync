@@ -354,8 +354,9 @@ and documentation. It does **not** cover:
 
 - the **Sony Camera Remote SDK**, which is not in this repository and stays
   under Sony's own licence agreement;
-- the **vendor PDFs in `docs/`** (Smart Vision Lights, VA Imaging,
-  Digital Yacht), kept for reference and the copyright of their publishers;
+- the **vendor documentation** the docs cite (Smart Vision Lights, VA Imaging,
+  Digital Yacht), which is not redistributed here and stays the copyright of
+  its publishers (where to get it: `THIRD_PARTY_NOTICES.md`);
 - the third-party components listed in
   [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), each under its own
   licence. `third_party/httplib.h` is cpp-httplib, vendored under its MIT

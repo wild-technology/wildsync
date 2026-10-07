@@ -126,17 +126,17 @@ declare a different licence expression.
 `python3-libgpiod`). It was not installed on the host where this file was
 written, so its licence and version are not asserted.
 
-## Vendor documentation kept in `docs/`
+## Vendor documentation
 
-Three PDFs from equipment vendors are kept in `docs/` for reference. They are
-not part of Wild Sync, are not covered by its licence, and remain the
-copyright of their publishers.
+The documentation below is cited by Wild Sync's docs. The documents
+themselves are not redistributed in this repository; they remain the
+copyright of their publishers. Get them from the vendors.
 
-| File | Publisher | What it is |
+| Document | Publisher | Where to get it |
 |---|---|---|
-| `docs/XR256_Datasheet.pdf` | Smart Vision Lights | XR256 high-speed strobe light (OverDrive) product data sheet |
-| `docs/VA_Imaging_Industrial_Strobe_Controller.pdf` | VA Imaging | Industrial strobe controller page from the publisher's web site (its footer reads "(c) 2026 - VA Imaging"), saved to PDF from a browser on 2026-08-28 |
-| `docs/iKonvertManual.pdf` | Digital Yacht | Instruction manual for the iKonvert NMEA 2000 gateway |
+| XR256 Series High-Speed Strobe Light data sheet, Rev 2020/06/15 | Smart Vision Lights | From the publisher (the XR256 is end of life and its product page no longer resolves) |
+| Industrial Strobe Controller (LED-Light, Trigger), VA-STRB-D1-V1, product page | VA Imaging | <https://va-imaging.com/en-us/products/industrial-strobe-controller-led-light-trigger-va-strb-d1-v1> |
+| iKonvert NMEA 2000 to USB gateway, quick start guide | Digital Yacht | <https://digitalyacht.co.uk/product/ikonvert-nmea-2000-to-usb/> (guide: <https://digitalyachtamerica.com/download/ikonvert-usb-quick-start-guide-v2_02/?wpdmdl=5667>) |
 
 ## Referenced at view time, not distributed
 

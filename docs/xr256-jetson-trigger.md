@@ -9,7 +9,9 @@ flash exposes both ILX-LR1 bodies on sync.
 > field. It replaces the earlier Bolt VB-22 contact-closure design
 > (`docs/strobe-trigger.md`, still supported by `piagent`); the *topology* that
 > design settled carries over intact.
-> Datasheet: `docs/XR256_Datasheet.pdf` (SVL, Rev 2020/06/15).
+> Datasheet: Smart Vision Lights, *XR256 Series High-Speed Strobe Light*
+> data sheet, Rev 2020/06/15. Not redistributed here; the XR256 is end of
+> life, so ask Smart Vision Lights for a copy.
 
 **Status:** software in place (2026-09-21) — `piagent` runs on the Jetson in its
 strobe role (`PIAGENT_ROLE=strobe`, active-high line for this board), installed
