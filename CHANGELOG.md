@@ -104,3 +104,11 @@ The repository history was rewritten on 2026-09-21 and again on 2026-10-05
 commit). Commit IDs quoted before 2026-10-05 no longer resolve. Known
 mappings: `fe114e8` -> `43c91d6` and `f72b595` -> `4b57fc0`. Refer to the tags
 (`task6-report-2026-08-31`, `v1.0.0`), not commit IDs.
+
+On 2026-10-07 the history was rewritten a third time, when the repository was
+re-created as a public repository: internal notes, the third-camera material
+and the vendor PDFs (which are not redistributable; `THIRD_PARTY_NOTICES.md`
+now says where to get them) were removed from every commit, so every
+tagged version also checks out on Windows. Mappings:
+`task6-report-2026-08-31` `43c91d6` -> `75113f6`, `v1.0.0` `4b57fc0` ->
+`10dcc29`, `v1.1.0` `be8bfce` -> `9d89976`.
