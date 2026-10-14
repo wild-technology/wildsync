@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """rigcal selftest — the stereo solve against a synthetic rig with known
-truth, the guidance engine's advice, and the IMU stillness gate. No hardware,
-no network: capture is bypassed and _detect is fed rendered JPEGs.
+truth, the guidance engine's advice, the pair-synchronisation gate, the save
+guard, and the IMU stillness gate (noise, steady rate, slow tilt, the +/-180
+roll wrap, heading circular means). No hardware, no network: capture is
+bypassed and _detect is fed rendered JPEGs; the IMU windows are injected.
 
 Run: python3 rig/tests/rigcal_selftest.py            (exit 0 = pass)
 """
@@ -170,6 +172,145 @@ def main():
     check("vslam loader reads it back",
           bool(cal) and abs(cal["baseline_m"] - res["baseline_m"]) < 1e-9)
 
+    # ---- save guard: a failed solve never silently replaces a good one ----
+    check("the passing synthetic solve is ok (saves without force)",
+          res.get("ok") is True, res.get("verdict"))
+    sess2 = rigcal.StereoSession(COLS, ROWS, SQ_MM)
+    sess2.result = dict(res, ok=False, baseline_m=0.123,
+                        verdict=["stereo RMS 15.00 px is HIGH"])
+    good_bl = json.load(open(rigcal.STEREO_PATH))["baseline_m"]
+    try:
+        sess2.save()
+        refused = None
+    except RuntimeError as e:
+        refused = str(e)
+    check("a failed solve is refused without force, naming the verdict",
+          refused is not None and "did not pass" in refused
+          and "RMS 15.00" in refused, refused)
+    check("and the saved file is untouched",
+          json.load(open(rigcal.STEREO_PATH))["baseline_m"] == good_bl)
+    out2 = sess2.save(force=True)
+    check("force writes the failed solve",
+          json.load(open(rigcal.STEREO_PATH))["baseline_m"] == 0.123
+          and out2["forced"] is True)
+    check("and keeps the previous solution beside it as .prev",
+          os.path.isfile(rigcal.STEREO_PATH + ".prev")
+          and json.load(open(rigcal.STEREO_PATH + ".prev"))["baseline_m"]
+          == good_bl)
+    sess.save()
+    check("a passing solve still saves with no force",
+          json.load(open(rigcal.STEREO_PATH))["baseline_m"] == good_bl)
+
+    # ---- pair synchronisation: the skew gate is enforced ------------------
+    G = {"path": "gpio", "ok": True}
+    U = {"path": "usb", "ok": True}
+    sy = rigcal._pair_sync({"results": {"cam1": G, "cam2": G}, "skew_ms": 0.6},
+                           ["cam1", "cam2"], 10.0)
+    check("both on GPIO within the budget is synchronised",
+          sy["ok"] is True and sy["skew_ms"] == 0.6, sy)
+    sy = rigcal._pair_sync({"results": {"cam1": G, "cam2": U},
+                            "skew_ms": None}, ["cam1", "cam2"], 10.0)
+    check("a USB-fired camera is unsynchronised, with the reason",
+          sy["ok"] is False and "cam2 fired over usb" in sy["reason"], sy)
+    sy = rigcal._pair_sync({"results": {"cam1": G, "cam2": G}, "skew_ms": 14},
+                           ["cam1", "cam2"], 10.0)
+    check("a skew over the spec is unsynchronised",
+          sy["ok"] is False and "14.0 ms" in sy["reason"], sy)
+    sy = rigcal._pair_sync({"results": {"cam1": G, "cam2": G},
+                            "skew_ms": None}, ["cam1", "cam2"], 10.0)
+    check("GPIO with no measured skew is NOT assumed synchronised",
+          sy["ok"] is False, sy)
+    sy = rigcal._pair_sync({"results": {
+        "cam1": dict(G, exposure_epoch=100.0000),
+        "cam2": dict(G, exposure_epoch=100.0008)}, "skew_ms": 90.0},
+        ["cam1", "cam2"], 10.0)
+    check("the pair's own exposure instants decide, not a third camera's skew",
+          sy["ok"] is True and abs(sy["skew_ms"] - 0.8) < 1e-6, sy)
+
+    import copy
+    mixed = rigcal.StereoSession(COLS, ROWS, SQ_MM)
+    mixed.pairs = copy.deepcopy(sess.pairs)
+    found_pairs = [p for p in mixed.pairs
+                   if all(c.get("found") for c in p["cams"].values())]
+    for p in found_pairs[5:]:
+        p["sync"] = {"ok": False, "reason": "cam2 fired over usb"}
+    stm2 = mixed.status()
+    check("status() counts only the synchronised pairs (legacy unmarked "
+          "records stay usable)", len(found_pairs) > 8
+          and stm2["pairs_good"] == 5, stm2["pairs_good"])
+    check("and says why pairs were rejected",
+          any("rejected" in g and "GPIO" in g for g in stm2["guidance"]),
+          stm2["guidance"])
+    try:
+        mixed.compute()
+        check("compute refuses when too few pairs are synchronised", False)
+    except RuntimeError as e:
+        check("compute refuses when too few pairs are synchronised",
+              "only 5 usable pairs" in str(e), str(e))
+    allsync = rigcal.StereoSession(COLS, ROWS, SQ_MM)
+    allsync.pairs = copy.deepcopy(sess.pairs)
+    for p in allsync.pairs:
+        p["sync"] = {"ok": True, "reason": ""}
+    check("a fully synchronised session is as ready as an unmarked one",
+          allsync.status()["ready"] == sess.status()["ready"])
+
+    # capture() end to end against a stub rig
+    img1, img2 = jpeg(render(*poses[0])), jpeg(render(*poses[0], R2, T2))
+
+    class Mon:
+        def __init__(self, name, num, host):
+            self.name_, self.node, self.host = name, {"cam_num": num}, host
+            self.fired = False
+
+        def is_capturing(self):
+            return True
+
+        def is_connected(self):
+            return True
+
+        def shots(self):
+            return ["IMG_%s.jpg" % self.name_] if self.fired else []
+
+    class Rig:
+        def __init__(self, reply):
+            self.monitors = [Mon("cam1", 1, "h1"), Mon("cam2", 2, "h2")]
+            self.reply = reply
+            self.runmgr = self
+            self.SKEW_BUDGET_MS = 10.0
+
+        def status(self):
+            return {"active": False}
+
+        def drain_status(self):
+            return {"active": False}
+
+        def capture_once(self, af=False):
+            for m in self.monitors:
+                m.fired = True
+            return self.reply
+
+    real_bytes, real_sleep = rigcal.http_bytes, rigcal.time.sleep
+    rigcal.http_bytes = lambda url, timeout=15: (
+        (img1 if "h1" in url else img2), None)
+    rigcal.time.sleep = lambda s_: None
+    try:
+        for label, reply, want in (
+                ("mixed GPIO and USB", {"ok": True, "skew_ms": None, "results": {
+                    "cam1": G, "cam2": U}}, False),
+                ("both GPIO at 0.6 ms", {"ok": True, "skew_ms": 0.6, "results": {
+                    "cam1": G, "cam2": G}}, True),
+                ("both GPIO at 14 ms", {"ok": True, "skew_ms": 14, "results": {
+                    "cam1": G, "cam2": G}}, False)):
+            cs = rigcal.StereoSession(COLS, ROWS, SQ_MM)
+            pv = cs.capture(Rig(reply))
+            check("capture(): %s records sync.ok=%s" % (label, want),
+                  pv["sync"]["ok"] is want, pv["sync"])
+            if not want:
+                check("capture(): the rejection reason reaches pair_view",
+                      bool(pv["sync"]["reason"]), pv["sync"])
+    finally:
+        rigcal.http_bytes, rigcal.time.sleep = real_bytes, real_sleep
+
     # ---- guidance: sparse session asks for more ---------------------------
     poor = rigcal.StereoSession(COLS, ROWS, SQ_MM)
     for rvec, tvec in poses[:3]:
@@ -211,6 +352,109 @@ def main():
     check("motion is detectable for the gate",
           stm["gyro_std_dps"][0] > rigcal.STILL_GYRO_DPS,
           stm["gyro_std_dps"])
+
+    # ---- IMU stillness gate through calibrate_imu ------------------------
+    def window(n=200, **over):
+        out = []
+        for i in range(n):
+            smp = dict(still[0], epoch=i * 0.05)
+            for k, v in over.items():
+                smp[k] = v(i, n) if callable(v) else v
+            out.append(smp)
+        return out
+
+    def gate(by_cam, target="cam1", secs=3.0):
+        """calibrate_imu with injected windows; (error text or None, doc)."""
+        real = (rigcal._collect, rigcal.IMU_SOURCES, rigcal.IMU_PATH)
+        path = os.path.join(tempfile.mkdtemp(), "imu_calibration.json")
+        rigcal.IMU_PATH = path
+        rigcal.IMU_SOURCES = lambda: {n: (n, "/imu/latest") for n in by_cam}
+        rigcal._collect = lambda host, p_, seconds: by_cam[host]
+        try:
+            try:
+                rigcal.calibrate_imu(target, secs)
+                err = None
+            except RuntimeError as e:
+                err = str(e)
+            doc = json.load(open(path)) if os.path.exists(path) else None
+            return err, doc
+        finally:
+            rigcal._collect, rigcal.IMU_SOURCES, rigcal.IMU_PATH = real
+
+    def tilt(i, n):
+        return 15.0 * i / n
+
+    ramp = window(gy=1.5, gz=3.0, pitch=tilt,
+                  ax=lambda i, n: math.sin(math.radians(tilt(i, n))),
+                  ay=0.0,
+                  az=lambda i, n: math.cos(math.radians(tilt(i, n))))
+    err, doc = gate({"cam1": ramp})
+    check("a steady pan with a slow tilt is refused (std gates alone passed it)",
+          err is not None and "MOVED" in err, err)
+    check("and nothing is written for the refused window", doc is None)
+    err, doc = gate({"cam1": window(gy=6.0)})
+    check("a large steady rate with no tilt is refused",
+          err is not None and "MOVED" in err and "mean gyro" in err, err)
+    bias = window(gx=-1.06, gy=-1.27, gz=0.0,
+                  pitch=lambda i, n: 10.6 + 0.02 * math.sin(i),
+                  roll=lambda i, n: 118.6 - 0.02 * math.sin(i * 1.3))
+    err, doc = gate({"cam1": bias})
+    check("a still rig with the documented YB bias (-1.06, -1.27, 0) is accepted",
+          err is None and doc and abs(doc["cam1"]["level_ref"]["pitch"]
+                                      - 10.6) < 0.05, err)
+    err, doc = gate({"cam1": window(
+        pitch=lambda i, n: 10.6 + 0.5 * i / n)})
+    check("a sub-degree settle across the window is not a false refusal",
+          err is None, err)
+    wrap_ramp = window(roll=lambda i, n: ((178.0 + 4.0 * i / n + 180) % 360)
+                       - 180)
+    err, doc = gate({"cam1": wrap_ramp})
+    check("a 4 degree tilt across the +/-180 roll wrap is refused",
+          err is not None and "MOVED" in err, err)
+    flicker = window(roll=lambda i, n: 179.5 if i % 2 else -179.5)
+    err, doc = gate({"cam1": flicker})
+    check("a still window flickering between 179.5 and -179.5 is accepted",
+          err is None, err)
+    check("and its level reference is near +/-180, not the arithmetic 0",
+          doc and abs(abs(doc["cam1"]["level_ref"]["roll"]) - 180.0) < 1.0,
+          doc and doc["cam1"]["level_ref"])
+    err, doc = gate({"cam1": window(gx=lambda i, n: math.sin(i) * 30)})
+    check("wild oscillating motion is still refused", err is not None
+          and "MOVED" in err, err)
+
+    # ---- heading: circular mean, and no fabricated relative yaw ------------
+    def hdg(vals):
+        return window(heading=lambda i, n: vals[i % len(vals)])
+
+    def cdist(a, b):
+        return abs(((a - b + 540) % 360) - 180)
+    hm = rigcal._stats(hdg([359, 0, 1, 359, 0, 1]))["heading_mean"]
+    check("headings straddling north average near 0, not 120",
+          hm is not None and cdist(hm, 0) < 1.0, hm)
+    check("a constant heading is unchanged",
+          rigcal._stats(still)["heading_mean"] == 65.1)
+    hm = rigcal._stats(hdg([10, 350]))["heading_mean"]
+    check("10 and 350 average near 0, not 180",
+          hm is not None and cdist(hm, 0) < 1.0, hm)
+    check("no heading column gives None, not 0",
+          rigcal._stats([{k: v for k, v in smp.items() if k != "heading"}
+                         for smp in still])["heading_mean"] is None)
+    check("headings spread evenly round the circle give None (no direction)",
+          rigcal._stats(hdg([0, 90, 180, 270]))["heading_mean"] is None)
+    check("relative yaw across north is -1.0, not a 359 swing",
+          abs(rigcal._yaw_difference(359.5, 0.5) + 1.0) < 1e-9)
+    check("relative yaw with an unknown heading is None, not made up",
+          rigcal._yaw_difference(None, 12.0) is None
+          and rigcal._yaw_difference(12.0, None) is None)
+    err, doc = gate({"cam1": hdg([359, 0]), "cam2": hdg([0, 1])}, "both")
+    check("calibrate_imu(both) records the cam1->cam2 yaw seed across north",
+          err is None and abs(doc["relative"]["yaw"] + 1.0) < 0.05,
+          err or doc.get("relative"))
+    nohead = [{k: v for k, v in smp.items() if k != "heading"}
+              for smp in still]
+    err, doc = gate({"cam1": hdg([359, 0]), "cam2": nohead}, "both")
+    check("a camera with no heading leaves the relative yaw unset",
+          err is None and doc["relative"]["yaw"] is None, err or doc.get("relative"))
     return 0
 
 

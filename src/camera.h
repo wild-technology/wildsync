@@ -103,6 +103,7 @@ public:
     // stranded. Callers that do not care may ignore both.
     bool disconnect(std::string* err = nullptr);
     SDK::CrSdkControlMode controlMode() const { return m_mode; }
+    bool saveDirOk() const { return m_saveDirOk.load(); }
 
     // Card drain (SDK "Remote Transfer"): list what the card holds, pull a
     // file to a directory, delete a content. Post-run only - never while a
@@ -331,6 +332,9 @@ private:
     // Last save location handed to SetSaveInfo. The SDK forgets it across a
     // reconnect, so it is replayed from OnConnected.
     std::string m_saveDir;
+    // True only while the SDK holds m_saveDir: set by a successful
+    // SetSaveInfo, cleared by a failed attempt and by a session drop.
+    std::atomic<bool> m_saveDirOk{false};
 
     // Timed (X2): the HTTP-facing entry points bound their wait on this so a
     // wedged SDK call (a stuck SDK::Connect holds it until the body is

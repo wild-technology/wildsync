@@ -39,6 +39,7 @@ routes the drain through POST /api/drain, tailing progress from GET
 the direct path.
 """
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -281,6 +282,21 @@ def _drain_via_rigd(node, keep=False, base=RIGD_BASE, log=print, poll_s=2.0):
         time.sleep(poll_s)
 
 
+def _write_all(fd, data):
+    """os.write until every byte is out. A single write(2) on a regular file
+    may return a short count at ENOSPC, a quota or an NFS/USB destination and
+    does NOT raise, so the bare os.write the drain used to make could bless a
+    truncated host file and then delete the card original, the only other
+    copy of the frame (audit 2026-10-15)."""
+    mv = memoryview(data)
+    off = 0
+    while off < len(mv):
+        n = os.write(fd, mv[off:])
+        if n <= 0:
+            raise OSError(errno.EIO, "short write")
+        off += n
+
+
 class Drainer:
     def __init__(self, node, host, dest=DEFAULT_DEST, log=print, disk_min_mb=2000):
         self.node = node
@@ -515,13 +531,26 @@ class Drainer:
                 try:
                     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
                     try:
-                        os.write(fd, data)
+                        _write_all(fd, data)
                         os.fsync(fd)
+                        # A volume that fills or hits a quota mid-write can
+                        # leave a short file without any exception; the
+                        # hash gate above ran on the in-memory bytes, not on
+                        # this file (audit 2026-10-15). Compare what landed.
+                        if os.fstat(fd).st_size != len(data):
+                            raise OSError(errno.EIO, "host file is %d B, "
+                                          "expected %d" % (os.fstat(fd).st_size,
+                                                           len(data)))
                     finally:
                         os.close(fd)
                 except OSError as e:
                     rep["errors"].append("%s host write: %s" % (f["name"], e))
                     all_ok = False
+                    # not in `staged` yet, so the cleanup below cannot see it
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
                     continue
                 staged.append((tmp, f["name"], host_sha, len(data)))
             if not staged:
@@ -715,7 +744,14 @@ def main():
             sys.exit(2)
         rep = _drain_via_rigd(a.node, keep=a.keep)
         print(json.dumps(rep, indent=1))
-        sys.exit(0 if rep.get("ok") else 1)
+        # rigd reports per-node errors as a count in `last`; the poll loop
+        # ending is not success (the operator chains drain && ingest)
+        last = rep.get("last") or {}
+        errs = last.get("errors") or 0
+        if isinstance(errs, (list, tuple)):
+            errs = len(errs)
+        sys.exit(0 if rep.get("ok") and not (
+            last.get("node") in (None, a.node) and errs) else 1)
     t0 = time.time()
     rep = drain_node(a.node, host=a.host, dest=a.dest, keep_card=a.keep, limit=a.limit)
     dt = time.time() - t0
@@ -727,6 +763,10 @@ def main():
           % (rep["pulled"], len(rep["files"]), rep["bytes"] / 1e9,
              rep["deleted"], len(rep["errors"]), dt,
              rep["bytes"] / 1e6 / dt if dt else 0))
+    # a printed report with status 0 reads as success to `drain && ingest`;
+    # a cancelled or limit-reached drain with no errors stays 0
+    if rep["errors"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -96,6 +96,8 @@ STROBE_ROLE = ROLE == "strobe"
 # (δ ≈ 8–12 ms after T clears curtain travel plus skew). Anything more than
 # this far from the trigger instant is a scheduling bug, not a plan.
 STROBE_MAX_AFTER_S = 2.0
+# How long a failed strobe-line claim waits before the next attempt.
+STROBE_CLAIM_RETRY_S = 5.0
 
 # Guard window for EXPOSURE edge debouncing. Well under the >=1 ms Sony
 # specifies for the assert (measured ~13 ms), and far above the ~60 us bursts a
@@ -500,6 +502,7 @@ class Gpio:
         # nothing on pin 37 never touches the line at all. Open-drain with NO
         # pull-up (the flash supplies 2.9 V of its own) and never parked.
         self._strobe = None              # _LineDriver once claimed, or False
+        self._strobe_retry_at = 0.0      # monotonic; a failed claim waits this
         self._strobe_fires = 0
         self._strobe_last = None         # epoch of the last pulse
         self._strobe_err = None
@@ -517,6 +520,11 @@ class Gpio:
     # ---- safe parking of the camera-input lines ---------------------------
     def _park(self, bcm):
         """Hold `bcm` as an input with a pull-up so the camera sees it idle."""
+        if STROBE_ROLE:
+            # 17/27 are camera-harness offsets on a Pi header; on the strobe
+            # host's chip they are unrelated pads that must never be biased,
+            # whichever path (gpiod missing, shutdown) reaches here.
+            return False
         p = self._parkers.get(bcm)
         if p is not None and p.poll() is None:
             return True
@@ -794,6 +802,16 @@ class Gpio:
                         "error": "strobe_at_epoch sits %+.3f s from at_epoch - "
                                  "must be 0..%.1f s after it" %
                                  (delta, STROBE_MAX_AFTER_S)}
+            # Coerce the width here, with the other request fields, not in
+            # _strobe_pulse: that runs AFTER the TRIGGER pulse, so a width that
+            # does not parse used to raise there once the camera had already
+            # exposed - a 500 for a frame the host then books as a failed fire,
+            # and an orphan exposure. Nothing is touched until this passes.
+            try:
+                strobe_pulse_ms = max(1, min(int(strobe_pulse_ms or 5), 100))
+            except (TypeError, ValueError, OverflowError):
+                return {"ok": False, "code": 400,
+                        "error": "strobe_pulse_ms is not a number"}
             # Claim the line now, while we are still waiting for the shot's
             # instant, so the first-ever strobe does not pay the chip-open
             # latency inside its timing window.
@@ -825,6 +843,8 @@ class Gpio:
         with self._lock:
             if self._strobe is not None:
                 return self._strobe
+            if time.monotonic() < self._strobe_retry_at:
+                return False
             if not BCM_STROBE:
                 self._strobe, self._strobe_err = False, "strobe disabled " \
                     "(WILDSYNC_STROBE_BCM=0)"
@@ -835,8 +855,15 @@ class Gpio:
             drv = _LineDriver(self.chip, (BCM_STROBE,), pull_up=False,
                               active_high=STROBE_ACTIVE_HIGH)
             if not drv.ok:
-                self._strobe, self._strobe_err = False, \
+                # Not cached: a busy line or chip permissions that have not
+                # settled after a restart handover fail once and then work,
+                # and a cached False would darken every strobe for the rest of
+                # the survey. Retry after a cooldown so a persistent failure
+                # does not reopen the chip on every shot. (The disabled and
+                # no-gpio results above are permanent and stay cached.)
+                self._strobe_err = \
                     "could not claim BCM%d (gpiod path required)" % BCM_STROBE
+                self._strobe_retry_at = time.monotonic() + STROBE_CLAIM_RETRY_S
                 log("warn", "strobe", self._strobe_err)
                 return False
             self._strobe, self._strobe_err = drv, None
@@ -1049,13 +1076,13 @@ class Gpio:
             # it is alive.
             self._focus_lease(True, max(FOCUS_HOLD_DEFAULT_TTL_S,
                                         2.5 * period_s))
-            self._interval_stop = threading.Event()
+            stop = self._interval_stop = threading.Event()
             self._interval_state.update(running=True, fired=0,
                                         target=int(count), period_s=period_s,
                                         error=None)
             t = threading.Thread(target=self._interval_loop,
                                  args=(at_epoch or time.time(), period_s,
-                                       int(count)), daemon=True)
+                                       int(count), stop), daemon=True)
             self._interval_thread = t
             t.start()
             log("info", "interval", "interval started",
@@ -1063,9 +1090,16 @@ class Gpio:
             return {"ok": True, "start_epoch": at_epoch or time.time(),
                     "period_s": period_s, "count": count}
 
-    def _interval_loop(self, start, period, count):
+    def _interval_loop(self, start, period, count, stop=None):
         k = 0
-        stop = self._interval_stop
+        # This run's own Event. interval_stop() reports running:false at once,
+        # so a restart is accepted while the old loop is still inside a fire
+        # (the wait for at_epoch sits under _fire_lock, up to 5.5 s). Every
+        # write to the shared bookkeeping below is therefore conditional on
+        # `self._interval_stop is stop`, or the stale loop's exit block marks
+        # the restarted run not running and clamps its lease.
+        if stop is None:
+            stop = self._interval_stop
         while not stop.is_set():
             target = start + k * period      # absolute schedule: no drift
             if count and k >= count:
@@ -1073,8 +1107,10 @@ class Gpio:
             res = self.fire(target, 5)
             if res.get("ok"):
                 with self._lock:
-                    self._interval_state["fired"] += 1
-                    self._interval_state["last_late_ms"] = res.get("late_ms")
+                    if self._interval_stop is stop:
+                        self._interval_state["fired"] += 1
+                        self._interval_state["last_late_ms"] = \
+                            res.get("late_ms")
             else:
                 log("warn", "interval", "interval frame failed",
                     reason=res.get("error"))
@@ -1086,7 +1122,8 @@ class Gpio:
                 if res.get("code") == 409 and not res.get("busy") \
                         and not self.focus_held():
                     with self._lock:
-                        self._interval_state["error"] = res.get("error")
+                        if self._interval_stop is stop:
+                            self._interval_state["error"] = res.get("error")
                     log("warn", "interval", "interval stopped: FOCUS gone",
                         fired=self._interval_state["fired"])
                     break
@@ -1108,20 +1145,24 @@ class Gpio:
                     if self.focus_held():
                         self._focus_lease(True, None)
         with self._lock:
-            self._interval_state["running"] = False
-            # The long lease existed only to span this schedule's gaps. With
-            # the loop gone nothing is proving the hold's owner is still
-            # alive, so bring it back to the default bound - shortening only,
-            # never extending a lease its owner asked to be shorter.
-            if self._focus_hold_expiry is not None:
-                self._focus_hold_ttl = min(self._focus_hold_ttl or
-                                           FOCUS_HOLD_DEFAULT_TTL_S,
-                                           FOCUS_HOLD_DEFAULT_TTL_S)
-                self._focus_hold_expiry = min(
-                    self._focus_hold_expiry,
-                    time.monotonic() + FOCUS_HOLD_DEFAULT_TTL_S)
-        log("info", "interval", "interval finished",
-            fired=self._interval_state["fired"])
+            mine = self._interval_stop is stop
+            if mine:
+                self._interval_state["running"] = False
+                # The long lease existed only to span this schedule's gaps.
+                # With the loop gone nothing is proving the hold's owner is
+                # still alive, so bring it back to the default bound -
+                # shortening only, never extending a lease its owner asked to
+                # be shorter.
+                if self._focus_hold_expiry is not None:
+                    self._focus_hold_ttl = min(self._focus_hold_ttl or
+                                               FOCUS_HOLD_DEFAULT_TTL_S,
+                                               FOCUS_HOLD_DEFAULT_TTL_S)
+                    self._focus_hold_expiry = min(
+                        self._focus_hold_expiry,
+                        time.monotonic() + FOCUS_HOLD_DEFAULT_TTL_S)
+            fired = self._interval_state["fired"]
+        log("info", "interval", "interval finished" if mine else
+            "interval superseded", fired=fired)
 
     def interval_stop(self):
         with self._lock:
@@ -1479,25 +1520,37 @@ class Gpio:
         # in place after the line is released, so a pull-up applied here still
         # protects the camera while piagent is stopped - which is the whole
         # window a restart or a crash opens up.
-        if self.driver.ok:
+        # A strobe host never claimed 17/27: on the Jetson's gpiochip they are
+        # unrelated pads, and parking them here would bias lines that libgpiod
+        # v1 then leaves in place after the process is gone. The harness
+        # handling is skipped wholesale; the driver holds no lines in that
+        # role, so closing it is a no-op.
+        if STROBE_ROLE:
+            self.driver.close()
+        elif self.driver.ok:
             for bcm in self.PARKED_INPUTS:
                 self.driver.set(bcm, _LineDriver.IDLE)
             self.driver.close()
         else:
             self._release_focus()
-        # The strobe line releases to its cmdline-configured no-pull high-Z
-        # (`gpio=26=ip,np`), which the flash's own pull-up holds idle — never
-        # asserted, so a dying piagent cannot latch the tube on.
+        # The strobe line is driven to ITS OWN idle level before release: HIGH
+        # (high-Z, the flash's own pull-up holds it) for the open-drain
+        # active-low wiring, LOW for the push-pull active-high XR256 board. The
+        # class constant is the open-drain level; writing it to an active-high
+        # driver is the ASSERT level, a rising edge that fires the tube on
+        # every restart. The pad then reverts to its cmdline-configured
+        # no-pull state (`gpio=26=ip,np`).
         if self._strobe:
-            self._strobe.set(BCM_STROBE, _LineDriver.IDLE)
+            self._strobe.set(BCM_STROBE, self._strobe.IDLE)
             self._strobe.close()
             self._strobe = None
         # Leave a pull-up on the pads either way: once our handles are gone the
         # line reverts to pad bias, and a bare release lands on a pull-DOWN here
         # - which is a permanent half-press on the camera.
-        for bcm in self.PARKED_INPUTS:
-            self._park(bcm)
-            self._unpark(bcm)
+        if not STROBE_ROLE:
+            for bcm in self.PARKED_INPUTS:
+                self._park(bcm)
+                self._unpark(bcm)
 
 
 # ---------------------------------------------------------------------------
@@ -1971,13 +2024,34 @@ class Handler(BaseHTTPRequestHandler):
         /gpio/focus dropped a hold it was asked to extend. A missing body is
         an intentional "all defaults" call (several endpoints are used that
         way); a PRESENT body that cannot be parsed is a client bug and must be
-        a 400, never a guess (audit 2026-08-27)."""
-        try:
-            n = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            n = 0
-        if n <= 0 or n > 1 << 20:
+        a 400, never a guess (audit 2026-08-27).
+
+        "Present" includes a body this server cannot frame: a chunked body, a
+        Content-Length that is not a number or is negative, or one over 1 MiB
+        all used to answer {} WITHOUT reading it, so /gpio/fire fired NOW on
+        its defaults and /gpio/focus read a missing hold as false. Each is now
+        a 400, and the connection is closed because the unread bytes would
+        otherwise be parsed as the next request (rigd's _read_body does the
+        same)."""
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            return None
+        raw_n = self.headers.get("Content-Length")
+        if raw_n is None:
             return {}
+        try:
+            n = int(raw_n)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return None
+        if n < 0:
+            self.close_connection = True
+            return None
+        if n == 0:
+            return {}
+        if n > 1 << 20:
+            self.close_connection = True
+            return None
         try:
             doc = json.loads(self.rfile.read(n).decode() or "{}")
             return doc if isinstance(doc, dict) else None

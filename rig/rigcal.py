@@ -15,8 +15,12 @@ STEREO SESSION FLOW
 
 Captures ride the rig's own synchronized fire path (RunManager.capture_once),
 so each pair is a genuine simultaneous stereo exposure - a handheld board is
-fine. Frames are read back from the node spools exactly like the Review tab
-reads them; nothing here touches the cards.
+fine - but ONLY while both cameras fire on the GPIO path within the skew
+budget. A pair fired over USB (0-200 ms skew), or measured over the budget, or
+with no skew figure at all, is recorded as unsynchronised and excluded from
+the guidance counts and the solve (audit 2026-10-15): the result is persisted
+as measured. Frames are read back from the node spools exactly like the Review
+tab reads them; nothing here touches the cards.
 
 The saved artifact (~/rig/stereo_calibration.json) is the wire-in the stereo
 VSLAM documents (docs/vslam.md): K/dist per camera, R, T, baseline.
@@ -25,7 +29,8 @@ vslam.load_stereo_calibration() consumes it.
 IMU CALIBRATION
     Each camera carries its own IMU (an Olive per camera, served on /imu;
     IMU_SOURCES() falls back to /imu2 for a node configured the older way).
-    calibrate_imu() samples a still window, refuses if the rig moved, and
+    calibrate_imu() samples a still window, refuses if the rig moved (a noisy
+    window, a steady rate, or a slow tilt across the window), and
     records gyro bias, accel norm, and the mounting attitude reference
     (the pitch/roll the IMU reports when the rig is level - the number every
     later attitude is read against). "both" also records the relative
@@ -38,6 +43,7 @@ cv2/numpy are imported lazily and their absence degrades to a clear
 import json
 import math
 import os
+import shutil
 import threading
 import time
 
@@ -82,6 +88,46 @@ def _cv():
         raise RuntimeError("OpenCV/numpy are not importable on this host "
                            "(%s) - pip3 install opencv-python-headless numpy"
                            % e)
+
+
+def _pair_sync(r, names, budget_ms):
+    """Was this capture a genuinely simultaneous pair? {"ok", "reason", "path",
+    "skew_ms"}. Only the GPIO path measures an exposure instant; a USB fire
+    is 0-200 ms apart and returns no skew at all, so a missing skew is
+    UNSYNCHRONISED, never assumed good (the skew was recorded and never read,
+    so a harness-less pair calibrated as if simultaneous - audit 2026-10-15).
+    The skew is taken from the two pair cameras' own exposure instants when
+    both report one (a third camera in the shot does not count against the
+    pair), else from capture_once's figure."""
+    res = (r or {}).get("results") or {}
+    paths = {n: (res.get(n) or {}).get("path") for n in sorted(names)}
+    reasons = []
+    for n, path in paths.items():
+        if path != "gpio":
+            reasons.append("%s fired over %s (0-200 ms inter-camera skew)"
+                           % (n, path or "no recorded path"))
+        elif (res.get(n) or {}).get("ok") is False:
+            reasons.append("%s did not fire cleanly" % n)
+    exps = [(res.get(n) or {}).get("exposure_epoch") for n in names]
+    if len(exps) == 2 and all(isinstance(e, (int, float)) for e in exps):
+        skew = round(abs(exps[0] - exps[1]) * 1000.0, 2)
+    else:
+        skew = (r or {}).get("skew_ms")
+    if not reasons:
+        if not isinstance(skew, (int, float)):
+            reasons.append("no inter-camera skew was measured")
+        elif skew > budget_ms:
+            reasons.append("skew %.1f ms is over the %.0f ms spec"
+                           % (skew, budget_ms))
+    return {"ok": not reasons, "reason": "; ".join(reasons),
+            "path": paths, "skew_ms": skew}
+
+
+def _synced(p):
+    """False only for a pair recorded as unsynchronised. A record with no sync
+    block (hand-built, or from before this check) stays usable."""
+    sync = p.get("sync")
+    return not (isinstance(sync, dict) and sync.get("ok") is False)
 
 
 def _atomic_json(path, doc):
@@ -172,7 +218,9 @@ class StereoSession:
         if not (isinstance(r, dict) and r.get("ok", True) is not False):
             raise RuntimeError("capture failed: %s"
                                % (r or {}).get("error", "no answer"))
-        rec = {"at": time.time(), "cams": {}, "skew_ms": (r or {}).get("skew_ms")}
+        rec = {"at": time.time(), "cams": {}, "skew_ms": (r or {}).get("skew_ms"),
+               "sync": _pair_sync(r, mons, getattr(rig.runmgr, "SKEW_BUDGET_MS",
+                                                   10.0))}
         deadline = time.time() + 8.0
         pending = set(mons)
         while pending and time.time() < deadline:
@@ -289,16 +337,18 @@ class StereoSession:
     # -- guidance -----------------------------------------------------------
     def pair_view(self, i):
         p = self.pairs[i]
-        return {"index": i, "at": p["at"],
+        return {"index": i, "at": p["at"], "sync": p.get("sync"),
                 "cams": {n: {k: v for k, v in c.items() if k != "corners"}
                          for n, c in p["cams"].items()}}
 
     def status(self):
         with _lock:
             pairs = list(self.pairs)
-        good = [p for p in pairs
+        seen = [p for p in pairs
                 if all(c.get("found") for c in p["cams"].values())
                 and len(p["cams"]) == 2]
+        good = [p for p in seen if _synced(p)]
+        unsynced = len(seen) - len(good)
         cov = {}
         near = far = tilted = 0
         for p in good:
@@ -346,7 +396,7 @@ class StereoSession:
                              "cannot separate focal length from distance"
                              % (MIN_TILTED - tilted,
                                 "" if MIN_TILTED - tilted == 1 else "s"))
-        bad = len(pairs) - len(good)
+        bad = len(pairs) - len(good) - unsynced
         if bad and len(pairs) >= 3 and bad / len(pairs) > 0.5:
             guide.append("most captures miss the board on one camera - keep "
                          "it inside the stereo overlap (both live views) and "
@@ -355,6 +405,14 @@ class StereoSession:
         if ready:
             guide.append("enough data - Compute when you are done adding "
                          "poses (more well-spread pairs only help)")
+        if unsynced:
+            # informational: it never holds a session with enough good pairs
+            # back from "ready", it explains why the count is lower
+            guide.append("%d pair%s rejected: not fired together on the GPIO "
+                         "path within the skew spec - restore the harness "
+                         "(sync_degraded) before calibrating, or hold the "
+                         "board rigidly still" % (unsynced,
+                                                  "" if unsynced == 1 else "s"))
         return {"active": True, "pattern": [self.cols, self.rows],
                 "square_mm": self.square_mm,
                 "baseline_mm_measured": self.baseline_mm,
@@ -379,7 +437,7 @@ class StereoSession:
         cv2, np = _cv()
         with _lock:
             good = [p for p in self.pairs
-                    if len(p["cams"]) == 2
+                    if len(p["cams"]) == 2 and _synced(p)
                     and all(c.get("found") for c in p["cams"].values())]
             self.busy = True
         try:
@@ -455,13 +513,30 @@ class StereoSession:
             with _lock:
                 self.busy = False
 
-    def save(self):
+    def save(self, force=False):
+        """Persist the solve. A solve that did not pass its own verdict
+        (res["ok"] False) replaced the last good file silently and vslam then
+        froze it as measured (audit 2026-10-15), so it is refused unless the
+        caller says `force` - a wrong tape measure or a real lens difference
+        can fail a verdict on a calibration worth keeping. Whatever is
+        overwritten is kept as <path>.prev first."""
         with _lock:
             res = self.result
         if not res:
             raise RuntimeError("nothing computed yet")
+        if not res.get("ok") and not force:
+            raise RuntimeError(
+                "calibration did not pass: %s - confirm to save anyway"
+                % "; ".join(res.get("verdict") or ["no verdict recorded"]))
+        if os.path.exists(STEREO_PATH):
+            try:
+                shutil.copy2(STEREO_PATH, STEREO_PATH + ".prev")
+            except OSError:
+                pass         # best effort: never block a save on the backup
         _atomic_json(STEREO_PATH, res)
-        return {"path": STEREO_PATH, "baseline_m": res["baseline_m"]}
+        return {"path": STEREO_PATH, "baseline_m": res["baseline_m"],
+                "ok": bool(res.get("ok")), "forced": bool(
+                    force and not res.get("ok"))}
 
 
 def stereo_start(cols, rows, square_mm, baseline_mm=None, notes=""):
@@ -512,6 +587,14 @@ def IMU_SOURCES():
             for n in rigcore.NODES if n["name"] in STEREO_PAIR}
 STILL_GYRO_DPS = 2.0        # allowed |gyro| std while "still"
 STILL_ACC_G = 0.02          # allowed |accel| std
+# The two std gates cannot see a CONSTANT rate (std ~0) or a slow tilt (|a|
+# stays 1 g), so a steady pan or a hand-tilted housing averaged into the
+# saved reference (audit 2026-10-15). The mean-rate limit sits above the
+# documented YB bias of about 1.3 dps, so it only refuses a real steady turn;
+# a slow yaw under it passes, which is why tilt is judged on the accel-derived
+# pitch/roll instead, between the first and last thirds of the window.
+STILL_TILT_DEG = 1.0
+STILL_GYRO_MEAN_DPS = 4.0
 
 
 def _collect(host, path, seconds):
@@ -525,6 +608,56 @@ def _collect(host, path, seconds):
             out.append(r)
         time.sleep(0.05)
     return out
+
+
+def _circ_mean_deg(vals):
+    """Mean of angles in degrees, wrapped to [0, 360); None for no values or
+    when they spread around the circle so evenly that no direction exists.
+    A plain mean of a heading that straddles north (359, 0, 1) lands near 180,
+    and the same goes for a roll near +/-180 (audit 2026-10-15)."""
+    if not vals:
+        return None
+    sx = sum(math.sin(math.radians(v)) for v in vals) / len(vals)
+    cx = sum(math.cos(math.radians(v)) for v in vals) / len(vals)
+    if math.hypot(sx, cx) < 0.1:
+        return None
+    return math.degrees(math.atan2(sx, cx)) % 360.0
+
+
+def _angle_diff(a, b):
+    """a - b wrapped to [-180, 180)."""
+    return ((a - b + 540.0) % 360.0) - 180.0
+
+
+def _tilt_drift(samples):
+    """Largest change in mean pitch or mean roll (degrees, wrap-aware) from
+    the first third of the window to the last; None when the samples carry no
+    attitude. Thirds, not std, so sensor noise and a symmetric swell average
+    out while a steady tilt does not."""
+    n = len(samples)
+    if n < 6:
+        return None
+    k = n // 3
+    drift = []
+    for key in ("pitch", "roll"):
+        head = [s[key] for s in samples[:k]
+                if isinstance(s.get(key), (int, float))]
+        tail = [s[key] for s in samples[-k:]
+                if isinstance(s.get(key), (int, float))]
+        a, b = _circ_mean_deg(head), _circ_mean_deg(tail)
+        if a is None or b is None:
+            return None
+        drift.append(abs(_angle_diff(a, b)))
+    return round(max(drift), 3)
+
+
+def _yaw_difference(a, b):
+    """Relative yaw a - b in degrees [-180, 180), or None when either heading
+    is unknown: a missing heading used to be read as 0, which fabricated a
+    cam1->cam2 yaw out of one camera's compass (audit 2026-10-15)."""
+    if a is None or b is None:
+        return None
+    return round(_angle_diff(a, b), 2)
 
 
 def _stats(samples):
@@ -543,6 +676,10 @@ def _stats(samples):
     ax, ay, az = col("ax"), col("ay"), col("az")
     amag = [math.sqrt(x * x + y * y + z * z)
             for x, y, z in zip(ax, ay, az)] if ax and ay and az else []
+    # roll sits near +/-180 on some mounts and heading wraps at north: both
+    # are circular quantities (pitch is limited to +/-90 and is not)
+    roll_c = _circ_mean_deg(col("roll"))
+    head_c = _circ_mean_deg(col("heading"))
     return {
         "n": len(samples),
         "gyro_bias_dps": [round(mean(v), 4) if v else None
@@ -554,10 +691,10 @@ def _stats(samples):
         else None,
         "level_ref": {"pitch": round(mean(col("pitch")), 3)
                       if col("pitch") else None,
-                      "roll": round(mean(col("roll")), 3)
-                      if col("roll") else None},
-        "heading_mean": round(mean(col("heading")), 2)
-        if col("heading") else None,
+                      "roll": round(_angle_diff(roll_c, 0.0), 3)
+                      if roll_c is not None else None},
+        "heading_mean": round(head_c, 2) if head_c is not None else None,
+        "tilt_drift_deg": _tilt_drift(samples),
     }
 
 
@@ -597,13 +734,17 @@ def calibrate_imu(target="both", seconds=10.0):
                     % (name, len(samples), seconds))
             st = _stats(samples)
             gs = [g for g in st["gyro_std_dps"] if g is not None]
+            mg = [abs(g) for g in st["gyro_bias_dps"] if g is not None]
             if (gs and max(gs) > STILL_GYRO_DPS) or \
-                    (st["accel_std_g"] or 0) > STILL_ACC_G:
+                    (st["accel_std_g"] or 0) > STILL_ACC_G or \
+                    (mg and max(mg) > STILL_GYRO_MEAN_DPS) or \
+                    (st["tilt_drift_deg"] or 0) > STILL_TILT_DEG:
                 raise RuntimeError(
                     "%s: the rig MOVED during the window (gyro std %s dps, "
-                    "accel std %s g) - hold it still, on a solid surface, "
-                    "and run again" % (name, st["gyro_std_dps"],
-                                       st["accel_std_g"]))
+                    "mean gyro %s dps, accel std %s g, tilt drift %s deg) - "
+                    "hold it still, on a solid surface, and run again"
+                    % (name, st["gyro_std_dps"], st["gyro_bias_dps"],
+                       st["accel_std_g"], st["tilt_drift_deg"]))
             res[name] = st
         doc = {}
         try:
@@ -622,16 +763,15 @@ def calibrate_imu(target="both", seconds=10.0):
             # windows were sampled simultaneously, so this is a true
             # same-instant comparison.
             a, b = res["cam1"], res["cam2"]
-            if a["level_ref"]["pitch"] is not None \
-                    and b["level_ref"]["pitch"] is not None:
+            if None not in (a["level_ref"]["pitch"], a["level_ref"]["roll"],
+                            b["level_ref"]["pitch"], b["level_ref"]["roll"]):
                 doc["relative"] = {
                     "pitch": round(a["level_ref"]["pitch"]
                                    - b["level_ref"]["pitch"], 3),
-                    "roll": round(a["level_ref"]["roll"]
-                                  - b["level_ref"]["roll"], 3),
-                    "yaw": round(((a["heading_mean"] or 0)
-                                  - (b["heading_mean"] or 0) + 540) % 360
-                                 - 180, 2),
+                    "roll": round(_angle_diff(a["level_ref"]["roll"],
+                                              b["level_ref"]["roll"]), 3),
+                    "yaw": _yaw_difference(a["heading_mean"],
+                                           b["heading_mean"]),
                     "method": "euler-difference seed; refine in fusion",
                 }
         _atomic_json(IMU_PATH, doc)

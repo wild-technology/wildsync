@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — drain / ingest / stereo_check (G1..G7).
+"""Audit regression suite — drain / ingest / stereo_check (G1..G14).
 
 G1  The drain pulled only the RAW of each RAW+JPEG content and then deleted
     the CONTENT, destroying the never-pulled card JPEG of every shot; ingest
@@ -32,6 +32,34 @@ G6  _iso() carry (".1000Z"), stereo_check tracebacking on a missing card JPEG,
 
 G7  Drainer.run(stop=Event) cancels at a content boundary (contract C4).
 
+G8  The host write was one bare os.write whose return count nobody read: a
+    short write (volume full, quota, NFS/USB) blessed a truncated file and the
+    card original was then deleted. The write now loops to the full length and
+    the landed size is checked before the content is staged.
+
+G9  The XMP pair_spread_ms was keyed by round(epoch): at 2 Hz a lost frame let
+    the neighbouring shot share the bucket (about 500 ms printed), and a shot
+    whose exposures straddled an x.5 boundary split in two. Frames now pair
+    with the nearest frame of the other camera inside half a shot period.
+
+G10 place(--move) deleted the staged original after a cross-volume copy it
+    never compared; a copy that is not byte-identical now keeps the source.
+
+G11 `drain.py` and `ingest.py` exit 1 when the drain had errors or the ingest
+    was refused / conflicted / hash-mismatched / matched nothing.
+
+G12 Time matching tied the true clock offset with the one a shot period away
+    (a missing head frame, an extra pre-run card) and dict order picked the
+    shifted one, renaming every RAW one frame off. The journal offset now
+    arbitrates; without it a tie is refused.
+
+G13 A lone card series was attributed to cam1 whichever body it came from; it
+    is now taken only when the staging dir, the journal, or elimination (the
+    other camera already resolved its own series) says whose it is.
+
+G14 The XMP dates carried the raw host epoch while the filename carries the
+    GPS-corrected time; they now agree (wildsync:capture_epoch stays host).
+
 Hermetic: stub cameras and a loopback HTTP stub only — the live rigd on
 localhost:9090 and the fleet on 192.168.1.x are never contacted (every rigd
 call in here takes an explicit 127.0.0.1 base). Temp dirs only.
@@ -39,6 +67,7 @@ call in here takes an explicit 127.0.0.1 base). Temp dirs only.
 Run standalone:  python3 rig/tests/audit_drain.py
 """
 
+import errno
 import hashlib
 import http.server
 import json
@@ -298,6 +327,476 @@ def _g7_stop_event(opts):
 
 
 # ---------------------------------------------------------------------------
+# G8 — a short host write must not bless a truncated file
+# ---------------------------------------------------------------------------
+class _ShortWrites:
+    """Patch os.write (and os.open, to learn which fd is a .part-c staging
+    file) so only the drain's host write is disturbed. mode:
+      "enospc"  - first call writes a third, any further call raises ENOSPC
+      "short1"  - first call writes a third, later calls behave normally
+      "lie"     - writes a third but reports the full count (a layer that
+                  swallows the shortfall; only the size check can see it)"""
+
+    def __init__(self, mode):
+        self.mode, self.fds, self.calls = mode, set(), 0
+        self._write, self._open = os.write, os.open
+
+    def __enter__(self):
+        def op(path, *a, **k):
+            fd = self._open(path, *a, **k)
+            if ".part-c" in str(path):
+                self.fds.add(fd)
+            return fd
+
+        def wr(fd, data):
+            if fd not in self.fds:
+                return self._write(fd, data)
+            self.calls += 1
+            if self.calls == 1 or self.mode == "lie":
+                n = self._write(fd, bytes(data)[:len(data) // 3])
+                return len(data) if self.mode == "lie" else n
+            if self.mode == "enospc":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return self._write(fd, data)
+        os.open, os.write = op, wr
+        return self
+
+    def __exit__(self, *exc):
+        os.open, os.write = self._open, self._write
+
+
+def _g8_short_write(opts):
+    sect("audit G8: a short os.write is not an exception - the drain must "
+         "check the count, because the card is the only other copy")
+    big = b"ARWDATA!" * 37500                      # 300000 B
+    for mode in ("enospc", "lie"):
+        d = _tmp()
+        s = StubCam(d, {60: [("W.ARW", big, RAW)]}, node="cam1")
+        with _ShortWrites(mode):
+            rep = s.run()
+        dest = os.path.join(d, "cam1")
+        files = _host_files(dest)
+        sums = os.path.join(d, "SHA256SUMS")
+        recorded = open(sums).read() if os.path.isfile(sums) else ""
+        check("%s: the failed host write is reported" % mode,
+              any("host write" in e for e in rep["errors"]),
+              json.dumps(rep["errors"]))
+        check("%s: the card original is NOT deleted" % mode,
+              s.deleted == [] and rep["deleted"] == 0 and 60 in s.card,
+              "deleted=%s" % s.deleted)
+        check("%s: no truncated final file and no .part is left" % mode,
+              files == [], str(files))
+        check("%s: nothing is recorded in SHA256SUMS" % mode,
+              "W.ARW" not in recorded, recorded[:80])
+    # a short count that the loop can finish is not an error
+    d = _tmp()
+    s = StubCam(d, {61: [("V.ARW", big, RAW)]}, node="cam1")
+    with _ShortWrites("short1"):
+        rep = s.run()
+    dest = os.path.join(d, "cam1")
+    got = open(os.path.join(dest, "V.ARW"), "rb").read() \
+        if os.path.isfile(os.path.join(dest, "V.ARW")) else b""
+    check("a single short write is completed by the loop: full-length file",
+          got == big, "%d of %d B" % (len(got), len(big)))
+    vs = draindrv.verify_sums(d)
+    check("the recorded hash verifies and the card is then deleted",
+          rep["errors"] == [] and s.deleted == [61] and rep["deleted"] == 1
+          and vs["ok"] == 1 and not vs["failed"] and not vs["missing"],
+          json.dumps({"errors": rep["errors"], "verify": vs}))
+
+
+# ---------------------------------------------------------------------------
+# G9 — pair_spread_ms pairs by nearest frame, not by integer second
+# ---------------------------------------------------------------------------
+def _spread_of(xmp_path):
+    """<wildsync:pair_spread_ms> from a sidecar: float, or None when the
+    field is absent (xmp_sidecar omits an empty value)."""
+    m = re.search(r"<wildsync:pair_spread_ms>([^<]*)<", open(xmp_path).read())
+    return float(m.group(1)) if m and m.group(1) != "" else None
+
+
+def _ingest_pair(d, runs, rows, drop=None):
+    """Ingest both cameras of a _write_run run from per-node staging dirs;
+    rows[cam] minus `drop` (cam, k) is what lands on that card."""
+    for cam in (1, 2):
+        rs = [r for k, r in enumerate(rows[cam]) if drop != (cam, k)]
+        _write_card(os.path.join(d, "cam%d" % cam), rs,
+                    "_CA" if cam == 1 else "DSC", -172769.57 + cam,
+                    numbers=False)
+        ing.ingest(os.path.join(d, "cam%d" % cam), runs_dir=runs,
+                   log=lambda *a: None, offsets=[])
+
+
+def _drop_row(root, cam, k):
+    """Remove one camera's frame from the run's index, as a lost frame would."""
+    idx = ing.read_frame_index(root)
+    gone = [r for r in idx if r["cam"] == cam][k]
+    keep = [r for r in idx if r is not gone]
+    with open(os.path.join(root, "index.jsonl"), "w") as fh:
+        for r in keep:
+            fh.write(json.dumps(r) + "\n")
+    with open(os.path.join(root, "run.json")) as fh:
+        doc = json.load(fh)
+    doc["index"], doc["frames"] = keep, len(keep)
+    with open(os.path.join(root, "run.json"), "w") as fh:
+        json.dump(doc, fh)
+
+
+def _g9_pair_spread(opts):
+    sect("audit G9: pair_spread_ms pairs a frame with the NEAREST frame of the "
+         "other camera, not whatever shares round(epoch)")
+    # 2 Hz, cam2 fires 1 ms after cam1, phase chosen so every other shot's
+    # exposures fall either side of an x.5 rounding boundary
+    t0 = 1787253940.4995
+    d = _tmp()
+    runs = os.path.join(d, "runs")
+    root, rows = _write_run(runs, "261015_0000_spread", 8, t0=t0, interval=0.5)
+    _ingest_pair(d, runs, rows)
+    sp = [(_spread_of(os.path.join(root, "cam%d" % cam,
+                                   os.path.splitext(r["file"])[0] + ".xmp")))
+          for cam in (1, 2) for r in rows[cam]]
+    check("a 2 Hz pair whose exposures straddle an x.5 boundary reads 1.00 ms "
+          "on every frame (the second-bucket printed ~499 ms)",
+          len(sp) == 16 and all(v is not None and abs(v - 1.0) < 0.05
+                                for v in sp), str(sp))
+
+    # a frame lost from one camera: its shot is a single, and the NEIGHBOURING
+    # shots must not borrow its epoch
+    d = _tmp()
+    runs = os.path.join(d, "runs")
+    root, rows = _write_run(runs, "261015_0000_spreadlost", 8, t0=t0,
+                            interval=0.5)
+    _drop_row(root, 2, 4)
+    kept = {1: rows[1], 2: [r for k, r in enumerate(rows[2]) if k != 4]}
+    _ingest_pair(d, runs, rows, drop=(2, 4))
+    got = {}
+    for cam in (1, 2):
+        for r in kept[cam]:
+            got[(cam, r["orig"])] = _spread_of(os.path.join(
+                root, "cam%d" % cam, os.path.splitext(r["file"])[0] + ".xmp"))
+    lone = got[(1, rows[1][4]["orig"])]
+    others = [v for (c, o), v in got.items() if o != rows[1][4]["orig"]]
+    check("the shot cam2 lost is a single: blank spread, not a cross-shot figure",
+          lone is None, str(lone))
+    check("every other shot still reads 1.00 ms (the bucket printed ~500 ms "
+          "for the neighbours)",
+          len(others) == 14 and all(v is not None and abs(v - 1.0) < 0.05
+                                    for v in others), str(others))
+
+    # the default 2 s interval: the straddling shot used to land in two buckets
+    # and print BLANK
+    d = _tmp()
+    runs = os.path.join(d, "runs")
+    root, rows = _write_run(runs, "261015_0000_spread2s", 5, t0=t0, step=2.0,
+                            interval=2.0)
+    _ingest_pair(d, runs, rows)
+    sp = [_spread_of(os.path.join(root, "cam%d" % cam,
+                                  os.path.splitext(r["file"])[0] + ".xmp"))
+          for cam in (1, 2) for r in rows[cam]]
+    check("at interval 2 s a straddling shot reads 1.00 ms instead of blank",
+          all(v is not None and abs(v - 1.0) < 0.05 for v in sp), str(sp))
+
+
+# ---------------------------------------------------------------------------
+# G10 — --move keeps the source unless the copy is byte-identical
+# ---------------------------------------------------------------------------
+def _g10_move_verified(opts):
+    sect("audit G10: place(--move) over a cross-volume copy must hash the copy "
+         "before it unlinks the source")
+    d = _tmp()
+    src = os.path.join(d, "card.ARW")
+    dst = os.path.join(d, "run", "Cam1_z.ARW")
+    good = b"CORRECT-" * 512
+    with open(src, "wb") as fh:
+        fh.write(good)
+    real_link, real_copy = ing.os.link, ing.shutil.copy2
+
+    def no_link(*a, **k):
+        raise OSError(errno.EXDEV, "cross-device")
+
+    def bad_copy(s_, d_, *a, **k):
+        with open(d_, "wb") as fh:
+            fh.write(good[:len(good) // 2])       # a truncated copy
+        return d_
+    ing.os.link, ing.shutil.copy2 = no_link, bad_copy
+    try:
+        try:
+            how = ing.place(src, dst, move=True, dry=False)
+            err = None
+        except OSError as e:
+            how, err = None, e
+        check("a corrupt cross-volume copy under --move raises",
+              err is not None, str(how))
+        check("the staged original is NOT deleted",
+              os.path.isfile(src) and open(src, "rb").read() == good)
+        check("nothing lands under the run name and no .part is left",
+              not os.path.exists(dst) and not os.path.exists(dst + ".part"),
+              str(os.listdir(os.path.dirname(dst))))
+        # without --move the source is not at risk: behaviour is unchanged
+        try:
+            how2 = ing.place(src, dst, move=False, dry=False)
+        except OSError as e:
+            how2 = "raised %s" % e
+        check("without --move a short copy is not second-guessed (source kept)",
+              how2 == "copied" and os.path.isfile(src), str(how2))
+        os.unlink(dst)
+        ing.shutil.copy2 = real_copy
+        how3 = ing.place(src, dst, move=True, dry=False)
+        check("a faithful copy under --move is placed and the source removed",
+              how3 == "moved" and not os.path.exists(src)
+              and open(dst, "rb").read() == good, str(how3))
+    finally:
+        ing.os.link, ing.shutil.copy2 = real_link, real_copy
+
+
+# ---------------------------------------------------------------------------
+# G11 — drain CLI exit status
+# ---------------------------------------------------------------------------
+def _run_drain_main(argv):
+    """drain.main() under argv; returns its exit code (0 when it returns)."""
+    import contextlib
+    import io
+    old = sys.argv
+    sys.argv = ["drain.py"] + argv
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                draindrv.main()
+            except SystemExit as e:
+                return 0 if e.code in (None, 0) else e.code
+        return 0
+    finally:
+        sys.argv = old
+
+
+def _g11_drain_exit_status(opts):
+    sect("audit G11: the drain CLI must say failure with its exit status "
+         "(the operator chains drain && ingest)")
+    saved = (draindrv.drain_node, draindrv._rigd_alive, draindrv._drain_via_rigd)
+
+    def rep(errors):
+        return {"pulled": 3, "verified": 3, "deleted": 3, "skipped": 0,
+                "files": ["a", "b"], "bytes": 10, "errors": errors,
+                "cancelled": False}
+    try:
+        draindrv._rigd_alive = lambda *a, **k: False
+        draindrv.drain_node = lambda *a, **k: rep(["X.ARW HASH MISMATCH"])
+        check("a standalone drain with per-shot errors exits 1",
+              _run_drain_main(["cam1", "--host", "127.0.0.1"]) == 1)
+        draindrv.drain_node = lambda *a, **k: rep([])
+        check("a clean standalone drain exits 0",
+              _run_drain_main(["cam1", "--host", "127.0.0.1"]) == 0)
+        draindrv._rigd_alive = lambda *a, **k: True
+        draindrv._drain_via_rigd = lambda *a, **k: {
+            "ok": True, "active": False,
+            "last": {"node": "cam1", "pulled": 3, "deleted": 1, "errors": 2}}
+        check("a rigd-routed drain whose last report has errors exits 1",
+              _run_drain_main(["cam1"]) == 1)
+        draindrv._drain_via_rigd = lambda *a, **k: {
+            "ok": True, "active": False,
+            "last": {"node": "cam1", "pulled": 3, "deleted": 3, "errors": 0}}
+        check("a clean rigd-routed drain exits 0", _run_drain_main(["cam1"]) == 0)
+        draindrv._drain_via_rigd = lambda *a, **k: {"ok": False,
+                                                    "error": "lost rigd"}
+        check("a lost rigd still exits 1", _run_drain_main(["cam1"]) == 1)
+    finally:
+        draindrv.drain_node, draindrv._rigd_alive, draindrv._drain_via_rigd = saved
+
+
+# ---------------------------------------------------------------------------
+# G12 — a tie between alignments is arbitrated by the journal, else refused
+# ---------------------------------------------------------------------------
+_T0, _OFF12 = 1787253940.0, -172769.57
+
+
+def _g12_build(n=20, drop=(), extra_before=0, jit=0.0, seed=0):
+    import random
+    rnd = random.Random(seed)
+    rows = [{"orig": "ILX%05d.JPG" % (100 + k), "epoch": _T0 + k * 0.5}
+            for k in range(n)]
+    cards = [{"stem": "_CA%05d" % (30000 + j), "series": "_CA",
+              "number": 30000 + j, "arw": "x", "jpg": None,
+              "exif": _T0 + j * 0.5 + _OFF12 + rnd.gauss(0, jit)}
+             for j in range(-extra_before, n) if j not in drop]
+    return rows, cards
+
+
+def _g12_match(expect, **kw):
+    rows, cards = _g12_build(**kw)
+    s_, off, how, m, u = ing.match_run(rows, cards, set(), expect=expect,
+                                       tol_s=0.225, authoritative=True)
+    wrong = sum(1 for r, c, _res in m
+                if int(c["stem"][3:]) - 30000 != int(r["orig"][3:8]) - 100)
+    return s_, how, len(m), wrong
+
+
+def _g12_offset_ties(opts):
+    sect("audit G12: a missing head frame or an extra pre-run card must not "
+         "shift the whole run by one frame")
+    for name, kw, want in (("first card missing", dict(drop=(0,)), 19),
+                           ("first two missing", dict(drop=(0, 1)), 18),
+                           ("one extra card a period before row 0",
+                            dict(extra_before=1), 20),
+                           ("last card missing", dict(drop=(19,)), 19),
+                           ("middle card missing", dict(drop=(7,)), 19),
+                           ("no hole", {}, 20)):
+        s_, how, nm, wrong = _g12_match(_OFF12, **kw)
+        check("%s: journal offset picks the true alignment (%d matched, 0 wrong)"
+              % (name, want), nm == want and wrong == 0,
+              "matched %d wrong %d" % (nm, wrong))
+    bad = 0
+    for seed in range(50):
+        for kw in (dict(drop=(0,)), {}):
+            bad += _g12_match(_OFF12, jit=0.03, seed=seed, **kw)[3]
+    check("30 ms of jitter over 50 seeds: no wrong assignment", bad == 0,
+          "%d wrong" % bad)
+    s_, how, nm, wrong = _g12_match(None, drop=(0,))
+    check("a missing head frame with NO journal offset is refused, not shifted",
+          s_ is None and str(how).startswith("ambiguous") and nm == 0,
+          "%s %s %d" % (s_, how, nm))
+    for name, kw in (("no hole", {}), ("a middle hole", dict(drop=(7,)))):
+        s_, how, nm, wrong = _g12_match(None, **kw)
+        check("%s with no journal offset still matches (no false refusal)"
+              % name, s_ == "_CA" and wrong == 0 and nm >= 19,
+              "%s %s %d wrong %d" % (s_, how, nm, wrong))
+
+    # end to end: card dir missing the first frame, journal offset present
+    d = _tmp()
+    runs = os.path.join(d, "runs")
+    root, rows = _write_run(runs, "261015_0000_head", 8, interval=0.5)
+    _write_card(os.path.join(d, "cam1"), rows[1][1:], "_CA", _OFF12,
+                numbers=False)
+    # card stems must still carry the ORIGINAL frame's number, so write them
+    # for rows 1.. but with a counter that is not the PC-save one (done above)
+    started = rows[1][0]["epoch"]
+    ing.ingest(os.path.join(d, "cam1"), runs_dir=runs, log=lambda *a: None,
+               offsets=[(started, "cam1", _OFF12)])
+    okp, bad = 0, 0
+    for k, r in enumerate(rows[1]):
+        arw = os.path.join(root, "cam1", os.path.splitext(r["file"])[0] + ".ARW")
+        if k == 0:
+            bad += os.path.exists(arw)
+        elif os.path.isfile(arw):
+            ex = ing._arw_exif_epoch(arw)
+            okp += ex is not None and abs(ex - _OFF12 - r["epoch"]) < 0.02
+    check("through ingest(): rows 1..7 got their own RAW, row 0 stays unmatched",
+          okp == 7 and bad == 0, "right %d, RAW on the lost row %d" % (okp, bad))
+
+
+# ---------------------------------------------------------------------------
+# G13 — a lone series is not attributed to whichever camera asks first
+# ---------------------------------------------------------------------------
+def _g13_lone_series(opts):
+    sect("audit G13: one card series in a non-camN dir must not be handed to "
+         "cam1 when nothing says it is cam1's")
+    d = _tmp()
+    runs = os.path.join(d, "runs")
+    root, rows = _write_run(runs, "261015_0000_lone", 6)
+    lone = os.path.join(d, "download")
+    _write_card(lone, rows[2], "DSC", -172748.18, numbers=False)
+    out = ing.ingest(lone, runs_dir=runs, log=lambda *a: None, offsets=[])
+    sm = out["runs"][0]["summary"]
+    check("both cameras are refused as ambiguous (cam1 used to claim all six)",
+          all(str(sm[c]["how"]).startswith("ambiguous") for c in (1, 2)),
+          json.dumps({c: sm[c]["how"] for c in (1, 2)}))
+    check("nothing was placed and the totals say so",
+          out["totals"]["raw"] == 0 and out["totals"]["ambiguous"]
+          and not glob_any(os.path.join(root, "cam1"), ".ARW"),
+          json.dumps(out["totals"]))
+
+    started = rows[1][0]["epoch"]
+    offs = [(started, "cam2", -172748.18), (started, "cam1", -172769.57)]
+    out2 = ing.ingest(lone, runs_dir=runs, log=lambda *a: None, offsets=offs)
+    s2 = out2["runs"][0]["summary"]
+    check("the journal offset attributes the lone series to cam2",
+          s2[2]["matched"] == 6 and s2[2]["series"] == "DSC", json.dumps(s2[2]))
+    check("cam1 is still refused and receives no files",
+          s2[1]["matched"] == 0 and not glob_any(os.path.join(root, "cam1"),
+                                                 ".ARW"), json.dumps(s2[1]))
+
+    # elimination still works: cam2 by number, cam1 takes the series left over
+    d3 = _tmp()
+    runs3 = os.path.join(d3, "runs")
+    root3, rows3 = _write_run(runs3, "261015_0000_elim", 6)
+    both = os.path.join(d3, "download")
+    # cam2's PC-save counter (ILX09000+) is what its card numbering follows;
+    # cam1's is not, so only cam2 resolves by number
+    idx = ing.read_frame_index(root3)
+    for r in idx:
+        if r["cam"] == 2:
+            r["orig"] = "ILX%05d.JPG" % (9000 + int(r["orig"][3:8]) - 1000)
+    for fn in ("index.jsonl",):
+        with open(os.path.join(root3, fn), "w") as fh:
+            for r in idx:
+                fh.write(json.dumps(r) + "\n")
+    os.makedirs(both)
+    for r in (x for x in idx if x["cam"] == 2):
+        with open(os.path.join(both, "DSC%05d.ARW" % int(r["orig"][3:8])),
+                  "wb") as fh:
+            fh.write(make_arw(r["epoch"] - 172748.18))
+    _write_card(both, rows3[1], "_CA", -172769.57, numbers=False)
+    out3 = ing.ingest(both, runs_dir=runs3, log=lambda *a: None, offsets=[])
+    s3 = out3["runs"][0]["summary"]
+    check("cam2 matches by number and cam1 takes the remaining series by time",
+          s3[2]["how"] == "number" and s3[2]["matched"] == 6
+          and s3[1]["how"] == "time" and s3[1]["matched"] == 6
+          and s3[1]["series"] == "_CA",
+          json.dumps({c: (s3[c]["how"], s3[c]["matched"]) for c in (1, 2)}))
+
+    rws, cds = _g12_build(n=6)
+    a = ing._offset_by_time(rws, cds, None, False, False)
+    b = ing._offset_by_time(rws, cds, None, False, True)
+    c = ing._offset_by_time(rws, cds, None, True, False)
+    check("_offset_by_time: a lone series needs authority or elimination",
+          str(a[2]).startswith("ambiguous") and a[0] is None
+          and b[0] == "_CA" and c[0] == "_CA", "%s | %s | %s" % (a, b, c))
+
+
+def glob_any(folder, ext):
+    return os.path.isdir(folder) and any(n.endswith(ext)
+                                         for n in os.listdir(folder))
+
+
+# ---------------------------------------------------------------------------
+# G14 — the XMP dates are in the same timebase as the filename
+# ---------------------------------------------------------------------------
+def _g14_xmp_time(opts):
+    sect("audit G14: XMP DateTimeOriginal must carry the GPS-corrected time "
+         "the filename carries, not the raw host epoch")
+    off = 259200.0 + 12.34                         # a host with no usable RTC
+    for label, gps_off in (("gps run", off), ("host-time run", 0.0),
+                           ("legacy run with no time block", None)):
+        d = _tmp()
+        runs = os.path.join(d, "runs")
+        root, rows = _write_run(runs, "261015_0000_xmp", 3, gps_off=gps_off)
+        _write_card(os.path.join(d, "cam1"), rows[1], "_CA", -172769.57,
+                    numbers=False)
+        ing.ingest(os.path.join(d, "cam1"), runs_dir=runs,
+                   log=lambda *a: None, offsets=[])
+        r = rows[1][1]
+        base = os.path.splitext(r["file"])[0]
+        x = open(os.path.join(root, "cam1", base + ".xmp")).read()
+        want = ing._iso(r["epoch"] + (gps_off or 0.0))
+        got = {k: re.search(r"<%s>([^<]*)<" % k, x).group(1)
+               for k in ("exif:DateTimeOriginal", "xmp:CreateDate",
+                         "photoshop:DateCreated")}
+        check("%s: all three XMP dates are the presentation time" % label,
+              all(v == want for v in got.values()), "%s vs %s" % (got, want))
+        m = re.match(r"Cam1_(\d{8})_(\d{6})\.(\d\d)$", base)
+        stem_t = time.mktime(time.strptime(m.group(1) + m.group(2),
+                                           "%Y%m%d%H%M%S")) - time.timezone
+        xt = time.mktime(time.strptime(want[:19], "%Y-%m-%dT%H:%M:%S")) \
+            - time.timezone + float(want[19:-1])
+        check("%s: the XMP time agrees with the filename to 10 ms" % label,
+              abs(xt - (stem_t + int(m.group(3)) / 100.0)) < 0.011,
+              "%s vs %s" % (want, base))
+        check("%s: capture_epoch is still the raw host epoch" % label,
+              ("<wildsync:capture_epoch>%.6f<" % r["epoch"]) in x)
+        check("%s: gps_offset_s is recorded only when a correction was applied"
+              % label, (("<wildsync:gps_offset_s>" in x) == bool(gps_off)))
+
+
+# ---------------------------------------------------------------------------
 # G1(b) — EXIF straight out of the ARW
 # ---------------------------------------------------------------------------
 def _g1_arw_exif(opts):
@@ -341,7 +840,8 @@ def _g1_arw_exif(opts):
 # run fixtures
 # ---------------------------------------------------------------------------
 def _write_run(runs, rid, per_cam, cams=(1, 2), t0=1787253940.0, step=0.5,
-               jsonl=True, truncate_json=None):
+               jsonl=True, truncate_json=None, interval=None, gps_off=None,
+               skew2=0.001):
     """A run root with index.jsonl (full) and run.json (tail-truncated the way
     run.py does). Returns (root, {cam: [rows]})."""
     root = os.path.join(runs, rid)
@@ -351,12 +851,14 @@ def _write_run(runs, rid, per_cam, cams=(1, 2), t0=1787253940.0, step=0.5,
     for k in range(per_cam):
         ep = t0 + k * step
         for cam in cams:
-            e = ep + (0.001 if cam == 2 else 0.0)
+            e = ep + (skew2 if cam == 2 else 0.0)
+            # the filename is in the presentation timebase (host + GPS offset)
+            ef = e + (gps_off or 0.0)
             r = {"cam": cam,
                  "file": "Cam%d_%s.%02d.jpg" % (cam,
                                                 time.strftime("%Y%m%d_%H%M%S",
-                                                              time.gmtime(e)),
-                                                int((e % 1) * 100)),
+                                                              time.gmtime(ef)),
+                                                int((ef % 1) * 100)),
                  "orig": "ILX%05d.JPG" % (1000 + k), "epoch": e,
                  "src": "gpio_edge"}
             idx.append(r)
@@ -367,8 +869,14 @@ def _write_run(runs, rid, per_cam, cams=(1, 2), t0=1787253940.0, step=0.5,
                 fh.write(json.dumps(e) + "\n")
     keep = idx[-2000:] if truncate_json is None else idx[-truncate_json:]
     with open(os.path.join(root, "run.json"), "w") as fh:
-        json.dump({"run_id": rid, "frames": len(idx), "index": keep,
-                   "final": True, "started": t0}, fh)
+        doc = {"run_id": rid, "frames": len(idx), "index": keep,
+               "final": True, "started": t0}
+        if interval is not None:
+            doc["config"] = {"interval_s": interval}
+        if gps_off is not None:
+            doc["time"] = {"source": "gps" if gps_off else "host",
+                           "gps_offset_s": gps_off}
+        json.dump(doc, fh)
     return root, rows
 
 
@@ -728,11 +1236,13 @@ def _run(fn, opts):
 
 def suite(opts):
     try:
-        for fn in (_g1_whole_content, _g2_duplicate_names, _g7_stop_event,
+        for fn in (_g1_whole_content, _g2_duplicate_names, _g7_stop_event, _g8_short_write,
                    _g1_arw_exif, _g1_raw_only_ingest, _g3_index_jsonl,
                    _g5_attribution, _g6_iso_carry, _g6_place_move,
                    _g6_foreign_xmp, _g6_stereo_missing_jpg,
-                   _g4_cli_routes_through_rigd):
+                   _g4_cli_routes_through_rigd, _g9_pair_spread,
+                   _g10_move_verified, _g11_drain_exit_status,
+                   _g12_offset_ties, _g13_lone_series, _g14_xmp_time):
             _run(fn, opts)
     finally:
         _cleanup()

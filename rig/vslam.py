@@ -669,8 +669,13 @@ class StereoVslamEngine(VslamEngine):
 
     def __init__(self, intrinsics=None, backend=None, baseline_m=0.30,
                  baseline_calibrated=False, calib_pairs=5, min_pnp_points=12,
-                 **kw):
+                 intrinsics_source="guess", **kw):
         super().__init__(intrinsics=intrinsics, backend=backend, **kw)
+        # where K came from: "calibration" (the saved checkerboard solve) or
+        # "guess" (the Intrinsics default / CLI flags). Depth is f*b/disparity,
+        # so a measured baseline with a guessed focal is NOT a measured scale.
+        self.intrinsics_source = intrinsics_source
+        self.ext_from_file = False  # R,T frozen from a saved calibration
         self.baseline_m = float(baseline_m)
         self.baseline_calibrated = bool(baseline_calibrated)
         self.calib_pairs = int(calib_pairs)
@@ -688,9 +693,16 @@ class StereoVslamEngine(VslamEngine):
         base = ("baseline %.3f m (measured)" % self.baseline_m
                 if self.baseline_calibrated else
                 "baseline %.3f m PLACEHOLDER — UNCALIBRATED" % self.baseline_m)
+        if self.intrinsics_source == "calibration":
+            base += "; intrinsics from the saved calibration"
+        elif self.baseline_calibrated:
+            base += ("; intrinsics GUESSED (focal %.0f px) - metric scale "
+                     "carries that guess" % self.intrinsics.focal_px)
         if self._ext is None:
             return "extrinsics pending (%d/%d pairs); %s" % (
                 len(self._calib), self.calib_pairs, base)
+        if self.ext_from_file:
+            return "extrinsics frozen from the saved calibration; %s" % base
         return ("extrinsics self-estimated from %d pairs (t scatter %s deg); %s"
                 % (self.calib_pairs, self.stats["calib_scatter_deg"], base))
 
@@ -1012,7 +1024,9 @@ def load_stereo_calibration(path=STEREO_CAL_PATH):
     Returns {"R": 3x3, "T": [3] metres, "baseline_m": float, "K1","d1","K2",
     "d2", "rms_stereo_px", "date"} - the wire-in docs/vslam.md
     specifies: construct the stereo engine with these extrinsics frozen
-    (baseline_calibrated=True) instead of the self-estimate."""
+    (baseline_calibrated=True) instead of the self-estimate. The stereo
+    engine also takes its focal from K1 (_intrinsics_from_cal): T is in metres
+    only against that K."""
     try:
         with open(path) as fh:
             doc = json.load(fh)
@@ -1022,6 +1036,30 @@ def load_stereo_calibration(path=STEREO_CAL_PATH):
         return doc
     except (OSError, ValueError):
         return None
+
+
+def _intrinsics_from_cal(cal, base=None):
+    """Intrinsics for the stereo engine from a saved calibration, or None.
+
+    R and T were solved against the file's K1, so triangulating with any other
+    focal scales every depth, landmark and PnP translation by f_guess/f_true
+    (about 0.75 for the default guess against an in-water 950 px at proc scale
+    0.5) while the status still said "measured" (audit 2026-10-15). K1's focal
+    is given at the calibration's image_size; it is rescaled to the stream
+    width the engine works at (`base`, the caller's Intrinsics, else the
+    default). No port factor: a through-port calibration already contains the
+    refraction. The principal point, K2 and distortion stay unmodelled.
+    None when the file lacks a usable K1 focal or image_size."""
+    try:
+        fx = float(cal["K1"][0][0])
+        iw = float(cal["image_size"][0])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(fx) and fx > 0 and math.isfinite(iw) and iw > 0):
+        return None
+    base = base if isinstance(base, Intrinsics) else Intrinsics()
+    return Intrinsics(width=base.width, height=base.height,
+                      focal_px=fx * base.width / iw)
 
 
 class VslamRunner:
@@ -1087,10 +1125,16 @@ class VslamRunner:
             cal = None if self.baseline_calibrated else \
                 load_stereo_calibration()
             if cal:
-                eng = StereoVslamEngine(baseline_m=float(cal["baseline_m"]),
-                                        baseline_calibrated=True,
-                                        calib_pairs=self.calib_pairs,
-                                        **self.engine_kw)
+                kw = dict(self.engine_kw)
+                intr = _intrinsics_from_cal(cal, kw.get("intrinsics"))
+                if intr is not None:
+                    kw["intrinsics"] = intr
+                eng = StereoVslamEngine(
+                    baseline_m=float(cal["baseline_m"]),
+                    baseline_calibrated=True, calib_pairs=self.calib_pairs,
+                    intrinsics_source="calibration" if intr else "guess",
+                    **kw)
+                eng.ext_from_file = True
                 eng._ext = ([list(map(float, row)) for row in cal["R"]],
                             [float(v) for v in cal["T"]])
                 return eng

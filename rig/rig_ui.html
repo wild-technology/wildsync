@@ -1675,8 +1675,15 @@ function exposureSource(src, live){
 // partial apply is amber and names what was not read and not applied, because
 // "fleet now on cam2's exposure: iso" is a true sentence that reads as a
 // finished job.
-function applyVerdict(srcName, applied, missing){
+function applyVerdict(srcName, applied, missing, deferred){
   const nm=escapeHtml(srcName);
+  // A body held by a card drain or busy cannot take the write now; rigd keeps
+  // it as owed and pays it on release. Green here would read as "the pair
+  // matches" while that body is still on the old exposure.
+  if(deferred && deferred.length)
+    return '<span style="color:var(--warn)">fleet partly on '+nm+"'s exposure: "+
+      escapeHtml(applied.join(', '))+' — '+escapeHtml(deferred.join(', '))+
+      ' is held (drain/busy) and will receive it when released</span>';
   if(!missing.length)
     return '<span style="color:var(--ok)">fleet now on '+nm+"'s exposure: "+
       escapeHtml(applied.join(', '))+'</span>';
@@ -1793,7 +1800,8 @@ $('#btnApply').onclick=async()=>{
     applyNote('<span style="color:var(--bad)">refused: '+
       escapeHtml(rej.map(k=>k+' — '+r.rejected[k]).join(' · '))+'</span>');
   else if(r && r.applied && Object.keys(r.applied).length){
-    applyNote(applyVerdict(src.name, Object.keys(r.applied), plan.missing));
+    applyNote(applyVerdict(src.name, Object.keys(r.applied), plan.missing,
+                           r.deferred));
     // The forced reconcile pushes expcomp fleet-wide: the per-node pushed
     // ledger must follow, or bodiesMatch() reads a stale split forever.
     if(r.applied.expcomp!=null)
@@ -2182,7 +2190,18 @@ function strobeFastCams(live, desired){
 async function preflight(){
   const [f,d,an,nv]=await Promise.all([api('/api/fleet'),api('/api/diag'),
                                        api('/api/anomalies'),api('/api/nav')]);
-  const nodes=(f&&f.nodes)||[], live=nodes.filter(n=>n.connected);
+  return pfCheck(f,d,an,nv);
+}
+// The judgement itself, separate from the four reads so it can be called with
+// hand-built rig state (audit_ui drives it synchronously).
+function pfCheck(f,d,an,nv){
+  // `conn` is every node that answers (it can still host the strobe); `live` is
+  // the cameras that will actually shoot. A camera the operator switched off is
+  // perfectly connected and takes no frames (the run roster drops it), so
+  // everything about frames - the camera count, the stereo warning, sync,
+  // convergence, disk, battery - is judged on `live`.
+  const nodes=(f&&f.nodes)||[], conn=nodes.filter(n=>n.connected);
+  const live=conn.filter(n=>n.camera_enabled!==false);
   const rows=[], hard=[], warn=[];
   const run=(f&&f.run)||{};
   const label=$('#cLabel').value.trim(), iv=+$('#cInt').value;
@@ -2196,8 +2215,11 @@ async function preflight(){
     (+$('#cFrames').value>0?(+$('#cFrames').value+' frames'):'until stopped')+
     ($('#cAuto').checked?' · auto-capture':' · manual capture only')));
 
-  if(!live.length){ hard.push('no camera connected');
-    rows.push(pfRow('cameras','bad','none connected','nothing would be recorded')); }
+  if(!live.length){
+    const off=conn.length>0;
+    hard.push(off?'no camera enabled':'no camera connected');
+    rows.push(pfRow('cameras','bad',off?'all connected cameras are switched off'
+      :'none connected','nothing would be recorded')); }
   else {
     if(live.length<2) warn.push('only '+live.length+' camera connected — no stereo pair');
     rows.push(pfRow('cameras',live.length>=2?'ok':'warn',
@@ -2235,7 +2257,7 @@ async function preflight(){
 
   // Strobe: armed and plausible, or off.
   if(STROBE.enabled){
-    const sn=live.find(n=>n.name===STROBE.node);
+    const sn=conn.find(n=>n.name===STROBE.node);
     const fast=strobeFastCams(live, (d&&d.desired)||{});
     if(!sn){ hard.push('strobe is armed on '+STROBE.node+' which is not connected');
       rows.push(pfRow('strobe','bad','armed on '+STROBE.node+' — not connected')); }
@@ -3331,10 +3353,23 @@ function mapClick(e){
 // Live breadcrumb + keeping an ACTIVE run's layer growing on screen.
 async function pollMapLive(){
   if(TAB!=='map'||document.hidden) return;
-  const nv=await api('/api/nav');
-  const fx=nv&&nv.fix;
-  if(fx&&isFinite(fx.lat)&&isFinite(fx.lon)&&nv.online){
-    const u=llToUtm(fx.lat,fx.lon);
+  mapLiveFix(await api('/api/nav'));
+  const run=FLEET&&FLEET.run;
+  if(run&&run.active&&run.run_id){
+    if(!MAP.runs[run.run_id]) mapShow();
+    else if(Date.now()-MAP.liveAt>10000){ MAP.liveAt=Date.now();
+      if(MAP.runs[run.run_id].on) mapLoadRun(run.run_id); }
+  }
+}
+function mapLiveFix(nv){
+  // /api/nav is the FLAT NavReader snapshot (lat/lon/valid/fix_kind), the same
+  // shape renderNav reads. This used to read nv.fix and nv.online, neither of
+  // which rigd ever sends, so the live trail and Follow never moved. A STATIC
+  // armed position also carries lat/lon (valid:false): it is where the boat was
+  // told it is, not a track, so only a live fix is plotted.
+  if(nv&&nv.present!==false&&navFixKind(nv)==='live'
+     &&nv.lat!=null&&nv.lon!=null&&isFinite(nv.lat)&&isFinite(nv.lon)){
+    const u=llToUtm(nv.lat,nv.lon);
     const last=MAP.live[MAP.live.length-1];
     if(!last||Math.hypot(u.x-last.x,u.y-last.y)>0.5){
       MAP.live.push({x:u.x,y:u.y,zoneLabel:u.zone});
@@ -3342,12 +3377,6 @@ async function pollMapLive(){
       if(MAP.follow&&MAP.view){ MAP.view.cx=u.x; MAP.view.cy=u.y; }
       mapDraw();
     }
-  }
-  const run=FLEET&&FLEET.run;
-  if(run&&run.active&&run.run_id){
-    if(!MAP.runs[run.run_id]) mapShow();
-    else if(Date.now()-MAP.liveAt>10000){ MAP.liveAt=Date.now();
-      if(MAP.runs[run.run_id].on) mapLoadRun(run.run_id); }
   }
 }
 
@@ -3431,7 +3460,17 @@ $('#clCompute').onclick=async()=>{
   if(r&&r.result){ renderCalResult(r.result); $('#clSave').disabled=false; }
 };
 $('#clSave').onclick=async()=>{
-  const r=await api('/api/rigcal/stereo/save',{});
+  let r=await api('/api/rigcal/stereo/save',{});
+  if(r&&r.ok===false&&r.needs_force){
+    // A solve that failed its own verdict is refused by default: saving it
+    // would silently replace the last good calibration, and stereo VSLAM
+    // would then treat it as measured. The operator can still force it.
+    if(!confirm('This calibration did not pass its own check:\n'+r.error+
+                '\n\nSave it anyway? The previous file is kept as stereo_calibration.json.prev.')){
+      $('#clSaved').innerHTML='<span style="color:var(--warn)">not saved</span>'; return;
+    }
+    r=await api('/api/rigcal/stereo/save',{force:true});
+  }
   if(r&&r.ok) $('#clSaved').innerHTML='<b style="color:var(--ok)">saved ✓</b> — stereo VSLAM uses it from the next run';
   else $('#clSaved').innerHTML='<span style="color:var(--bad)">'+escapeHtml((r&&r.error)||'save failed')+'</span>';
   pollCalib();

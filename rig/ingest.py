@@ -10,7 +10,8 @@ after a card download (or a remote pull): it matches every card file to its
 flight-log row, renames the RAW (and the card JPEG) to the rig's scheme beside
 the review JPEG, and writes an XMP sidecar carrying the true capture instant,
 the position and the attitude — so photogrammetry software reads the survey's
-real time and place straight off the archive.
+real time and place straight off the archive. The XMP's date fields carry the
+same GPS-corrected time as the filename (run.json time.gps_offset_s).
 
     python3 rig/ingest.py ~/rig-raw/cam1          # what the drain staged
     python3 rig/ingest.py /Users/wild/Pictures/2026/2026-08-18
@@ -33,8 +34,14 @@ Matching, per run and camera, in order:
 WHICH body a card series belongs to is a separate question: both bodies fire
 the same instants, so a time match alone cannot tell them apart. A per-node
 directory (~/rig-raw/cam1 — what the drain writes) settles it; failing that
-rigd's journalled exif_offset does; with neither, ingest REFUSES that camera
-rather than risk swapping the two bodies' RAWs.
+rigd's journalled exif_offset does; failing that, a lone series is taken only
+as the one left over once every other camera of the run has resolved its own.
+With none of these, ingest REFUSES that camera rather than risk swapping the
+two bodies' RAWs. The same journal offset says which alignment is real when a
+missing first/last frame or an extra card file makes two fit equally well; with
+no journal such a tie is refused too. Exit status: 1 when a run was refused,
+conflicted, failed the drain-hash check, or the card held files and none
+matched; unmatched frames alone stay 0.
 
 Frames come from <run>/index.jsonl when it exists (the complete list) and from
 run.json's last-2000 index only as a fallback. Originals are hardlinked into
@@ -53,9 +60,11 @@ everything listed. When the card files came from a drain, each placed file is
 also checked against the hash the drain verified (<dest>/SHA256SUMS).
 """
 import argparse
+import bisect
 import csv
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -347,7 +356,8 @@ def _offset_by_number(rows, cards):
     return (best[1], best[2]) if best else (None, None)
 
 
-def _offset_by_time(rows, cards, expect=None, authoritative=False):
+def _offset_by_time(rows, cards, expect=None, authoritative=False,
+                    sole_ok=False):
     """The clock offset as the mode of all pairwise (exif - epoch) differences
     over every card series, then the series that carries it. Two bodies shoot
     the same instants, so every series aligns with every camera's rows at
@@ -357,6 +367,18 @@ def _offset_by_time(rows, cards, expect=None, authoritative=False):
     With NEITHER, more than one qualifying series is a coin flip that would
     silently swap cam1's and cam2's RAWs (max() over tied counts returned the
     first-inserted key, i.e. glob order — audit 2026-08-23, medium): refuse.
+    A LONE series is no safer: it fits whichever body is asked first, so it
+    is accepted only when something attributed it - the per-node dir, a
+    journal offset it agrees with, or `sole_ok` (every other camera of the
+    run already resolved its own series, so this is the one left over). The
+    old rule handed a lone cam2 series to cam1 and renamed it Cam1_*
+    (audit 2026-10-15, high).
+    Which ALIGNMENT within the series is a second question. A missing head
+    frame, or one extra pre-run card, makes the true bin and the bin one shot
+    period away tie, and dict order picked the shifted one: every RAW was
+    renamed one frame off (audit 2026-10-15, high). The journalled offset
+    chooses between alignments that fit about equally well; with no journal
+    a TIE between alignments is refused, never guessed.
     Returns (series, offset, why) where why is None or "ambiguous: ..."."""
     hist = {}
     for r in rows:
@@ -374,6 +396,7 @@ def _offset_by_time(rows, cards, expect=None, authoritative=False):
     cands = [(k, n) for k, n in hist.items() if n >= need]
     if not cands:
         return None, None, None
+    near = []
     if expect is not None:
         near = [(k, n) for k, n in cands if abs(k[1] * BIN_S - expect) <= 2.0]
         if near:
@@ -381,7 +404,22 @@ def _offset_by_time(rows, cards, expect=None, authoritative=False):
     series_set = sorted({k[0] for k, n in cands})
     if len(series_set) > 1 and not authoritative:
         return None, None, "ambiguous: " + "/".join(series_set)
-    (series, kbin), n = max(cands, key=lambda kv: kv[1])
+    if not (authoritative or near or sole_ok):
+        return None, None, "ambiguous: " + "/".join(series_set)
+    top = max(n for k, n in cands)
+    if expect is not None:
+        # alignments within a fifth of the best are indistinguishable by
+        # count alone (jitter splits bins); the journal says which is real
+        close = [(k, n) for k, n in cands if n >= 0.8 * top]
+        (series, kbin), n = min(close, key=lambda kv: (
+            abs(kv[0][1] * BIN_S - expect), -kv[1]))
+    else:
+        best = [k for k, n in cands if n == top]
+        for a in best:
+            for b in best:
+                if a[0] == b[0] and abs(a[1] - b[1]) >= 2:
+                    return None, None, "ambiguous: offset"
+        (series, kbin), n = max(cands, key=lambda kv: kv[1])
     # refine: median of diffs inside the winning bin (+-1 bin)
     diffs = [c["exif"] - r["epoch"] for r in rows for c in cards
              if c["series"] == series and c["exif"] is not None
@@ -391,7 +429,7 @@ def _offset_by_time(rows, cards, expect=None, authoritative=False):
 
 def match_run(rows, cards, used, expect=None, number_only=False,
               tol_s=None,
-              authoritative=False):
+              authoritative=False, sole_ok=False):
     """rows: index entries for one camera. Returns (series, offset, how,
     matches, unmatched) where matches = [(row, card, residual_s)]; how is
     "ambiguous: <series list>" when attribution was refused (G5)."""
@@ -401,7 +439,8 @@ def match_run(rows, cards, used, expect=None, number_only=False,
     if series is None:
         if number_only:
             return None, None, how, [], list(rows)
-        series, off, why = _offset_by_time(rows, avail, expect, authoritative)
+        series, off, why = _offset_by_time(rows, avail, expect, authoritative,
+                                           sole_ok)
         how = why or "time"
     if series is None:
         return None, None, how, [], list(rows)
@@ -453,8 +492,16 @@ def _iso(epoch):
             + ".%03dZ" % frac)
 
 
-def xmp_sidecar(row, fl, run_id, cam, residual_s, pair_spread_ms):
-    """An XMP packet carrying the rig's truth for this frame."""
+def xmp_sidecar(row, fl, run_id, cam, residual_s, pair_spread_ms,
+                gps_offset_s=0.0):
+    """An XMP packet carrying the rig's truth for this frame.
+
+    The three XMP date fields are in the run's PRESENTATION timebase - the
+    host epoch plus the run-latched GPS offset (run.json time.gps_offset_s),
+    which is what the CamN_ filename and the flight_log datetime already carry.
+    They used to hold the raw host epoch and disagreed with the filename by
+    the whole offset (audit 2026-10-15). wildsync:capture_epoch stays the HOST
+    epoch, the same value index.jsonl and the manifest hold."""
     lat = fl.get("lat") if fl else None
     lon = fl.get("long") if fl else None
     gps = ""
@@ -470,6 +517,7 @@ def xmp_sidecar(row, fl, run_id, cam, residual_s, pair_spread_ms):
     ws = "\n".join("   <wildsync:%s>%s</wildsync:%s>" % (k, v, k) for k, v in [
         ("run_id", run_id), ("camera", "cam%d" % cam),
         ("capture_epoch", "%.6f" % row["epoch"]),
+        ("gps_offset_s", "%.6f" % gps_offset_s if gps_offset_s else ""),
         ("capture_source", row.get("src", "")),
         ("card_name", row.get("card_stem", "")),
         ("pc_save_name", row.get("orig", "")),
@@ -481,7 +529,7 @@ def xmp_sidecar(row, fl, run_id, cam, residual_s, pair_spread_ms):
         ("heading_imu_deg", f("heading_imu")),
         ("time_source", f("time_source")),
     ] if v != "")
-    iso = _iso(row["epoch"])
+    iso = _iso(row["epoch"] + gps_offset_s)
     return ("""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="wildsync ingest">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -552,6 +600,16 @@ def place(src, dst, move, dry):
             shutil.copy2(src, tmp)
             with open(tmp, "rb+") as fh:
                 os.fsync(fh.fileno())
+            # --move is documented as removing the source only after the
+            # destination is confirmed byte-identical, but the only checks
+            # were the 'exists' compare and the drain-hash cross-check, which
+            # runs AFTER place() returns and only warns - by then the staged
+            # RAW, the host's only copy, was already unlinked (audit
+            # 2026-10-15). Hash both ends here, and only when a delete follows.
+            if move and (os.path.getsize(tmp) != os.path.getsize(src)
+                         or file_sha256(tmp) != file_sha256(src)):
+                raise OSError("copy of %s is not byte-identical, source kept"
+                              % src)
             os.replace(tmp, dst)
         except OSError:
             try:
@@ -703,6 +761,25 @@ def verify_run(path, log=print):
     return rep
 
 
+def _pair_spread_ms(epoch, cam, epochs, tol):
+    """Spread (ms) between this frame and the nearest frame of each OTHER
+    camera, counting only frames within `tol` s; None when no other camera
+    has one (a single, or a frame the other body lost) - blank, not a
+    cross-shot figure. Equidistant candidates resolve to the earlier."""
+    seen = [epoch]
+    for other, eps in epochs.items():
+        if other == cam or not eps:
+            continue
+        i = bisect.bisect_left(eps, epoch)
+        near = [e for e in eps[max(0, i - 1):i + 1]]
+        if not near:
+            continue
+        best = min(near, key=lambda e: (abs(e - epoch), e))
+        if abs(best - epoch) <= tol:
+            seen.append(best)
+    return (max(seen) - min(seen)) * 1000.0 if len(seen) > 1 else None
+
+
 def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
            log=print, offsets=None):
     """Returns {"runs": [...], "leftover": [...], "totals": {...}} — totals
@@ -739,6 +816,15 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
         doc, rows, flight = load_run(root)
         if not rows:
             continue
+        # the correction run.py applied to this run's filenames and datetimes;
+        # absent (runs before it was recorded) or unusable means none
+        tinfo = doc.get("time") if isinstance(doc.get("time"), dict) else {}
+        try:
+            gps_off = float(tinfo.get("gps_offset_s") or 0.0)
+        except (TypeError, ValueError):
+            gps_off = 0.0
+        if not math.isfinite(gps_off):
+            gps_off = 0.0
         nidx = sum(len(v) for v in rows.values())
         if doc.get("frames", 0) > nidx:
             log("  %s: WARNING frame index truncated - run.json says %d "
@@ -753,11 +839,16 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
               if isinstance(doc.get("config"), dict) else None)
         run_tol = min(TOL_S, 0.45 * iv) if isinstance(iv, (int, float)) \
             and iv and iv > 0 else None
-        # pair spreads by shot for the sidecar
-        shots = {}
-        for cam, rs in rows.items():
-            for r in rs:
-                shots.setdefault(round(r["epoch"]), {})[cam] = r["epoch"]
+        # pair spreads for the sidecar: each frame is paired with the NEAREST
+        # frame of every other camera within the live view's tolerance
+        # (rigcore._pairs: half a shot period). The integer-second bucket this
+        # replaced paired the wrong shots at 2 Hz (a lost frame let the
+        # neighbouring shot's epoch share the bucket) and split a shot whose
+        # two exposures straddled an x.5 boundary (audit 2026-10-15).
+        pair_tol = rigcore.PAIR_TOL_S if run_tol is None \
+            else max(0.05, min(rigcore.PAIR_TOL_S, iv / 2.0))
+        epochs = {cam: sorted(r["epoch"] for r in rs)
+                  for cam, rs in rows.items()}
         manifest = []
         summary = {}
         hasher = None if dry else RunHasher(root)
@@ -782,9 +873,14 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
         started = doc.get("started") or min(r["epoch"] for rs in rows.values() for r in rs)
         for cam in pending:
             exp = expected_offset(offsets, "cam%d" % cam, started)
+            # a lone card series is taken on trust only when every OTHER
+            # camera of the run has already resolved its own (the number pass
+            # or an earlier time match): cam2 by number, cam1 the remainder
+            others = all(results.get(c, (None,))[0] is not None
+                         for c in rows if c != cam)
             results[cam] = match_run(rows[cam], cards, used, expect=exp,
                                      authoritative=(dir_cam == cam),
-                                     tol_s=run_tol)
+                                     tol_s=run_tol, sole_ok=others)
         # The run's own ledger of frames it knowingly failed to keep: their
         # card originals are exactly the "leftovers" this pass will refuse to
         # attribute by time alone, so say what they were.
@@ -823,13 +919,19 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                             "raw": 0, "conflicts": 0, "residual_ms": []}
             if series is None:
                 if how.startswith("ambiguous"):
-                    log("  %s cam%d: REFUSED (%s) - several card series fit "
-                        "and neither the journal offset nor a per-node "
-                        "staging path says which body this is. Nothing was "
-                        "renamed. Fix by putting each body's files in their "
-                        "own directory (ingest ~/rig-raw/cam%d, which is what "
+                    log("  %s cam%d: REFUSED (%s) - %s Nothing was renamed. "
+                        "Fix by putting each body's files in their own "
+                        "directory (ingest ~/rig-raw/cam%d, which is what "
                         "the drain writes) or by restoring ~/rig/rigd.jsonl"
-                        % (rid, cam, how, cam))
+                        % (rid, cam, how,
+                           "several alignments fit equally well (a missing "
+                           "first or last frame, or an extra card file) and "
+                           "the journal offset does not say which is real."
+                           if how == "ambiguous: offset" else
+                           "several card series fit, or one series nothing "
+                           "attributes to this body, and neither the journal "
+                           "offset nor a per-node staging path says which "
+                           "body this is.", cam))
                 elif how == "other-node":
                     log("  %s cam%d: skipped - staging dir belongs to cam%d"
                         % (rid, cam, dir_cam))
@@ -874,9 +976,7 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                 # it so the operator is told rather than left to find it
                 summary[cam]["conflicts"] += sum(
                     1 for v in acts.values() if str(v).startswith("conflict:"))
-                sh = shots.get(round(r["epoch"]), {})
-                spread = ((max(sh.values()) - min(sh.values())) * 1000.0
-                          if len(sh) > 1 else None)
+                spread = _pair_spread_ms(r["epoch"], cam, epochs, pair_tol)
                 r["card_stem"] = c["stem"]
                 if not dry:
                     # Once a run has been opened in Lightroom/Capture One,
@@ -895,7 +995,8 @@ def ingest(card_dir, runs_dir=RUNS_DIR, only=None, move=False, dry=False,
                         if not own:
                             xp = os.path.join(camdir, base + ".wildsync.xmp")
                     with open(xp, "w") as fh:
-                        fh.write(xmp_sidecar(r, flight.get(r["file"]), rid, cam, res, spread))
+                        fh.write(xmp_sidecar(r, flight.get(r["file"]), rid, cam, res, spread,
+                                         gps_off))
                 summary[cam]["residual_ms"].append(res * 1000.0)
                 manifest.append({"run_id": rid, "cam": cam, "card": c["stem"],
                                  "new_base": base, "epoch": "%.6f" % r["epoch"],
@@ -1040,6 +1141,11 @@ def _selftest():
     x = open(xmps[0]).read()
     assert "<exif:GPSLatitude>41,25.426512N" in x and "<wildsync:capture_epoch>" in x, x[:400]
     assert "<wildsync:time_source>jetson</wildsync:time_source>" in x, x
+    # the XMP dates follow the run's GPS correction; capture_epoch stays host
+    xo = xmp_sidecar({"epoch": t0}, None, rid, 1, 0.0, None, gps_offset_s=3600.5)
+    assert "<exif:DateTimeOriginal>%s</exif:DateTimeOriginal>" % _iso(t0 + 3600.5) in xo, xo
+    assert "<wildsync:capture_epoch>%.6f<" % t0 in xo, xo
+    assert "gps_offset_s" not in xmp_sidecar({"epoch": t0}, None, rid, 1, 0.0, None)
     assert os.path.exists(os.path.join(root, "ingest_manifest.csv"))
     # hashes: manifest columns appended, SHA256SUMS over frames + records
     with open(os.path.join(root, "ingest_manifest.csv"), newline="") as fh:
@@ -1102,6 +1208,16 @@ def _cli_verify(targets, runs_dir):
     return worst
 
 
+def _ingest_failed(totals):
+    """The verdict rigd's post-drain ingest already uses (rigd.py: ambiguous
+    or conflicts or hash_mismatch or cards-but-nothing-matched). Unmatched
+    frames alone are routine (calibration exposures, unpulled frames) and do
+    not fail the CLI."""
+    return bool(totals["ambiguous"] or totals["conflicts"]
+                or totals["hash_mismatch"]
+                or (totals["cards"] and not totals["matched"]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("card_dir", nargs="?", help="directory of downloaded card files")
@@ -1132,7 +1248,12 @@ def main():
         return
     if not a.card_dir:
         ap.error("card_dir is required")
-    ingest(a.card_dir, runs_dir=a.runs, only=a.run, move=a.move, dry=a.dry_run)
+    out = ingest(a.card_dir, runs_dir=a.runs, only=a.run, move=a.move,
+                 dry=a.dry_run)
+    # the operator chains `drain && ingest`: a printed REFUSED/CONFLICT with
+    # status 0 reads as success to the shell
+    if _ingest_failed(out["totals"]):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

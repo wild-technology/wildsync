@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 import rigcore
 from rigcore import (NODES, EventLog, NodeMonitor, RunBrowser, RunsError,
@@ -77,6 +77,11 @@ SLOT_WRITING_CRITICAL_S = 120.0
 # ---------------------------------------------------------------------------
 class BadRequest(ValueError):
     """Client input this daemon refuses to act on. Answered 400, never 500."""
+
+
+class Forbidden(BadRequest):
+    """A request this daemon refuses regardless of its content: answered 403
+    (a cross-origin browser POST)."""
 
 
 def want_bool(v, what):
@@ -905,15 +910,15 @@ class Anomalies:
                         # The Subsonus over Ethernet (rig/nav_subsonus.py):
                         # a dark socket is power or cabling, a connected
                         # socket with no packets is the unit's output config.
-                        silent = "Subsonus sending no data"
-                        fix = ("plug in or power the Subsonus for live nav"
+                        silent = "nav unit (ANPP) sending no data"
+                        fix = ("plug in or power the nav unit for live nav"
                                if sf else
-                               ("the Subsonus accepted the connection but "
+                               ("the nav unit accepted the connection but "
                                 "sends nothing - enable packet 20 on its "
                                 "ANPP port in the unit's web UI"
                                 if health.get("packets", 0) == 0
                                 and health.get("last_error") is None
-                                else "check the Subsonus's power and "
+                                else "check the nav unit's power and "
                                      "Ethernet link, then its address (%s)"
                                      % health.get("port")))
                     else:
@@ -1151,6 +1156,10 @@ class Rig:
         self.timesync = TimeSync(self.events)
         self.nav = self._start_nav()
         self._drain_lock = threading.Lock()
+        # One export build per run at a time (export_run_zip): the lock dict
+        # is guarded by its own lock, the builds by the per-run locks.
+        self._export_guard = threading.Lock()
+        self._export_locks = {}
         self._drain_status = {"active": False, "node": None, "last": None,
                               "queue": [], "cancel_requested": False,
                               "wedged": {}}
@@ -1352,24 +1361,74 @@ class Rig:
             os.path.join(os.path.dirname(project.runs_dir()), "exports")
         os.makedirs(exp_dir, exist_ok=True)
         out = os.path.join(exp_dir, run_id + ".zip")
-        newest = 0.0
-        members = []
-        for base, _dirs, files in os.walk(root):
-            for f in files:
-                p = os.path.join(base, f)
+        # Serialised per run. Two overlapping requests (a double-clicked ZIP
+        # link, two operators) both passed the freshness check, because `out`
+        # does not exist until the first os.replace, and then shared one .tmp:
+        # the second open truncated the file the first was still writing, the
+        # first request's os.replace published it mid-rewrite, and the
+        # second's os.replace raised FileNotFoundError (a 500). Waiting here,
+        # the second request re-judges freshness after the first has published
+        # and is simply handed the finished zip. Per run, so exporting one run
+        # never blocks another.
+        with self._export_guard:
+            run_lock = self._export_locks.setdefault(run_id, threading.Lock())
+        with run_lock:
+            newest = 0.0
+            members = []
+            for base, _dirs, files in os.walk(root):
+                for f in files:
+                    p = os.path.join(base, f)
+                    try:
+                        newest = max(newest, os.path.getmtime(p))
+                    except OSError:
+                        continue
+                    members.append(p)
+            if os.path.isfile(out) and os.path.getmtime(out) > newest \
+                    and members:
+                return out
+            # The export copies the whole run onto the same project volume the
+            # live frame writes depend on, and a frame write that raises OSError
+            # on a full volume is never retried (see free_mb). A run that is
+            # still recording is also a moving target - every ZIP click would
+            # rebuild a multi-GB copy of it. So: not the live run, and not
+            # unless the volume keeps the headroom the rig already treats as
+            # the transect-risk line AFTER the copy.
+            st = self.runmgr.status()
+            if st.get("active") and st.get("run_id") == run_id:
+                raise RunsError("run %s is still recording - stop it before "
+                                "exporting" % run_id)
+            need_mb = 0
+            for p in members:
                 try:
-                    newest = max(newest, os.path.getmtime(p))
+                    need_mb += os.path.getsize(p)
                 except OSError:
                     continue
-                members.append(p)
-        if os.path.isfile(out) and os.path.getmtime(out) > newest and members:
-            return out
-        tmp = out + ".tmp"
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED,
-                             allowZip64=True) as z:
-            for p in sorted(members):
-                z.write(p, os.path.join(run_id, os.path.relpath(p, root)))
-        os.replace(tmp, out)
+            need_mb = need_mb // (1024 * 1024) + 1
+            free = free_mb(exp_dir)
+            if isinstance(free, (int, float)) \
+                    and free - need_mb < RUNS_DISK_LOW_MB:
+                raise RunsError(
+                    "not enough free space for the export: %d MB needed, %d "
+                    "MB free, and %d MB must stay free for recording"
+                    % (need_mb, free, RUNS_DISK_LOW_MB))
+            tmp = out + ".tmp"
+            try:
+                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED,
+                                     allowZip64=True) as z:
+                    for p in sorted(members):
+                        z.write(p, os.path.join(run_id,
+                                                os.path.relpath(p, root)))
+                os.replace(tmp, out)
+            except BaseException as e:
+                # A partial .tmp is a copy of the run nobody will ever read,
+                # sitting on the survey volume.
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                if isinstance(e, OSError):
+                    raise RunsError("export failed: %s" % e) from None
+                raise
         self.events.emit("info", "export", "run %s exported: %s (%.1f MB)"
                          % (run_id, out, os.path.getsize(out) / 1e6),
                          run_id=run_id)
@@ -1900,7 +1959,11 @@ class Rig:
             # The node said it is a test fake (rig/tests/fakenode.py); any run
             # it joins is marked simulated in run.json.
             "simulated": bool(getattr(m, "simulated", False)),
-            "connected": status.get("connected", False),
+            # An OFFLINE node is not connected whatever its last status said
+            # (the monitor marks it too; this keeps the fleet view right even
+            # if another path leaves a stale dict behind).
+            "connected": bool(status.get("connected", False))
+            and snap["state"] != NodeMonitor.OFFLINE,
             "model": status.get("model"), "id": status.get("id"),
             "battery": status.get("battery"),
             "iso": status.get("iso"),
@@ -2267,6 +2330,15 @@ RIG = None
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # HTTP/1.1 keeps connections open, and nothing here ever bounded a read: a
+    # phone or tablet UI that roams, sleeps or loses Wi-Fi without a FIN/RST
+    # left each of its ~6 keep-alive connections blocked in readline() for ever,
+    # holding a thread and a file descriptor apiece until rigd restarted. So did
+    # a client that announced a body and stopped sending. StreamRequestHandler
+    # applies this to the connection socket; 120 s is far above the UI's 2 s
+    # poll (a live page never sees an idle close) and it is per recv/send, so a
+    # multi-GB export that is still flowing is not cut off.
+    timeout = 120
 
     def log_message(self, *a):
         pass
@@ -2277,6 +2349,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            # An error path that left the request body unread (or unreadable):
+            # say the connection ends here, so a keep-alive client reconnects
+            # instead of sending its next request into a socket we are closing.
+            self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -2294,6 +2371,24 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    @staticmethod
+    def _content_disposition(name):
+        """An attachment header value that is always latin-1 encodable.
+
+        http.server encodes header values latin-1, strictly. A legacy run id
+        such as 251001_0000_サンゴ礁 (still browsable, see _RUN_ID_RE) raised
+        UnicodeEncodeError AFTER send_response(200) had buffered the status
+        line, and do_GET's catch-all then buffered a 500 after it: the client
+        got two status lines and no download. Send an ASCII fallback plus the
+        RFC 5987 form every browser prefers."""
+        ascii_name = name.encode("ascii", "replace").decode("ascii")
+        ascii_name = "".join("_" if c in '?"\\' or ord(c) < 32 else c
+                             for c in ascii_name)
+        if ascii_name == name:
+            return 'attachment; filename="%s"' % ascii_name
+        return ("attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                % (ascii_name, quote(name, safe="")))
+
     def _sendfile(self, path, ctype, download_name=None):
         # Streamed in 1 MB slices with a real Content-Length: a run export can
         # be a gigabyte, and _bytes' read-whole-file would hold it in memory
@@ -2305,12 +2400,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)}, 404)
             return
         with fh:
+            # Built before send_response: a header that cannot be encoded must
+            # fail while nothing has been buffered yet.
+            disposition = self._content_disposition(download_name) \
+                if download_name else None
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(size))
-            if download_name:
-                self.send_header("Content-Disposition",
-                                 'attachment; filename="%s"' % download_name)
+            if disposition:
+                self.send_header("Content-Disposition", disposition)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             try:
@@ -2331,11 +2429,24 @@ class Handler(BaseHTTPRequestHandler):
         that is valid JSON but not an OBJECT ("null", "[]", "3") is refused for
         the same reason: every handler below immediately does b.get(...), which
         on a list is an AttributeError and a 500."""
+        # An unframed body is a different failure from an empty one. A chunked
+        # request has no Content-Length, so it read as "no body" and POST
+        # /api/run/start with a streamed payload started a run on the built-in
+        # defaults - and, this being HTTP/1.1 keep-alive, its unread chunks
+        # would then have been parsed as the next request. A missing header
+        # (curl -X POST) is still a legitimate empty body.
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            raise BadRequest("Transfer-Encoding is not supported; send the "
+                             "body with a Content-Length")
         try:
             n = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
             raise BadRequest("bad Content-Length header") from None
-        if n <= 0:
+        if n < 0:
+            self.close_connection = True
+            raise BadRequest("negative Content-Length")
+        if n == 0:
             return {}
         if n > 1 << 20:
             # Not read, so the connection cannot be reused - say so rather
@@ -2345,6 +2456,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(n)
         except OSError as e:
+            # A read that timed out leaves the socket file flagged: the next
+            # handle_one_request() on this connection raises "cannot read from
+            # timed out object" (a stderr traceback and a dead thread), and a
+            # half-read body could not be re-framed anyway.
+            self.close_connection = True
             raise BadRequest("could not read the request body: %s" % e) from None
         # parse_constant refuses Infinity/-Infinity/NaN, which json.loads
         # otherwise accepts silently: they are not JSON, no client of this
@@ -2440,7 +2556,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     path = RIG.export_run_zip(rid)
                 except RunsError as e:
-                    self._json({"ok": False, "error": str(e)}, 404)
+                    # Same mapping as _runs: only a missing run is a 404; a
+                    # refusal (still recording, no room) is the client's to fix.
+                    self._json({"ok": False, "error": str(e)},
+                               404 if "no such" in str(e) else 400)
                 else:
                     self._sendfile(path, "application/zip", rid + ".zip")
             elif p == "/api/run/frame":
@@ -2620,10 +2739,39 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _check_same_origin(self):
+        """Refuse a POST that a browser sent from another site.
+
+        A cross-origin fetch with mode no-cors and a text/plain body is a
+        "simple" request: the browser sends it WITHOUT a preflight, and this
+        handler used to run it (only the response is hidden from the page). The
+        JSON-only parsing and the body-borne {"confirm":"format"} token are no
+        defence - the attacker writes the body - and a body-less POST parses as
+        {}. rigd binds 0.0.0.0 with no auth and its addresses are guessable, so
+        any page an operator opens on the rig network could stop a drain, start
+        a run or switch cameras off. Browsers attach Origin to every
+        cross-origin POST, so compare it with the Host the request was sent to.
+        No Origin (curl, urllib, the tests, drain, live_validate) is allowed:
+        only a browser can be talked into a forged request. No CORS headers
+        and no OPTIONS handler are added - the UI is served by rigd itself."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return
+        host = (self.headers.get("Host") or "").strip().lower()
+        o = origin.strip().lower()
+        if o != "null" and host and urlparse(o).netloc == host:
+            return
+        # The body is not read, so it cannot be left framed as the next request.
+        self.close_connection = True
+        raise Forbidden("cross-origin POST refused (Origin %s, Host %s)"
+                        % (origin[:80], host[:80] or "-"))
+
     def do_POST(self):
         u = urlparse(self.path)
         p = u.path
         try:
+            # Before anything is read or done: see _check_same_origin.
+            self._check_same_origin()
             # INSIDE the try, so a malformed body is a 400 with a message
             # rather than an exception on the way to the dispatch (D1).
             b = self._read_body()
@@ -2633,9 +2781,14 @@ class Handler(BaseHTTPRequestHandler):
                 # desired value looks exactly like a camera fault from the
                 # operator's side (red badge, anomaly pointing at the body),
                 # and the only way out was to guess which field was bad.
-                self._json({"ok": bool(rep["applied"]) or not rep["rejected"],
-                            "applied": rep["applied"],
-                            "rejected": rep["rejected"]})
+                out = {"ok": bool(rep["applied"]) or not rep["rejected"],
+                       "applied": rep["applied"],
+                       "rejected": rep["rejected"]}
+                if rep.get("deferred"):
+                    # Held cameras (drain/busy) that have not taken the
+                    # exposure yet: ok:true alone read as "the pair matches".
+                    out["deferred"] = rep["deferred"]
+                self._json(out)
             elif p == "/api/settings/preview":
                 # Stage on the primary only. `desired` is untouched and that
                 # node is pinned so the 3 s reconcile cannot yank the preview
@@ -2654,7 +2807,11 @@ class Handler(BaseHTTPRequestHandler):
                 name = self._node(b.get("node"), '"node"').name_
                 if "enabled" not in b:
                     raise BadRequest('"enabled" (true/false) is required')
-                self._json(RIG.set_camera_enabled(name, b["enabled"]))
+                # bool("false") is True: a client that sent the STRING switched
+                # a camera ON (and persisted it), and null/"" switched it off.
+                # A truthy string is not consent - require a real bool.
+                self._json(RIG.set_camera_enabled(
+                    name, want_bool(b["enabled"], '"enabled"')))
             elif p == "/api/settings/commit":
                 self._json(RIG.settings.commit())
             elif p in ("/api/project/create", "/api/project/open",
@@ -2683,7 +2840,18 @@ class Handler(BaseHTTPRequestHandler):
                         res = rigcal.stereo_session().compute()
                         self._json({"ok": True, "result": res})
                     elif p == "/api/rigcal/stereo/save":
-                        rep = rigcal.stereo_session().save()
+                        try:
+                            rep = rigcal.stereo_session().save(
+                                force=bool(b.get("force")))
+                        except RuntimeError as e:
+                            # A solve that failed its own verdict is refused
+                            # unless the operator confirms it (force:true):
+                            # saving it would silently replace the last good
+                            # calibration. needs_force lets the UI ask.
+                            self._json({"ok": False, "error": str(e),
+                                        "needs_force":
+                                        "confirm to save" in str(e)})
+                            return
                         RIG.events.emit(
                             "info", "rigcal",
                             "stereo calibration saved: baseline %.1f mm, "
@@ -2710,8 +2878,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise BadRequest('refusing to format without '
                                      '{"confirm":"format"}')
                 node = self._node(b.get("node"), '"node"').name_
-                self._json(RIG.node_format(node,
-                                           quick=bool(b.get("quick", 1))))
+                # Judged before any node is contacted. bool("false") is True,
+                # so {"quick":"false"} used to ask for a QUICK format when the
+                # client meant a full one.
+                quick = want_bool(b.get("quick", 1), '"quick"')
+                self._json(RIG.node_format(node, quick=quick))
             elif p in ("/api/settings/discard", "/api/settings/revert"):
                 self._json(RIG.settings.discard())
             elif p == "/api/settings/auto":
@@ -2948,6 +3119,14 @@ class Handler(BaseHTTPRequestHandler):
                                 "camera" % m.name_}, 409)
                     return
                 r = m.set_exposure(which, value)
+                if isinstance(r, dict) and r.get("ok") is not False \
+                        and not r.get("_unreachable"):
+                    # A deliberate per-camera value outranks an exposure apply
+                    # this body was still owed from a drain: paying the debt
+                    # afterwards would overwrite the operator's tweak.
+                    with m._lock:
+                        m._exposure_owed = \
+                            set(getattr(m, "_exposure_owed", ())) - {which}
                 self._json(r if isinstance(r, dict)
                            else {"ok": False, "error": "no response"})
             elif p in ("/api/focus/drive", "/api/focus/position",
@@ -2978,6 +3157,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(r)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
+        except Forbidden as e:
+            self._json({"ok": False, "error": str(e)}, 403)
         except BadRequest as e:
             # See do_GET: a client-side mistake is a clean 400 naming the
             # field, and is not journalled as a rigd error.

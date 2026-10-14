@@ -26,6 +26,22 @@ Covers, and FAILS on the pre-fix code for:
       in /health's imu section, per-slot rate floors, the acquire loop brings
       a probed olive online end-to-end, and undecodable bytes are counted
       and surfaced (raw tail), never raised or published
+  P11 strobe role (refuses harness endpoints, no IMU), strobe polarity at the
+      driver, Olive as the primary IMU
+  P12 a strobe-role shutdown never parks or biases harness offsets 17/27 on
+      the host's chip (also not via the gpiod-missing path); the node role
+      still parks both
+  P13 shutdown drives the strobe line to ITS OWN idle level: LOW for the
+      push-pull active-high XR256 board (the class constant is the ASSERT
+      level there and fired the tube on every restart)
+  P14 a strobe_pulse_ms that does not parse is a 400 BEFORE the TRIGGER
+      pulse, not a ValueError after the camera exposed
+  P15 a chunked, non-numeric/negative or oversize body is a 400 with the
+      connection closed, never {} on defaults
+  P16 a stopped interval's exit block does not clobber a restarted
+      interval's state and lease
+  P17 a failed strobe-line claim is retried after a cooldown; the permanent
+      refusals (disabled, no gpio) stay cached
 
 Usage:  python3 rig/tests/audit_piagent.py        (or via soaktest's registry)
 """
@@ -93,6 +109,9 @@ class StubDriver:
     def set(self, bcm, value):
         self.sets.append((bcm, value))
         return True
+
+    def close(self):
+        pass
 
     def pulse(self, bcm, hold_s):
         self.sets.append((bcm, "pulse"))
@@ -176,6 +195,380 @@ def _post(url, body):
 def _get(url):
     with _rq.urlopen(url, timeout=5) as r:
         return json.loads(r.read().decode())
+
+
+
+class _StrobeStub:
+    """A claimed strobe line that records the pulse width it was asked for."""
+    ok = True
+    IDLE, ASSERT = 0, 1
+
+    def __init__(self):
+        self.pulses = []
+
+    def pulse(self, bcm, hold_s):
+        self.pulses.append((bcm, round(hold_s, 6)))
+        return time.time()
+
+    def set(self, bcm, value):
+        return True
+
+    def close(self):
+        pass
+
+
+class _FakeProc:
+    """What a recorded Popen hands back: already dead, so no parker 'lives'."""
+
+    def __init__(self, cmd):
+        self.cmd = cmd
+
+    def poll(self):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _recording_popen(log_list):
+    def _popen(cmd, *a, **k):
+        log_list.append(list(cmd))
+        return _FakeProc(cmd)
+    return _popen
+
+
+def _shutdown_spawns(strobe_role, driver_ok):
+    """argv of every process Gpio.shutdown() starts, for the given role."""
+    spawned = []
+    real_popen = piagent.subprocess.Popen
+    old_role = piagent.STROBE_ROLE
+    try:
+        g = piagent.Gpio()
+        g._watchdog_run = False
+        g._mon_run = False
+        g.available = True
+        g.driver = StubDriver()
+        g.driver.ok = driver_ok
+        piagent.STROBE_ROLE = strobe_role
+        piagent.subprocess.Popen = _recording_popen(spawned)
+        g.shutdown()
+    finally:
+        piagent.subprocess.Popen = real_popen
+        piagent.STROBE_ROLE = old_role
+    return spawned
+
+
+def _p12_strobe_shutdown_leaves_harness_pads(cleanup):
+    sect("audit piagent: strobe-role shutdown leaves offsets 17/27 alone (P12)")
+    hot = (str(piagent.BCM_FOCUS), str(piagent.BCM_TRIGGER))
+    for label, ok in (("gpiod driver", True), ("gpiod missing", False)):
+        sp = _shutdown_spawns(True, ok)
+        touched = [c for c in sp if any(b in c for b in hot)]
+        check("strobe role, %s: shutdown spawns nothing on 17/27" % label,
+              not touched,
+              "spawned %r - gpiomon --bias=pull-up on the Jetson chip's "
+              "unrelated pads" % (touched,))
+    sp = _shutdown_spawns(False, True)
+    parked = sorted(set(c[-1] for c in sp if c[:1] == ["gpiomon"]
+                        and "--bias=pull-up" in c))
+    check("node role still parks FOCUS and TRIGGER with a pull-up at exit",
+          parked == sorted(hot), "%r" % (sp,))
+
+
+def _p13_strobe_shutdown_idle_level(cleanup):
+    sect("audit piagent: shutdown writes the strobe's own idle level (P13)")
+    import types
+    events = []
+    fake = types.ModuleType("gpiod")
+    fake.LINE_REQ_FLAG_OPEN_DRAIN, fake.LINE_REQ_FLAG_BIAS_PULL_UP = 1, 2
+    fake.LINE_REQ_DIR_OUT = 3
+
+    class _L(object):
+        def __init__(self, n):
+            self.n = n
+
+        def request(self, **k):
+            events.append(("req", self.n, k["flags"], k["default_vals"][0]))
+
+        def set_value(self, v):
+            events.append(("set", self.n, v))
+
+        def release(self):
+            pass
+
+    class _C(object):
+        def __init__(self, name):
+            pass
+
+        def get_line(self, n):
+            return _L(n)
+
+        def close(self):
+            pass
+
+    fake.Chip = _C
+    real = sys.modules.get("gpiod")
+    sys.modules["gpiod"] = fake
+    old_role = piagent.STROBE_ROLE
+    real_popen = piagent.subprocess.Popen
+    try:
+        for label, active_high, want in (("active-high", True, 0),
+                                         ("active-low", False, 1)):
+            g = _mk_gpio()
+            cleanup.append(g)
+            g._strobe = piagent._LineDriver(
+                "gpiochip0", (piagent.BCM_STROBE,), pull_up=False,
+                active_high=active_high)
+            del events[:]
+            piagent.STROBE_ROLE = True
+            piagent.subprocess.Popen = _recording_popen([])
+            g.shutdown()
+            writes = [e[2] for e in events
+                      if e[0] == "set" and e[1] == piagent.BCM_STROBE]
+            check("%s strobe: shutdown writes only its idle level (%d)"
+                  % (label, want), writes == [want],
+                  "wrote %r - on an active-high push-pull line the open-drain "
+                  "level is the ASSERT level, a rising edge that fires the "
+                  "XR256 at every restart" % (writes,))
+    finally:
+        piagent.STROBE_ROLE = old_role
+        piagent.subprocess.Popen = real_popen
+        if real is None:
+            sys.modules.pop("gpiod", None)
+        else:
+            sys.modules["gpiod"] = real
+
+
+def _p14_strobe_pulse_width_validated_first(cleanup):
+    sect("audit piagent: strobe_pulse_ms is validated before TRIGGER (P14)")
+    g = _mk_gpio()
+    cleanup.append(g)
+    g.available = True
+    g.focus(True)
+    stub = _StrobeStub()
+    g._strobe = stub
+
+    def go(width):
+        now = time.time()
+        g.driver.sets[:] = []
+        stub.pulses[:] = []
+        seq0 = g._fire_seq
+        try:
+            r = g.fire(now + 0.05, 5, 0, now + 0.06, width)
+            err = None
+        except Exception as e:  # noqa: BLE001 - the pre-fix ValueError
+            r, err = {}, repr(e)
+        trig = [s for s in g.driver.sets if s[1] == "pulse"]
+        return r, err, trig, g._fire_seq - seq0
+
+    for bad in ("abc", [1], {"a": 1}, float("nan"), float("inf")):
+        r, err, trig, used = go(bad)
+        check("strobe_pulse_ms=%r -> 400 before anything is touched" % (bad,),
+              err is None and r.get("ok") is False and r.get("code") == 400
+              and not trig and not stub.pulses and used == 0,
+              "err=%s result=%r TRIGGER pulses=%r strobe=%r fire_seq used=%d"
+              % (err, r, trig, stub.pulses, used))
+    for width, want in ((5, 0.005), (None, 0.005), (0, 0.005), (500, 0.1),
+                        ("7", 0.007)):
+        r, err, trig, used = go(width)
+        check("strobe_pulse_ms=%r still fires, %g s" % (width, want),
+              err is None and r.get("ok") is True and len(trig) == 1
+              and stub.pulses == [(piagent.BCM_STROBE, want)],
+              "err=%s result=%r strobe=%r" % (err, r, stub.pulses))
+    g.focus(False)
+
+
+def _raw_post(port, head_lines, body=b""):
+    """One raw HTTP/1.1 POST; returns (status, connection_closed_by_server)."""
+    import socket
+    so = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        so.sendall(("\r\n".join(head_lines) + "\r\n\r\n").encode() + body)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = so.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        status = int(data.split(b" ", 2)[1]) if data else 0
+        so.settimeout(2)
+        closed = False
+        try:
+            # The reply carries a Content-Length body; drain it, then a
+            # closed connection reads b"" while a kept-alive one times out.
+            while True:
+                chunk = so.recv(4096)
+                if not chunk:
+                    closed = True
+                    break
+        except OSError:
+            closed = False
+        return status, closed
+    finally:
+        so.close()
+
+
+def _p15_body_framing(cleanup):
+    sect("audit piagent: unframeable POST bodies are a 400 (P15)")
+    g = _mk_gpio()
+    cleanup.append(g)
+    g.available = True
+    g.focus(True)
+    old_gpio = piagent.GPIO
+    piagent.GPIO = g
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), piagent.Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        at = '{"at_epoch": %.3f}' % (time.time() + 4.0)
+        cases = (
+            ("chunked body", ["POST /gpio/fire HTTP/1.1", "Host: x",
+                              "Transfer-Encoding: chunked"],
+             ("%x\r\n%s\r\n0\r\n\r\n" % (len(at), at)).encode(), True),
+            ("Content-Length: abc", ["POST /gpio/fire HTTP/1.1", "Host: x",
+                                     "Content-Length: abc"], b"", None),
+            ("Content-Length: -5", ["POST /gpio/fire HTTP/1.1", "Host: x",
+                                    "Content-Length: -5"], b"", None),
+            ("Content-Length: 2 MiB", ["POST /gpio/fire HTTP/1.1", "Host: x",
+                                       "Content-Length: 2097152"], b"", True),
+        )
+        for label, head, body, want_closed in cases:
+            g.driver.sets[:] = []
+            status, closed = _raw_post(port, head, body)
+            fired = [s for s in g.driver.sets if s[1] in ("pulse", "shot")]
+            check("%s -> 400, nothing fired" % label,
+                  status == 400 and not fired,
+                  "status %r, driver saw %r - the body was treated as empty "
+                  "and the fire ran on defaults" % (status, fired))
+            if want_closed:
+                check("%s -> connection closed (unread bytes)" % label,
+                      closed, "kept open: the body would parse as the next "
+                      "request")
+        status, _ = _raw_post(port, ["POST /gpio/interval/stop HTTP/1.1",
+                                     "Host: x"])
+        check("no Content-Length at all is still an empty body (200)",
+              status == 200, "status %r" % (status,))
+        status, _ = _raw_post(port, ["POST /gpio/interval/stop HTTP/1.1",
+                                     "Host: x", "Content-Length: 0"])
+        check("Content-Length: 0 is still an empty body (200)",
+              status == 200, "status %r" % (status,))
+    finally:
+        srv.shutdown()
+        piagent.GPIO = old_gpio
+        g.focus(False)
+
+
+def _p16_interval_restart(cleanup):
+    sect("audit piagent: a stopped interval cannot clobber its successor (P16)")
+    g = _mk_gpio()
+    cleanup.append(g)
+    g.available = True
+    g.focus(True)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_fire(target, pulse_ms, *a, **k):
+        calls.append(target)
+        if len(calls) == 1:
+            entered.set()
+            release.wait(10)             # the old loop sits inside its fire
+        return {"ok": True, "late_ms": 0}
+
+    g.fire = fake_fire
+    try:
+        check("first interval starts", g.interval_start(0, 60.0, 0).get("ok"))
+        old_thread = g._interval_thread
+        check("...and is inside its first fire", entered.wait(5))
+        g.interval_stop()
+        r2 = g.interval_start(0, 60.0, 0)
+        check("a restart straight after stop is accepted", r2.get("ok"),
+              "%r" % (r2,))
+        release.set()
+        old_thread.join(5)
+        check("the old loop has exited", not old_thread.is_alive())
+        check("the restarted interval is still reported running",
+              g.interval_status().get("running") is True,
+              "the stale loop's exit block marked it stopped")
+        check("...with its long lease intact (not clamped to the 30 s default)",
+              (g._focus_hold_ttl or 0) >= 2.5 * 60.0 - 1,
+              "ttl %r" % (g._focus_hold_ttl,))
+        r3 = g.interval_start(0, 60.0, 0)
+        check("a third start is refused while the second runs",
+              r3.get("ok") is False and "already" in (r3.get("error") or ""),
+              "%r" % (r3,))
+        g.interval_stop()
+        ended = wait_for(lambda: not g.interval_status().get("running"),
+                         timeout=5.0, interval=0.1)
+        check("the live loop still ends normally on stop", ended)
+    finally:
+        release.set()
+        g.interval_stop()
+        g.focus(False)
+
+
+def _p17_strobe_claim_retry(cleanup):
+    sect("audit piagent: a failed strobe claim is retried (P17)")
+    made = []
+
+    class _Drv:
+        def __init__(self, chip, lines, pull_up=True, active_high=False):
+            made.append(lines)
+            self.ok = len(made) > 1      # the first claim fails, then works
+            self.IDLE, self.ASSERT = 1, 0
+
+        def close(self):
+            pass
+
+    # Built before the stub goes in: Gpio() constructs a real _LineDriver.
+    g, g0, gn = _mk_gpio(), _mk_gpio(), _mk_gpio()
+    cleanup.extend((g, g0, gn))
+    real_drv, real_bcm = piagent._LineDriver, piagent.BCM_STROBE
+    piagent._LineDriver = _Drv
+    piagent.BCM_STROBE = 26
+    try:
+        g.available = True
+        g._strobe = None
+        r1 = g._strobe_driver()
+        check("first claim fails and reports why",
+              r1 is False and g._strobe_err and len(made) == 1,
+              "%r %r" % (r1, g._strobe_err))
+        r2 = g._strobe_driver()
+        check("inside the cooldown no second claim is attempted",
+              r2 is False and len(made) == 1, "%d constructions" % len(made))
+        g._strobe_retry_at = time.monotonic() - 1.0
+        r3 = g._strobe_driver()
+        check("after the cooldown the claim is retried and succeeds",
+              r3 is not False and len(made) == 2 and g._strobe_err is None,
+              "%r made=%d err=%r - a cached False darkens the survey until "
+              "restart" % (r3, len(made), g._strobe_err))
+        check("...and the claimed driver is then cached",
+              g._strobe_driver() is r3 and len(made) == 2)
+        # Permanent refusals stay cached, with no retry.
+        del made[:]
+        piagent.BCM_STROBE = 0
+        g0.available = True
+        g0._strobe = None
+        a, b = g0._strobe_driver(), g0._strobe_driver()
+        check("strobe disabled stays cached False, never constructs",
+              a is False and b is False and g0._strobe is False
+              and not made)
+        piagent.BCM_STROBE = 26
+        gn.available = False
+        gn._strobe = None
+        a, b = gn._strobe_driver(), gn._strobe_driver()
+        check("no gpio on the node stays cached False, never constructs",
+              a is False and b is False and gn._strobe is False
+              and not made)
+    finally:
+        piagent._LineDriver, piagent.BCM_STROBE = real_drv, real_bcm
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +1347,13 @@ def suite(opts):
           hi == [("req", 5, 0, 0), ("set", 5, 1), ("set", 5, 0)], "%r" % hi)
     check("active-low strobe unchanged: open-drain, idles high-Z, pulls low",
           lo == [("req", 26, 1, 1), ("set", 26, 0), ("set", 26, 1)], "%r" % lo)
+
+    _p12_strobe_shutdown_leaves_harness_pads(cleanup)
+    _p13_strobe_shutdown_idle_level(cleanup)
+    _p14_strobe_pulse_width_validated_first(cleanup)
+    _p15_body_framing(cleanup)
+    _p16_interval_restart(cleanup)
+    _p17_strobe_claim_retry(cleanup)
 
     # ---- teardown ---------------------------------------------------------
     for g in cleanup:

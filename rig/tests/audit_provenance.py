@@ -26,6 +26,11 @@ P4  hashes. The drain records every verified file's SHA-256 before the card
     re-hashes; a recorded hash is never silently replaced; runs without any
     of this still load.
 
+P5  exit status. ingest.py exits 1 when a run was refused as ambiguous, a run
+    name already held different bytes, a placed file differs from the drain's
+    hash, or the card held files and nothing matched; routine leftovers and a
+    few unmatched frames stay exit 0 (the operator chains drain && ingest).
+
 Hermetic: in-process fakes on loopback only, temp run roots, never ~/rig or
 ~/rig-runs.
 
@@ -750,11 +755,118 @@ def _p4_hashes(opts):
 
 
 # ---------------------------------------------------------------------------
+# P5 — ingest.py exit status
+# ---------------------------------------------------------------------------
+def _cli_home(home, *args):
+    """_cli with HOME pointed at a temp dir, so the journal ingest reads for
+    exif offsets (~/rig/rigd.jsonl) is empty and the case is hermetic."""
+    import subprocess
+    env = dict(os.environ, HOME=home, PYTHONDONTWRITEBYTECODE="1")
+    p = subprocess.run([sys.executable, os.path.join(RIG, "ingest.py")]
+                       + list(args), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=120, env=env)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def _p5_case(tmp, name, shots=6, stage_name="cam1", series="DSC", skip=(),
+             spacing=None, record=True, cam=1, body_off=-172800.0 + 12.3):
+    """A fresh run plus a staging dir of `cam`'s card files (JPG + ARW per
+    frame, stems that are NOT the PC-save counter so only time can match).
+    Returns (runs, stage, root, doc, staged names)."""
+    from fakenode import make_jpeg
+    import drain as draindrv
+    base = os.path.join(tmp, name)
+    runs = os.path.join(base, "runs")
+    root, doc = write_legacy_run(runs, shots=shots)
+    stage = os.path.join(base, "raw", stage_name)
+    os.makedirs(stage, exist_ok=True)
+    staged = []
+    rows = [x for x in doc["index"] if x["cam"] == cam]
+    for i, e in enumerate(rows):
+        if i in skip:
+            continue
+        ep = e["epoch"] + body_off + (i * i * 7.0 if spacing else 0.0)
+        stem = "%s%05d" % (series, 70000 + i + (0 if cam == 1 else 500))
+        with open(os.path.join(stage, stem + ".JPG"), "wb") as fh:
+            fh.write(make_jpeg(ep))
+        with open(os.path.join(stage, stem + ".ARW"), "wb") as fh:
+            fh.write(b"ARW-%d-" % i * 4000)
+        staged += [stem + ".JPG", stem + ".ARW"]
+    if record:
+        draindrv.append_sums(os.path.join(base, "raw", "SHA256SUMS"), [
+            (stage_name + "/" + f, draindrv.file_sha256(os.path.join(stage, f)))
+            for f in staged])
+    return runs, stage, root, doc, staged
+
+
+def _p5_ingest_exit(opts):
+    sect("P5 exit status: ingest.py exits 1 on refused / conflicting / "
+         "hash-mismatched / nothing-matched, 0 otherwise")
+    tmp = _tmp()
+    home = os.path.join(tmp, "home")
+    os.makedirs(home)
+    try:
+        runs, stage, root, doc, _ = _p5_case(tmp, "clean")
+        rc, out = _cli_home(home, "--runs", runs, stage)
+        check("a clean match exits 0", rc == 0, _oneline(out))
+        rid = os.path.basename(root)
+        rc, out = _cli_home(home, "--runs", runs, "--verify", rid)
+        check("--verify keeps its own exit codes (0 for a verified run)",
+              rc == 0 and "VERIFIED" in out, _oneline(out))
+
+        runs, stage, root, doc, _ = _p5_case(tmp, "leftovers", skip=(2,))
+        from fakenode import make_jpeg
+        with open(os.path.join(stage, "DSC08999.JPG"), "wb") as fh:
+            fh.write(make_jpeg(doc["started"] - 900 - 172800.0 + 12.3))
+        rc, out = _cli_home(home, "--runs", runs, stage)
+        check("matched frames plus unmatched rows and a leftover card file "
+              "still exit 0 (routine)", rc == 0 and "unmatched 1" in out,
+              _oneline(out, 6))
+
+        runs, stage, root, doc, _ = _p5_case(tmp, "nomatch", spacing=True)
+        rc, out = _cli_home(home, "--runs", runs, stage)
+        check("card files that align with no row (NO MATCH) exit 1",
+              rc == 1 and "NO MATCH" in out, _oneline(out, 6))
+
+        runs, stage, root, doc, _ = _p5_case(tmp, "ambig", stage_name="download")
+        _p5_case_extra = _p5_case(tmp, "ambig2", cam=2, series="_CA",
+                                  stage_name="download")
+        # both bodies' files in one non-camN directory, no journal
+        for f in os.listdir(_p5_case_extra[1]):
+            shutil.copy(os.path.join(_p5_case_extra[1], f), stage)
+        rc, out = _cli_home(home, "--runs", runs, stage)
+        check("a combined directory with no exif_offset is REFUSED: exit 1, "
+              "nothing renamed", rc == 1 and "REFUSED" in out
+              and not any(f.endswith(".ARW") for f in os.listdir(
+                  os.path.join(root, "cam1"))), _oneline(out, 6))
+
+        runs, stage, root, doc, _ = _p5_case(tmp, "conflict")
+        first = [x for x in doc["index"] if x["cam"] == 1][0]
+        with open(os.path.join(root, "cam1",
+                               os.path.splitext(first["file"])[0] + ".ARW"),
+                  "wb") as fh:
+            fh.write(b"DIFFERENT BYTES")
+        rc, out = _cli_home(home, "--runs", runs, stage)
+        check("a run name already holding different bytes (CONFLICT) exits 1",
+              rc == 1 and "CONFLICT" in out, _oneline(out, 6))
+
+        runs, stage, root, doc, staged = _p5_case(tmp, "drainhash")
+        with open(os.path.join(stage, staged[1]), "ab") as fh:
+            fh.write(b"changed after the drain verified it")
+        rc, out = _cli_home(home, "--runs", runs, stage)
+        check("a staged file that differs from the drain's hash exits 1",
+              rc == 1 and "HASH MISMATCH" in out, _oneline(out, 6))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 def suite(opts):
     _p1_time_source(opts)
     _p2_software_stamp(opts)
     _p3_simulated(opts)
     _p4_hashes(opts)
+    _p5_ingest_exit(opts)
 
 
 if __name__ == "__main__":

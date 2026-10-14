@@ -6,7 +6,7 @@
 #   ./deploy.sh jetson           install rigd on this Jetson (the rig's clock master)
 #   ./deploy.sh strobe           install the XR256 strobe agent on this Jetson
 #   ./deploy.sh trust cam1       push this host's ssh key to a node (once per node)
-#   ./deploy.sh all              every reachable camera node + the Jetson
+#   ./deploy.sh all              the Jetson, then every reachable camera node
 #
 # ilxctl is ALWAYS built on the target. Nodes and the Jetson are all aarch64 but
 # different microarchitectures, and the Makefile probes -mcpu=native, so a binary
@@ -42,13 +42,26 @@ _ip() {
   echo "$ip"
 }
 
+# One transfer or remote step of a node deploy. This script is deliberately not
+# `set -e` (deploy_jetson and deploy_strobe lean on unchecked commands and
+# '|| echo WARNING' fallbacks, and bash 3.2 on the Mac treats -e inconsistently
+# inside functions), so every step that must not be skipped says so here. It
+# used to be bare: a failed src/ scp let the node build and restart on STALE
+# sources, a failed rsync of lib/ was followed by "provisioned", and either way
+# the script exited 0, so `all` and any wrapper saw success. Call it as
+# `_try cmd ... || return 1` so a failure stops the node BEFORE the remote
+# build-and-restart script runs.
+_try() {
+  "$@" || { echo "  FAILED on ${name:-?}: $*" >&2; return 1; }
+}
+
 # Everything a node needs that `node` does not ship: the SDK headers/libs, the
 # Makefile, and the third-party header. Only needed once per machine.
 provision_node() {
-  local name="$1" ip
+  local name="$1" ip rc
   ip="$(_ip "$name")" || return 1
   echo "=== provision $name ($ip) ==="
-  ping -c1 -W2 "$ip" >/dev/null 2>&1 || { echo "  unreachable, skip"; return; }
+  ping -c1 -W2 "$ip" >/dev/null 2>&1 || { echo "  unreachable, skip"; return 0; }
   # The Pis need the LINUX aarch64 SDK (.so). This checkout's lib/ holds
   # whatever platform the HOST builds with - on the Mac that is dylibs, and
   # rsyncing those bricked the node build with a missing libCr_Core.so while
@@ -84,11 +97,17 @@ provision_node() {
     return 1
   fi
   echo "  SDK source: $sdklib"
-  ssh ubuntu@"$ip" 'mkdir -p ~/wildsync/{src,rig,include,lib,third_party}'
-  rsync -az --delete "$REPO"/include/     ubuntu@"$ip":/home/ubuntu/wildsync/include/
-  rsync -az --delete "$sdklib"/           ubuntu@"$ip":/home/ubuntu/wildsync/lib/
-  rsync -az --delete "$REPO"/third_party/ ubuntu@"$ip":/home/ubuntu/wildsync/third_party/
-  scp -q "$REPO"/Makefile ubuntu@"$ip":/home/ubuntu/wildsync/Makefile
+  _try ssh ubuntu@"$ip" 'mkdir -p ~/wildsync/{src,rig,include,lib,third_party}' || return 1
+  _try rsync -az --delete "$REPO"/include/     ubuntu@"$ip":/home/ubuntu/wildsync/include/ || return 1
+  _try rsync -az --delete "$sdklib"/           ubuntu@"$ip":/home/ubuntu/wildsync/lib/ || return 1
+  _try rsync -az --delete "$REPO"/third_party/ ubuntu@"$ip":/home/ubuntu/wildsync/third_party/ || return 1
+  _try scp -q "$REPO"/Makefile ubuntu@"$ip":/home/ubuntu/wildsync/Makefile || return 1
+  # This heredoc is UNQUOTED on purpose: $USBFS_MB is expanded here, on the
+  # operator's host. Everything else in the body must therefore be escaped
+  # (\$var, \${var}) or free of $ and backticks altogether - an unescaped
+  # ${Status} aborted the whole script under set -u with an empty body, and
+  # backticks in a comment ran deploy.sh locally. The node-deploy heredoc
+  # below is quoted instead; it needs no local expansion.
   ssh ubuntu@"$ip" "bash -s" <<REMOTE
 set -uo pipefail
 # USBFS_MB is a FLOOR, never an assignment. Another USB3 camera on the same
@@ -168,10 +187,10 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
   build-essential rsync chrony python3-libgpiod gpiod libusb-1.0-0 libxml2 \
   >/dev/null 2>&1 || true
 for pkg in build-essential rsync python3-libgpiod gpiod; do
-  dpkg-query -W -f='${Status}' "\$pkg" 2>/dev/null | grep -q "ok installed" || \
+  dpkg-query -W -f='\${Status}' "\$pkg" 2>/dev/null | grep -q "ok installed" || \
     echo "  WARNING: \$pkg did NOT install - the node build will fail" >&2
 done
-if ! dpkg-query -W -f='${Status}' chrony 2>/dev/null | grep -q "ok installed"; then
+if ! dpkg-query -W -f='\${Status}' chrony 2>/dev/null | grep -q "ok installed"; then
   echo "  ERROR: chrony did NOT install - leaving systemd-timesyncd running." >&2
   echo "  The node keeps a clock, but not the rig's. Check the date (\$(date -Is))" >&2
   echo "  and this node's route to the archive, then re-run provision." >&2
@@ -184,8 +203,10 @@ else
   # Mac answers NTP; the moment something does, every node abandons the peer
   # group for the undisciplined host clock, as a common-mode offset that
   # rigd's node_clock_skew cannot see by construction.
-  # The one deliberate master is a Jetson host that ran `deploy.sh jetson`:
-  # `deploy.sh node` from THAT host writes 20-wildsync-host.conf pointing at it.
+  # The one deliberate master is a Jetson host that ran 'deploy.sh jetson':
+  # 'deploy.sh node' from THAT host writes 20-wildsync-host.conf pointing at it.
+  # (No backticks in this body: the heredoc is unquoted, so the operator's
+  # shell would run them as commands before ssh ever saw the text.)
   sudo rm -f /etc/chrony/conf.d/wildsync.conf
   if [ ! -f /etc/chrony/conf.d/10-wildsync.conf ]; then
     echo "  WARNING: no 10-wildsync.conf on this node - it has no rig peer mesh." >&2
@@ -202,31 +223,45 @@ else
 fi
 echo "  usbfs=\$(cat /sys/module/usbcore/parameters/usbfs_memory_mb)  chrony=\$(systemctl is-active chrony)  date=\$(date -Is)"
 REMOTE
+  # The remote script ends in an echo, so a nonzero status here is the ssh
+  # session itself failing - the one case where "provisioned" would be false.
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "  FAILED provision $name (remote exit $rc)" >&2; return 1; }
   echo "  provisioned $name — now run: $0 node $name"
 }
 
 deploy_node() {
-  local name="$1" ip
+  local name="$1" ip rc
   ip="$(_ip "$name")" || return 1
   echo "=== $name ($ip) ==="
-  ping -c1 -W2 "$ip" >/dev/null 2>&1 || { echo "  unreachable, skip"; return; }
+  # An unreachable node is skipped, not failed: `all` is documented as "every
+  # reachable camera node", and a node that is powered off for a dive is normal.
+  ping -c1 -W2 "$ip" >/dev/null 2>&1 || { echo "  unreachable, skip"; return 0; }
   # Create both dirs BEFORE any scp: without src/ the copy fails, and since this
   # script is not `set -e` the build would silently proceed against stale sources.
-  ssh ubuntu@"$ip" 'mkdir -p ~/wildsync/src ~/wildsync/rig'
-  scp -q "$REPO"/src/*.cpp "$REPO"/src/*.h ubuntu@"$ip":/home/ubuntu/wildsync/src/
-  scp -q "$REPO"/rig/{piagent.py,imu_yb.py,imu_olive.py,olive_ws_bridge.py} ubuntu@"$ip":/home/ubuntu/wildsync/rig/
-  scp -q "$REPO"/docs/PROTOCOL.md ubuntu@"$ip":/home/ubuntu/wildsync/rig/
-  scp -q "$REPO"/deploy/piagent.service ubuntu@"$ip":/tmp/piagent.service
-  scp -q "$REPO"/deploy/olive-bridge.service ubuntu@"$ip":/tmp/olive-bridge.service
-  scp -q "$REPO"/deploy/ilxctl.service ubuntu@"$ip":/tmp/ilxctl.service
+  # Every transfer is checked for the same reason: all of them finish before the
+  # remote script builds and restarts anything, so a failure leaves the running
+  # services alone.
+  _try ssh ubuntu@"$ip" 'mkdir -p ~/wildsync/src ~/wildsync/rig' || return 1
+  _try scp -q "$REPO"/src/*.cpp "$REPO"/src/*.h ubuntu@"$ip":/home/ubuntu/wildsync/src/ || return 1
+  _try scp -q "$REPO"/rig/{piagent.py,imu_yb.py,imu_olive.py,olive_ws_bridge.py} ubuntu@"$ip":/home/ubuntu/wildsync/rig/ || return 1
+  _try scp -q "$REPO"/docs/PROTOCOL.md ubuntu@"$ip":/home/ubuntu/wildsync/rig/ || return 1
+  _try scp -q "$REPO"/deploy/piagent.service ubuntu@"$ip":/tmp/piagent.service || return 1
+  _try scp -q "$REPO"/deploy/olive-bridge.service ubuntu@"$ip":/tmp/olive-bridge.service || return 1
+  _try scp -q "$REPO"/deploy/ilxctl.service ubuntu@"$ip":/tmp/ilxctl.service || return 1
   # The node's tree has no .git, so record which commit was deployed to it
   # (rig/buildinfo.py; read it with: cat ~/wildsync/BUILD_INFO.json).
+  # (A non-git checkout stays a warning, not a failure: that is a documented
+  # way to run this script. A failed transfer of the file is not.)
   if python3 "$REPO"/rig/buildinfo.py --write /tmp/wildsync-build-info.json >/dev/null 2>&1; then
-    scp -q /tmp/wildsync-build-info.json ubuntu@"$ip":/home/ubuntu/wildsync/BUILD_INFO.json
+    _try scp -q /tmp/wildsync-build-info.json ubuntu@"$ip":/home/ubuntu/wildsync/BUILD_INFO.json
+    rc=$?
   else
     echo "  WARNING: $REPO is not a git checkout - no BUILD_INFO.json for $name" >&2
+    rc=0
   fi
   rm -f /tmp/wildsync-build-info.json
+  [ "$rc" -eq 0 ] || return 1
   # Which IMU serves this node's /imu/* (and so its flight-log attitude). The
   # rig's IMUs are Olive olixVision units, one per camera, relayed by
   # olive-bridge to localhost UDP. Override per run for a Yahboom node:
@@ -237,8 +272,10 @@ deploy_node() {
   else
     printf 'PIAGENT_IMU=%s\nPIAGENT_IMU2=off\n' "$imu" > /tmp/wildsync-piagent.env
   fi
-  scp -q /tmp/wildsync-piagent.env ubuntu@"$ip":/tmp/wildsync-piagent.env
+  _try scp -q /tmp/wildsync-piagent.env ubuntu@"$ip":/tmp/wildsync-piagent.env
+  rc=$?
   rm -f /tmp/wildsync-piagent.env
+  [ "$rc" -eq 0 ] || return 1
   # When this host is the rig's clock master (deploy.sh jetson has run here),
   # point the node at it. The strobe fires on THIS host's clock and the
   # cameras on the nodes' clocks, so one reference keeps delta honest; the
@@ -327,6 +364,11 @@ sudo systemctl restart ilxctl
 sleep 4
 echo "  ilxctl: $(systemctl is-active ilxctl)   piagent: $(systemctl is-active piagent)"
 REMOTE
+  # "SDK not staged" and "BUILD FAILED" both exit 1 above, before any service is
+  # touched; this is where that becomes the script's own failure instead of a
+  # "done" line followed by exit 0.
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "  FAILED $name (remote exit $rc)" >&2; return 1; }
   echo "  done $name"
 }
 
@@ -449,6 +491,16 @@ case "${1:-}" in
   node)      deploy_node "${2:?usage: deploy.sh node <camN>}";;
   jetson)    deploy_jetson;;
   strobe)    deploy_strobe;;
-  all)       for n in $NODES; do deploy_node "$n"; done; deploy_jetson;;
+  # The Jetson goes FIRST: deploy_node points a node at the host's chrony only
+  # if /etc/chrony/conf.d/wildsync-host.conf already exists, and only
+  # deploy_jetson writes it. Nodes first left that file absent on a first
+  # install, so every node silently skipped the host master and the strobe (host
+  # clock) and the cameras (mesh clock) were on different references. One bad
+  # node must not stop the others, so failures are collected and `all` exits
+  # nonzero at the end.
+  all)       fail=""
+             deploy_jetson || fail="$fail jetson"
+             for n in $NODES; do deploy_node "$n" || fail="$fail $n"; done
+             if [ -n "$fail" ]; then echo "FAILED:$fail" >&2; exit 1; fi;;
   *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|jetson|strobe|all}"; exit 1;;
 esac

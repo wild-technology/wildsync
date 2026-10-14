@@ -135,11 +135,12 @@ Calibration procedure (in this order of preference):
 
 1. **Checkerboard**: the Calib tab (`rig/rigcal.py`) calibrates both cameras and
    the pair from a rigid board seen by both at once (see the stereo section
-   below). Per-camera intrinsics in `vslam.Intrinsics` are not yet fed from that
-   file: the single-camera chain still uses the guess above, so a saved solution
-   improves the stereo engine only. Calibrate THROUGH the housing port in water
-   for survey use, or multiply the in-air focal by 1.33 for a flat port
-   (approximation).
+   below). Of the per-camera intrinsics only the saved K1 focal is fed to the
+   stereo engine (rescaled to the stream width); the mono engine, the principal
+   point, K2 and lens distortion are not, so the single-camera chain still uses
+   the guess above and a saved solution improves the stereo engine only.
+   Calibrate THROUGH the housing port in water for survey use, or multiply the
+   in-air focal by 1.33 for a flat port (approximation).
 2. **EXIF**: the card JPEGs carry FocalLength (0x920A); f_px =
    f_mm / 35.7 × 1616 (stereo_check.py does exactly this). Good enough to
    replace the HFOV guess if no board is available.
@@ -236,7 +237,9 @@ overlay matters more than metric scale on a given day.
    check.
 3. Save writes `~/rig/stereo_calibration.json`. `vslam.load_stereo_calibration()`
    freezes its R, T into the stereo engine (`_ext`, `baseline_calibrated=True`)
-   from the next run; nothing else changes. This wire-in is implemented and
+   from the next run, and the engine takes its focal from the saved K1
+   (rescaled to the stream width). The mono engine, the principal point, K2 and
+   lens distortion are not fed. This wire-in is implemented and
    covered by `rig/tests/rigcal_selftest.py` (synthetic data). No saved
    calibration session is recorded.
 4. Re-run a drained run; `gps_ratio` should sit within a few % of 1.0 on a
@@ -257,7 +260,9 @@ Per-step pose error over dozens of PnP inliers lands at the cm level, so at
 error is dominated by the extrinsics until calibrated: baseline error maps
 1:1 onto every distance, and the self-estimated t-direction scatter (9–16°
 measured) tilts the whole track. After checkerboard calibration both
-collapse to the sub-percent level.
+collapse to the sub-percent level. The calibration feeds the stereo engine its
+extrinsics and the K1 focal only; the principal point, K2 and lens distortion
+are not taken from it.
 
 ## Measured performance and the Jetson budget
 

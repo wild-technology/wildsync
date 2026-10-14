@@ -68,6 +68,49 @@ X4 (cardPull keyed handshake, cancel on timeout, disconnect wakes the CV) has
     no camera-less surface at all - it is code review plus the bench
     procedure - so only its presence in source and binary is tripwired.
 
+X9  card/delete and card/pull read their ids with jsonInt, which clamps both
+    ways: an absent, null or garbage contentId came back as 0, and a value
+    past the ceiling (one past CrInt32u max) wrapped to 0 in the cast.  So
+    {"confirm":"delete"} alone deleted content 0 on the card, irreversibly.
+    The pre-fix tell is the camera layer's "not connected": the request got
+    past the parser carrying a guessed id.  Now the daemon answers 400 naming
+    the id; an explicit 0 and the true CrInt32u maximum still pass.
+
+X10 /liveview.jpg re-served its last good frame as a 200 for ever after the
+    camera stopped producing them (rigd and the page treat any 200 as live and
+    neither reads the age header).  The stale branch needs a frame cached by a
+    successful grab, which camera-less never happens, so the handler's shape is
+    tripwired.
+
+X11 /api/spool/prune renamed onto an existing archive file, silently replacing
+    a frame an earlier prune had archived - the body recycles names.
+
+X12 /api/shots answered 200 [] for a directory it could not read; run.py takes
+    that as the run-start baseline and then pulls and deletes every frame
+    already in the spool.
+
+X13 State-changing requests carrying a foreign Origin (a browser page on the rig
+    LAN POSTing a text/plain body, which needs no preflight) were honoured.
+
+X14 /api/card/mode transfer reconnected by its own pick loop, ignoring --camera
+    and the ILX-LR1 preference; tripwired (no camera, no enumeration here).
+
+X15 interval/start, shutter/hold and camera-interval/config turned a present
+    but garbage number into the default: an unlimited 1 Hz run, a 1 s hold.
+
+X16 A failed SetSaveInfo at connect was logged once, answered ok and never
+    retried.  Needs a body; tripwired.
+
+X17 A timed-out connect whose abandon could not take the SDK answered
+    "connect in progress" to every later connect.  Needs a half-open Connect;
+    tripwired.
+
+X18 configureCameraInterval logged a start delay the body never took.  Needs a
+    body; tripwired.
+
+X19 /api/format read "quick" with a default-on-garbage parser: false became
+    true, so a requested full format ran as a quick one.
+
 Hermetic: builds in the worktree, binds only 127.0.0.1 on ephemeral ports,
 temp save dirs, no camera, no fleet, no rigd.  soaktest's netguard (installed
 on import) refuses anything not on 127/8.
@@ -130,6 +173,27 @@ def _req(port, method, path, body=None, timeout=10.0):
     except Exception:
         doc = {}
     return code, doc, time.monotonic() - t0
+
+
+def _raw(port, method, path, body=b"", headers=None, timeout=10.0):
+    """Like _req but with full control of the headers (Content-Type, Origin).
+    Returns (status, dict-or-list, headers)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        payload = resp.read()
+        code, hdrs = resp.status, dict(resp.getheaders())
+    except Exception:
+        return 0, {}, {}
+    finally:
+        conn.close()
+    try:
+        doc = json.loads(payload.decode())
+    except Exception:
+        doc = {}
+    return code, doc, hdrs
 
 
 class Daemon:
@@ -720,6 +784,392 @@ def _x7_x8_tripwires():
 
 
 # ---------------------------------------------------------------------------
+# X9 - card ids are required and range-checked, never guessed.
+# ---------------------------------------------------------------------------
+
+def _x9_card_ids(d):
+    sect("audit-ilxctl X9: card/delete and card/pull reject a missing or "
+         "out-of-range id")
+    # Every one of these used to come back from jsonInt as 0 (the default -1
+    # clamped up to lo, garbage to the default, the 2^32 ceiling wrapping to 0
+    # in the CrInt32u cast) and went to the camera layer, which camera-less
+    # answers "not connected". Post-fix they stop at the door naming the field.
+    absent = object()
+    bad = [("absent", absent), ("null", None), ("empty string", ""),
+           ("word", "abc"), ("negative", -5), ("2^32 (wraps to 0)", 4294967296),
+           ("99999999999", 99999999999), ("1e99", 1e99), ("fraction", 1.5)]
+    for label, v in bad:
+        body = {"confirm": "delete"}
+        if v is not absent:
+            body["contentId"] = v
+        code, doc, _ = _req(d.port, "POST", "/api/card/delete", body)
+        err = str(doc.get("error") or "")
+        check("card/delete contentId %s refused with 400 naming the field"
+              % label,
+              code == 400 and doc.get("ok") is False and "contentId" in err
+              and "not connected" not in err, "code=%s err=%r" % (code, err))
+    for label, v in bad:
+        body = {"fileId": 1, "name": "x.ARW"}
+        if v is not absent:
+            body["contentId"] = v
+        code, doc, _ = _req(d.port, "POST", "/api/card/pull", body)
+        err = str(doc.get("error") or "")
+        check("card/pull contentId %s refused with 400 naming the field"
+              % label,
+              code == 400 and "contentId" in err
+              and "not connected" not in err, "code=%s err=%r" % (code, err))
+    for label, v in bad:
+        body = {"contentId": 1, "name": "x.ARW"}
+        if v is not absent:
+            body["fileId"] = v
+        code, doc, _ = _req(d.port, "POST", "/api/card/pull", body)
+        err = str(doc.get("error") or "")
+        check("card/pull fileId %s refused with 400 naming the field" % label,
+              code == 400 and "fileId" in err
+              and "not connected" not in err, "code=%s err=%r" % (code, err))
+    # The listing's fileId is a CrInt16u: one past it is out of range too.
+    code, doc, _ = _req(d.port, "POST", "/api/card/pull",
+                        {"contentId": 1, "fileId": 65536, "name": "x.ARW"})
+    check("card/pull fileId 65536 (past the listing's 16 bits) refused",
+          code == 400 and "fileId" in str(doc.get("error") or ""),
+          "code=%s doc=%r" % (code, doc))
+
+    # Positive controls: the boundary is exact and an explicit 0 stays valid
+    # (the drain forwards whatever /api/card/list reports). These must reach
+    # the camera layer.
+    for cid in (0, 1, 4294967295):
+        code, doc, _ = _req(d.port, "POST", "/api/card/delete",
+                            {"confirm": "delete", "contentId": cid})
+        check("card/delete contentId %d passes the gate (camera layer only)"
+              % cid, code == 503 and "not connected" in str(doc.get("error")),
+              "code=%s doc=%r" % (code, doc))
+    for cid, fid in ((0, 0), (4294967295, 65535), (7, 2)):
+        code, doc, _ = _req(d.port, "POST", "/api/card/pull",
+                            {"contentId": cid, "fileId": fid, "name": "x.ARW"})
+        check("card/pull %d/%d passes the gate (camera layer only)"
+              % (cid, fid),
+              code == 503 and "not connected" in str(doc.get("error")),
+              "code=%s doc=%r" % (code, doc))
+    code, doc, _ = _req(d.port, "POST", "/api/card/delete",
+                        {"contentId": 1})
+    check("card/delete still needs the confirm token first",
+          code == 400 and "confirm" in str(doc.get("error") or ""),
+          "code=%s doc=%r" % (code, doc))
+
+
+# ---------------------------------------------------------------------------
+# X15 - a present-but-garbage number is refused, not replaced by a default.
+# ---------------------------------------------------------------------------
+
+def _x15_numeric_defaults(d):
+    sect("audit-ilxctl X15: garbage numeric fields on interval/hold/config")
+    cases = [
+        ("/api/interval/start", {"intervalSec": "abc", "count": "x"},
+         "intervalSec"),
+        ("/api/interval/start", {"intervalSec": 2, "count": None}, "count"),
+        ("/api/interval/start", {"intervalSec": None}, "intervalSec"),
+        ("/api/interval/start", {"intervalSec": "1e999"}, "intervalSec"),
+        ("/api/shutter/hold", {"ms": None}, "ms"),
+        ("/api/shutter/hold", {"ms": "abc"}, "ms"),
+        ("/api/shutter/hold", {"ms": ""}, "ms"),
+        ("/api/camera-interval/config", {"intervalSec": ""}, "intervalSec"),
+        ("/api/camera-interval/config", {"intervalSec": 2, "shots": "x"},
+         "shots"),
+        ("/api/camera-interval/config", {"startDelaySec": None},
+         "startDelaySec"),
+    ]
+    for path, body, field in cases:
+        code, doc, _ = _req(d.port, "POST", path, body)
+        err = str(doc.get("error") or "")
+        check("%s %s refused with 400 naming %s" % (path, json.dumps(body),
+                                                    field),
+              code == 400 and ('bad "%s"' % field) in err
+              and "not connected" not in err, "code=%s err=%r" % (code, err))
+
+    # Controls: absent keeps the default, a fraction or numeric string is a
+    # number - all of these reach the camera layer.
+    for path, body in (("/api/shutter/hold", {}),
+                       ("/api/shutter/hold", {"ms": 250}),
+                       ("/api/interval/start", {}),
+                       ("/api/interval/start", {"intervalSec": 2.5,
+                                                "count": 2.5}),
+                       ("/api/interval/start", {"intervalSec": "2",
+                                                "count": "0"}),
+                       ("/api/camera-interval/config", {}),
+                       ("/api/camera-interval/config",
+                        {"intervalSec": 1.5, "shots": 3, "startDelaySec": 0})):
+        code, doc, _ = _req(d.port, "POST", path, body)
+        check("%s %s still reaches the camera layer" % (path, json.dumps(body)),
+              code == 400 and "not connected" in str(doc.get("error") or ""),
+              "code=%s doc=%r" % (code, doc))
+    _, st, _ = _req(d.port, "GET", "/api/status")
+    check("no refused request left an interval run behind",
+          not (st.get("interval") or {}).get("running"), repr(st.get("interval")))
+
+
+# ---------------------------------------------------------------------------
+# X19 - /api/format "quick" is a boolean, not a default-on-garbage number.
+# ---------------------------------------------------------------------------
+
+def _x19_format_quick(d):
+    sect("audit-ilxctl X19: /api/format quick is parsed strictly")
+    for label, v in (("word", "abc"), ("maybe", "maybe"), ("null", None),
+                     ("empty string", ""), ("2", 2)):
+        code, doc, _ = _req(d.port, "POST", "/api/format",
+                            {"confirm": "format", "quick": v})
+        err = str(doc.get("error") or "")
+        check("quick %s refused with 400 naming the field" % label,
+              code == 400 and 'bad "quick"' in err
+              and "not connected" not in err, "code=%s err=%r" % (code, err))
+    # false used to read as the default (true); all of these are valid and
+    # reach the camera layer.
+    for label, body in (("false", {"quick": False}), ("0", {"quick": 0}),
+                        ("true", {"quick": True}), ("1", {"quick": 1}),
+                        ("absent", {})):
+        b = dict(body)
+        b["confirm"] = "format"
+        code, doc, _ = _req(d.port, "POST", "/api/format", b)
+        check("quick %s passes the parser (camera layer only)" % label,
+              code == 400 and "not connected" in str(doc.get("error") or ""),
+              "code=%s doc=%r" % (code, doc))
+    with open(os.path.join(SRC, "main.cpp"), encoding="utf-8") as f:
+        main = f.read()
+    check("main.cpp no longer reads quick through jsonInt",
+          'jsonInt(req.body, "quick"' not in main)
+    with open(BIN, "rb") as f:
+        blob = f.read()
+    check("built binary carries the quick refusal", b'bad "quick"' in blob)
+
+
+# ---------------------------------------------------------------------------
+# X11/X12/X13 - spool prune, shot listing and the Origin gate (own daemon:
+# these move files in, and break, the daemon's spool directory).
+# ---------------------------------------------------------------------------
+
+def _write(path, payload):
+    with open(path, "wb") as f:
+        f.write(payload)
+    old = time.time() - 600           # comfortably past older_than_s=0
+    os.utime(path, (old, old))
+
+
+def _read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _x11_prune_never_overwrites(d):
+    sect("audit-ilxctl X11: spool/prune keeps a colliding name, never "
+         "overwrites")
+    spool = os.path.join(d.home, "spool")
+    archive = spool + "-archive"
+    payloads = [b"first frame A", b"second frame B", b"third frame C"]
+    for i, pl in enumerate(payloads):
+        _write(os.path.join(spool, "ILX00183.JPG"), pl)
+        code, doc, _ = _req(d.port, "POST", "/api/spool/prune",
+                            {"confirm": "prune", "older_than_s": 0, "keep": 0})
+        check("prune #%d answers ok, moved 1" % (i + 1),
+              code == 200 and doc.get("ok") is True and doc.get("moved") == 1,
+              "code=%s doc=%r" % (code, doc))
+        check("prune #%d left nothing in the spool" % (i + 1),
+              not os.path.exists(os.path.join(spool, "ILX00183.JPG")))
+    names = sorted(os.listdir(archive)) if os.path.isdir(archive) else []
+    check("the first archived frame still holds its own bytes",
+          os.path.exists(os.path.join(archive, "ILX00183.JPG"))
+          and _read(os.path.join(archive, "ILX00183.JPG")) == payloads[0],
+          repr(names))
+    check("all three payloads survive in the archive",
+          sorted(_read(os.path.join(archive, n)) for n in names)
+          == sorted(payloads), repr(names))
+    check("the collisions are tagged names containing the original",
+          len(names) == 3 and all("ILX00183" in n and n.endswith(".JPG")
+                                  for n in names), repr(names))
+
+
+def _x12_listing_failure(d):
+    sect("audit-ilxctl X12: /api/shots tells an unreadable dir from an empty "
+         "one")
+    spool = os.path.join(d.home, "spool")
+    for n in os.listdir(spool):
+        os.remove(os.path.join(spool, n))
+    code, doc, _ = _req(d.port, "GET", "/api/shots")
+    check("an empty spool lists as 200 []", code == 200 and doc == [],
+          "code=%s doc=%r" % (code, doc))
+    code, doc, _ = _req(d.port, "GET", "/api/shots?dir=raw")
+    check("an absent raw dir (no drain yet) is still an empty 200 []",
+          code == 200 and doc == [], "code=%s doc=%r" % (code, doc))
+
+    # opendir() on a regular file is ENOTDIR whoever runs the test.
+    os.rmdir(spool)
+    _write(spool, b"not a directory")
+    code, doc, hdrs = _req(d.port, "GET", "/api/shots")
+    check("an unreadable spool is an error object, not 200 []",
+          code == 500 and isinstance(doc, dict) and doc.get("ok") is False
+          and "cannot list" in str(doc.get("error") or ""),
+          "code=%s doc=%r" % (code, doc))
+    os.remove(spool)
+    os.mkdir(spool)
+    _write(os.path.join(spool, "ILX00001.JPG"), b"jpeg")
+    code, doc, _ = _req(d.port, "GET", "/api/shots")
+    check("the listing recovers once the directory is back",
+          code == 200 and isinstance(doc, list)
+          and [e.get("name") for e in doc] == ["ILX00001.JPG"],
+          "code=%s doc=%r" % (code, doc))
+
+    with open(os.path.join(SRC, "main.cpp"), encoding="utf-8") as f:
+        main = f.read()
+    with open(os.path.join(SRC, "web_ui.h"), encoding="utf-8") as f:
+        ui = f.read()
+    check("the /api/shots handler no longer sends shotsJson output "
+          "unconditionally", "res.set_content(shotsJson(" not in main)
+    check("the page ignores a non-array listing instead of corrupting its "
+          "state", "Array.isArray(next)" in ui)
+
+
+def _x13_origin_gate(d):
+    sect("audit-ilxctl X13: cross-origin state-changing requests are refused")
+    power = b'{"op":"off","confirm":"power"}'
+
+    def post(origin, path="/api/power", body=power, ctype="text/plain"):
+        h = {"Content-Type": ctype}
+        if origin is not None:
+            h["Origin"] = origin
+        return _raw(d.port, "POST", path, body, h)
+
+    code, doc, _ = post("http://evil.example")
+    err = str(doc.get("error") or "")
+    check("foreign Origin on /api/power is refused with 403",
+          code == 403 and doc.get("ok") is False and "cross-origin" in err,
+          "code=%s doc=%r" % (code, doc))
+    check("the refusal never reached the camera layer",
+          "not connected" not in err, repr(err))
+    code, doc, _ = post("http://evil.example", "/api/card/delete",
+                        b'{"confirm":"delete","contentId":1}')
+    check("foreign Origin on /api/card/delete is refused with 403",
+          code == 403, "code=%s doc=%r" % (code, doc))
+    code, doc, _ = post("http://evil.example", "/api/format",
+                        b'{"confirm":"format"}')
+    check("foreign Origin on /api/format is refused with 403", code == 403,
+          "code=%s doc=%r" % (code, doc))
+    code, doc, _ = post("null")
+    check("Origin: null is refused", code == 403, "code=%s doc=%r" % (code, doc))
+    code, doc, _ = post("http://127.0.0.1:%d" % (d.port + 1))
+    check("same host, other port is a different origin", code == 403,
+          "code=%s doc=%r" % (code, doc))
+
+    code, doc, _ = post("http://127.0.0.1:%d" % d.port)
+    check("an Origin equal to Host (the node's own page) passes the gate",
+          code == 400 and "not connected" in str(doc.get("error") or ""),
+          "code=%s doc=%r" % (code, doc))
+    code, doc, _ = post("HTTP://127.0.0.1:%d" % d.port)
+    check("the comparison is case-insensitive",
+          code == 400 and "not connected" in str(doc.get("error") or ""),
+          "code=%s doc=%r" % (code, doc))
+    code, doc, _ = post(None)
+    check("no Origin (curl, rigd, the drain) passes unchanged",
+          code == 400 and "not connected" in str(doc.get("error") or ""),
+          "code=%s doc=%r" % (code, doc))
+    code, doc, _ = post(None, "/api/spool/prune", b'{"confirm":"prune"}',
+                        "application/x-www-form-urlencoded")
+    check("the documented `curl -d` prune (urlencoded, no Origin) still works",
+          code == 200 and doc.get("ok") is True, "code=%s doc=%r" % (code, doc))
+    code, doc, _ = _raw(d.port, "GET", "/api/status",
+                        headers={"Origin": "http://evil.example"})
+    check("a cross-origin GET /api/status is unaffected",
+          code == 200 and "connected" in doc, "code=%s" % code)
+    _, st, _ = _req(d.port, "GET", "/api/status")
+    check("a refused cross-origin attempt is logged where rigd can see it",
+          "REFUSED cross-origin" in " ".join(st.get("log") or []),
+          " ".join(st.get("log") or [])[-160:])
+
+
+# ---------------------------------------------------------------------------
+# X10/X14/X16/X17/X18 - the shape of fixes that need a body (tripwires).
+# ---------------------------------------------------------------------------
+
+def _slice(text, start, end):
+    a = text.find(start)
+    if a < 0:
+        return ""
+    b = text.find(end, a + len(start))
+    return text[a:b if b > a else len(text)]
+
+
+def _x10_to_x18_tripwires():
+    sect("audit-ilxctl X10/X14/X16/X17/X18: fixes that need a body (tripwire)")
+    with open(os.path.join(SRC, "camera.cpp"), encoding="utf-8") as f:
+        cam = f.read()
+    with open(os.path.join(SRC, "main.cpp"), encoding="utf-8") as f:
+        main = f.read()
+
+    # X10: a failed live-view grab may re-serve the cache only briefly.
+    lv = _slice(main, 'g_srv.Get("/liveview.jpg"', "// Spool hygiene")
+    check("X10: live-view handler found", bool(lv))
+    mx = re.search(r"kLvStaleMaxMs\s*=\s*(\d+)", lv)
+    check("X10: the stale cache has a named maximum age of 2 s or less",
+          mx is not None and int(mx.group(1)) <= 2000,
+          mx.group(0) if mx else "no kLvStaleMaxMs")
+    check("X10: the failure path compares the post-grab age to the maximum",
+          re.search(r"stale\.count\(\)\s*>\s*kLvStaleMaxMs", lv) is not None)
+    fail_at = lv.find("lvCache.clear()")
+    err_at = lv.find("fail(res, err, 503)")
+    check("X10: the cache is dropped before the error is returned",
+          0 <= fail_at < err_at, "clear@%d fail@%d" % (fail_at, err_at))
+    check("X10: no unconditional re-serve after a failed grab",
+          re.search(r"else if \(lvCache\.empty\(\)\)", lv) is None)
+
+    # X14: one pick rule for every path that connects.
+    check("X14: a shared camera picker exists", "pickCamera = [&]" in main)
+    mode = _slice(main, 'g_srv.Post("/api/card/mode"', 'g_srv.Get(R"(/shot/')
+    check("X14: card/mode handler found", bool(mode))
+    check("X14: the transfer reconnect has no loop of its own",
+          "camMatch.empty() ||" not in mode and "pickCamera(" in mode)
+    dc = _slice(main, "auto doConnect = [&]", "// ----- routes")
+    check("X14: doConnect uses the same picker", "pickCamera(" in dc)
+    check("X14: the ILX-LR1 preference and --camera are applied in one place",
+          main.count('.find("ILX-LR1")') == 1
+          and main.count("camIndex >= 0") == 1,
+          "ILX=%d idx=%d" % (main.count('.find("ILX-LR1")'),
+                             main.count("camIndex >= 0")))
+
+    # X16: a failed SetSaveInfo is retried, reported and replayable.
+    m = re.search(r"bool Camera::setSaveDir\(.*?\n\}", cam, re.S)
+    body = m.group(0) if m else ""
+    want_at = body.find("m_saveDir = dir")
+    sdk_at = body.find("SDK::SetSaveInfo(")
+    check("X16: setSaveDir records the wanted directory before SetSaveInfo",
+          0 <= want_at < sdk_at and "m_saveDirOk" in body,
+          "want@%d sdk@%d" % (want_at, sdk_at))
+    check("X16: setSaveDir still takes the SDK through the bounded helper",
+          "SdkHold" in body)
+    check("X16: doConnect retries setSaveDir with a pause between attempts",
+          re.search(r"for \([^)]*\)\s*\{.*?setSaveDir\(.*?sleep_for", dc, re.S)
+          is not None)
+    check("X16: the connect reply carries saveDirOk:false when it failed",
+          'saveDirOk\\":false' in main and "connectedBody()" in main)
+    check("X16: statusJson reports saveDirOk", '\\"saveDirOk\\"' in cam)
+    check("X16: a session drop clears saveDirOk",
+          re.search(r"void Camera::OnDisconnected\(.*?m_saveDirOk = false",
+                    cam, re.S) is not None)
+
+    # X17: an abandoned attempt is not a pending one.
+    m = re.search(r"bool Camera::connect\(.*?\n\}", cam, re.S)
+    body = m.group(0) if m else ""
+    check("X17: connect()'s pending test ignores an abandoned attempt",
+          re.search(r"pending = \(m_connectResult == 0\)\s*&&\s*"
+                    r"!m_attemptAbandoned", body) is not None)
+
+    # X18: the log must not claim a start delay the body never took.
+    m = re.search(r"bool Camera::configureCameraInterval\(.*?\n\}", cam, re.S)
+    body = m.group(0) if m else ""
+    check("X18: the start-delay error is no longer thrown away",
+          body and "std::string ignored" not in body and "start delay NOT applied" in body)
+    check("X18: the 's delay' text is emitted only when the write took",
+          re.search(r"if \(delayApplied\) os << .*s delay", body) is not None)
+    check("X18: a snapped interval is logged as such", "snapped" in body)
+
+
+# ---------------------------------------------------------------------------
 
 def suite(opts):
     built, out = _build()
@@ -736,9 +1186,22 @@ def suite(opts):
         check("camera-less status is connected:false",
               doc.get("connected") is False)
         _x3_reject_garbage(d)
+        _x9_card_ids(d)
+        _x15_numeric_defaults(d)
+        _x19_format_quick(d)
         _x8_manual_focus_rule(d)
         _x2_single_flight(d)
         _x2_pool_survives_burst(d)
+    finally:
+        d.stop()
+    # X11/X12/X13 move files in and break the spool directory, so they get a
+    # daemon of their own.
+    d = Daemon(autoconnect=False)
+    try:
+        if check("ilxctl starts for the spool / Origin checks", d.wait_ready()):
+            _x13_origin_gate(d)
+            _x11_prune_never_overwrites(d)
+            _x12_listing_failure(d)
     finally:
         d.stop()
     # X7 needs the SDK wedged on purpose, which only --test-sdk-hold can do.
@@ -753,6 +1216,7 @@ def suite(opts):
     _x5_startup_window(opts)
     _x1_x6_tripwires()
     _x7_x8_tripwires()
+    _x10_to_x18_tripwires()
 
 
 if __name__ == "__main__":

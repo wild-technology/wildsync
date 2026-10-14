@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — nav (findings N1/N2/N3).
+"""Audit regression suite — nav (findings N1..N6).
 
 N1  TimeAuthority starvation: two trusted senders whose time words differ by
     more than CONFIRM_TOL_S (a GNSS 129029 next to a plotter's relayed
@@ -22,6 +22,23 @@ N3  navlog.replay() + fix_at(t) used to judge TimeAuthority freshness and
     as spans), and replay() parks the reader's judgement clock at the last
     recorded line (NavReader.set_clock) so the instant-less views —
     snapshot(), health(), gateway_online — describe the end of the log too.
+
+N4  Decoded lat/lon/heading/COG/wind angle were not range-checked, so a
+    talker's lat 150 deg gave valid=True (the UTM conversion failed quietly,
+    xutm None) and a 372 deg heading was folded to 12 deg by `% 360`.
+    Impossible values now decode to None like the NA sentinels; a position
+    pair with either half impossible goes as a pair.
+
+N5  depth_below_surface_m added the sounder offset whatever its sign. A keel
+    offset (<0) gives the depth under the keel, not under the surface, so
+    only a waterline offset (>=0) produces the key; a keel offset leaves it
+    None.
+
+N6  A 129029 whose method is no-fix/estimated/manual/simulate (0, 6, 7, 8)
+    still gave valid=True from its (or a 129025's) repeated coordinates, so
+    rigd saw a live fix and nav_no_fix never fired. Lat/lon/alt are now
+    withheld for those methods (sats, hdop and fix_source stay); N/A (15),
+    the trusted methods and a 129025-only feed are unchanged.
 
 Hermetic: no serial ports, no network, no rig processes; NavReader instances
 are never open()ed/start()ed — lines are pushed with feed_line()/replay().
@@ -70,6 +87,19 @@ def p_129029(gps_epoch, method=1, sats=12):
     d += bytes([(method << 4) & 0xFF, 0xFC, sats])
     d += struct.pack("<hh", 90, 150) + struct.pack("<i", -3520) + bytes([0])
     return d
+
+
+def p_127250(raw_heading, ref=0):
+    """Vessel Heading with the heading word given RAW (0.1 mrad units)."""
+    return struct.pack("<BHhhB", 1, raw_heading, 0, 0, ref & 0x03)
+
+
+def p_129026(raw_cog, ref=0):
+    return struct.pack("<BBHHH", 1, ref & 0x03, raw_cog, 100, 0xFFFF)
+
+
+def p_128267(raw_depth_cm, raw_offset_mm):
+    return struct.pack("<BIhB", 0, raw_depth_cm, raw_offset_mm, 0xFF)
 
 
 def p_126992(gps_epoch, source=0):
@@ -409,6 +439,137 @@ def _n3_offset_step_not_backdated(opts):
 
 
 # ---------------------------------------------------------------------------
+# N4 — impossible values are dropped, not reported as measurements
+# ---------------------------------------------------------------------------
+
+def _n4_range_checks(opts):
+    sect("audit N4: impossible lat/lon/heading are not measurements")
+    d = nav.decode_pgn(129025, p_129025(150.0, 10.0))
+    check("129025 lat 150 -> lat and lon None",
+          d["lat"] is None and d["lon"] is None, repr(d))
+    d = nav.decode_pgn(129025, p_129025(10.0, 200.0))
+    check("129025 lon 200 -> lat and lon None (pair goes together)",
+          d["lat"] is None and d["lon"] is None, repr(d))
+    d = nav.decode_pgn(129029, p_129029(time.time()))
+    check("129029 normal position decodes", abs(d["lat"] - LAT) < 1e-9, repr(d))
+    d = nav.decode_pgn(127250, p_127250(65000))
+    check("127250 heading 372 deg -> None",
+          d["heading_deg"] is None and d["heading_rad"] is None, repr(d))
+    d = nav.decode_pgn(129026, p_129026(65000))
+    check("129026 cog 372 deg -> None", d["cog_deg"] is None, repr(d))
+    for lat, lon in ((90.0, 180.0), (-90.0, -180.0)):
+        d = nav.decode_pgn(129025, p_129025(lat, lon))
+        check("129025 boundary %g/%g still decodes" % (lat, lon),
+              d["lat"] == lat and d["lon"] == lon, repr(d))
+    d = nav.decode_pgn(127250, p_127250(62832))
+    check("127250 heading raw 62832 (2 pi) still decodes",
+          d["heading_deg"] is not None and abs(d["heading_deg"] - 360.0) < 0.1,
+          repr(d))
+    # End to end: the snapshot must not claim a fix from an impossible latitude.
+    rd = reader()
+    t = time.time()
+    rd.feed_line(line(129025, p_129025(150.0, 10.0)), t)
+    fx = rd.fix_at(t, max_age_s=10.0)
+    check("lat 150 feed -> valid False, lat None",
+          fx["valid"] is False and fx["lat"] is None,
+          "valid=%r lat=%r xutm=%r" % (fx["valid"], fx["lat"], fx["xutm"]))
+    rd = reader()
+    rd.feed_line(line(129025, p_129025(LAT, LON)), t)
+    fx = rd.fix_at(t, max_age_s=10.0)
+    check("a normal 129025 feed is still valid with UTM",
+          fx["valid"] is True and fx["xutm"] is not None, repr(fx["valid"]))
+    rd = reader()
+    rd.feed_line(line(127250, p_127250(65000)), t)
+    fx = rd.fix_at(t, max_age_s=10.0)
+    check("heading 372 deg is not folded to 12 deg",
+          fx["heading_true_deg"] is None and fx["heading_mag_deg"] is None,
+          "%r %r" % (fx["heading_true_deg"], fx["heading_mag_deg"]))
+
+
+# ---------------------------------------------------------------------------
+# N5 — depth below the surface needs a waterline offset
+# ---------------------------------------------------------------------------
+
+def _n5_depth_offset_sign(opts):
+    sect("audit N5: depth_below_surface_m only from a waterline offset")
+    t = time.time()
+    for name, off, want_surface in (("waterline +0.5 m", 500, 12.84),
+                                    ("zero offset", 0, 12.34),
+                                    ("keel -0.5 m", -500, None)):
+        rd = reader()
+        rd.feed_line(line(128267, p_128267(1234, off)), t)
+        fx = rd.fix_at(t, max_age_s=10.0)
+        check("%s: depth_m is the transducer depth" % name,
+              fx["depth_m"] is not None and abs(fx["depth_m"] - 12.34) < 1e-9,
+              repr(fx["depth_m"]))
+        check("%s: depth_offset_m is published" % name,
+              fx["depth_offset_m"] is not None
+              and abs(fx["depth_offset_m"] - off / 1000.0) < 1e-9,
+              repr(fx["depth_offset_m"]))
+        got = fx["depth_below_surface_m"]
+        ok = (got is None) if want_surface is None else \
+            (got is not None and abs(got - want_surface) < 1e-9)
+        check("%s: depth_below_surface_m" % name, ok, repr(got))
+
+
+# ---------------------------------------------------------------------------
+# N6 — a position from a not-a-fix 129029 is withheld
+# ---------------------------------------------------------------------------
+
+def _n6_method_gates_position(opts):
+    sect("audit N6: no-fix/estimated/manual/simulate positions are withheld")
+    t = time.time()
+    names = {0: "no_fix", 6: "estimated", 7: "manual", 8: "simulate"}
+    for method, want_src in sorted(names.items()):
+        rd = reader()
+        rd.feed_line(line(129025, p_129025(12.5, -70.25), src=3), t)
+        rd.feed_line(line(129029, p_129029(t, method=method), src=3), t)
+        for view, fx in (("fix_at", rd.fix_at(t, max_age_s=10.0)),
+                         ("snapshot", None)):
+            if fx is None:
+                rd.set_clock(lambda: t + 0.1)
+                fx = rd.snapshot()
+            check("method %d (%s) %s: valid False, no lat/UTM"
+                  % (method, want_src, view),
+                  fx["valid"] is False and fx["lat"] is None
+                  and fx["xutm"] is None,
+                  "valid=%r lat=%r" % (fx["valid"], fx["lat"]))
+            check("method %d %s: fix_source names the method"
+                  % (method, view), fx["fix_source"] == want_src,
+                  repr(fx["fix_source"]))
+            check("method %d %s: sats still reported" % (method, view),
+                  fx["sats"] == 12, repr(fx["sats"]))
+        row = rd.flight_row(t, max_age_s=10.0)
+        check("method %d: flight_row lat/long cells empty" % method,
+              row.get("lat") in (None, "") and row.get("long") in (None, ""),
+              repr(row))
+    for method in (1, 2, 4, 5, 15):
+        rd = reader()
+        rd.feed_line(line(129025, p_129025(12.5, -70.25), src=3), t)
+        rd.feed_line(line(129029, p_129029(t, method=method), src=3), t)
+        fx = rd.fix_at(t, max_age_s=10.0)
+        check("method %d keeps the position and UTM" % method,
+              fx["valid"] is True and abs(fx["lat"] - 12.5) < 1e-6
+              and fx["xutm"] is not None,
+              "valid=%r lat=%r" % (fx["valid"], fx["lat"]))
+    rd = reader()
+    rd.feed_line(line(129025, p_129025(12.5, -70.25), src=3), t)
+    fx = rd.fix_at(t, max_age_s=10.0)
+    check("a 129025-only feed (no method known) stays valid",
+          fx["valid"] is True, repr(fx["valid"]))
+    # method 0 with N/A coordinates is the existing no-fix behaviour
+    rd = reader()
+    d = bytearray(p_129029(t, method=0))
+    d[7:15] = struct.pack("<q", 0x7FFFFFFFFFFFFFFF)
+    d[15:23] = struct.pack("<q", 0x7FFFFFFFFFFFFFFF)
+    rd.feed_line(line(129029, bytes(d), src=3), t)
+    fx = rd.fix_at(t, max_age_s=10.0)
+    check("method 0 with N/A lat/lon: valid False, fix_source no_fix",
+          fx["valid"] is False and fx["fix_source"] == "no_fix",
+          "%r %r" % (fx["valid"], fx["fix_source"]))
+
+
+# ---------------------------------------------------------------------------
 
 def suite(opts):
     _n1_disagreeing_senders(opts)
@@ -419,6 +580,9 @@ def suite(opts):
     _n3_replay_clock(opts)
     _n3_live_pulled_frame(opts)
     _n3_offset_step_not_backdated(opts)
+    _n4_range_checks(opts)
+    _n5_depth_offset_sign(opts)
+    _n6_method_gates_position(opts)
 
 
 if __name__ == "__main__":

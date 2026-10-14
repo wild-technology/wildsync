@@ -446,6 +446,10 @@ class NodeMonitor(threading.Thread):
         self._clock_hist = deque(maxlen=self.CLOCK_HIST_N)
         self.suspend_control = False # True while a card drain owns this node
         self._suspended_prev = False # suspend_control as of the previous tick
+        # EXPOSURE_FIELDS an explicit fleet apply asked for while this body was
+        # held (drain / transfer mode / busy) and so could not take them. Paid
+        # by the first pass that can reach it; see SettingsManager.reconcile_all.
+        self._exposure_owed = set()
         self._uptime = None          # piagent uptime_s from the last health
         self.rebooted_at = None      # epoch the node was last seen to restart
         self._connect_after = 0.0    # backoff gate
@@ -650,6 +654,18 @@ class NodeMonitor(threading.Thread):
                 self.status = {"connected": False, "stale": True,
                                "ilx_down": True,
                                "error": status.get("error") or "ilxctl not answering"}
+            elif self.status:
+                # Neither daemon answers: the node is gone (PoE pulled, Pi
+                # down). The branch above never ran, so the last good status
+                # stayed here with connected:true, and /api/fleet served
+                # state=OFFLINE next to a camera the UI counted, drew a normal
+                # health strip for and offered Controls on. Keep what was last
+                # seen (battery, id, model - the "last seen" display and the
+                # run layer's cam_id lookups read them) but say it is not
+                # live. ilx_down stays unset: it makes the live-view proxy
+                # answer "ilxctl not answering", which is the wrong diagnosis
+                # for a dead Pi.
+                self.status = dict(self.status, connected=False, stale=True)
         if rebooted:
             self.events.emit("error", "node_rebooted",
                              "%s restarted (piagent uptime reset to %.0f s) - "
@@ -1048,6 +1064,11 @@ DEFAULT_DESIRED = {
 # check then cleared the blind-field cache on every pass too, restoring the
 # multi-write-per-camera USB storm that cache exists to prevent, on the link the
 # frame pulls share.
+#
+# The same mechanism hit the white-balance and RAW fields, which had no bound at
+# all: the Kelvin box cleared in the UI sends `+''` -> colortemp 0, which was
+# persisted and re-pushed every 3 s, and program 0x8050 (a Movie_* program)
+# passed straight into the fleet vector DEFAULT_DESIRED promises never holds one.
 SETTING_BOUNDS = {
     "aperture": (50, 9900),          # f/0.5 .. f/99, f x100
     "iso": (25, 409600),             # plus the ISO_AUTO sentinel
@@ -1060,6 +1081,10 @@ SETTING_BOUNDS = {
     # focus_mode carries a stronger rule than a range: see _validate_field —
     # the rig is ALWAYS manual focus, so 1 (MF) is the only value that passes.
     "focus_mode": (1, 0xFFFF),
+    "colortemp": (2500, 9900),       # K - the UI's own min/max for the box
+    "wb_mode": (0, 0xFFFF),          # CrWhiteBalance_*; AWB is 0 and stays legal
+    "rawtype": (0, 6),               # CrRAWFile_Uncompression..Compressed_HQ
+    "program": (1, 0x804F),          # still programs only; Movie_* start 0x8050
     "quality": (1, 0xFFFF),          # CrJpegQuality — body choice list rules
     "pcsave": (0, 0xFFFF),           # RAW_J_PC_Save_Image (body-menu-only)
 }
@@ -1245,7 +1270,7 @@ class SettingsManager:
         for c in (raw or []):
             try:
                 out.append(int(c["v"] if isinstance(c, dict) else c))
-            except (TypeError, ValueError, KeyError):
+            except (TypeError, ValueError, KeyError, OverflowError):
                 continue
         return out
 
@@ -1258,7 +1283,13 @@ class SettingsManager:
             return None, "a boolean is not a camera setting value"
         try:
             v = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError is int(inf): json.loads turns the numeric token
+            # 1e999 into inf WITHOUT going through parse_constant (that hook
+            # only sees the literals Infinity/NaN), so a POST of {"iso":1e999}
+            # or a hand-edited desired.json used to raise out of a function
+            # documented never to - a 500 from the API, and from the load loop
+            # a rigd that would not start.
             return None, "not a number: %r" % (value,)
         if field == "focus_mode" and v != 1:
             # Operator rule, not a preference: the rig is ALWAYS manual focus
@@ -1297,8 +1328,11 @@ class SettingsManager:
         Returns {"applied": {...}, "rejected": {field: why}}. The rejections are
         returned rather than swallowed because an unattainable desired value is
         indistinguishable, from the operator's side, from a camera fault: the
-        badge goes red and the anomaly points at the body."""
+        badge goes red and the anomaly points at the body. A "deferred" list
+        (camera names) is added when an exposure apply could not reach a body
+        that is held by a drain or busy; it lands on release."""
         applied, rejected = {}, {}
+        deferred = []
         prim, status = self._primary_status()
         for k, v in (changes or {}).items():
             if k not in DEFAULT_DESIRED and k not in OPTIONAL_DESIRED_FIELDS:
@@ -1338,7 +1372,12 @@ class SettingsManager:
             # {"colortemp": 5000}) silently overwrote a deliberate per-camera
             # exposure split on every body with nothing in the log to say so.
             exp = sorted(set(applied) & set(EXPOSURE_FIELDS))
-            self.reconcile_all(force=True, exposure=exp or False)
+            deferred = self.reconcile_all(force=True, exposure=exp or False)
+            for name in deferred:
+                self.events.emit("info", "settings",
+                                 "exposure apply deferred on %s (drain/busy); "
+                                 "it will land when the body is released"
+                                 % name, node=name)
             if released:
                 # Dropping the pin above is not enough: the pass we just ran
                 # writes ONLY the exposure fields this apply touched, so a
@@ -1354,7 +1393,10 @@ class SettingsManager:
                 # is still safe (K2) (audit 2026-08-24).
                 self.reconcile_all(force=True, exposure=True,
                                    nodes=(released,))
-        return {"applied": applied, "rejected": rejected}
+        rep = {"applied": applied, "rejected": rejected}
+        if deferred:
+            rep["deferred"] = list(deferred)
+        return rep
 
     def bump_ev(self, steps):
         """EV compensation nudge during a survey: ±1/3-stop steps."""
@@ -1635,12 +1677,17 @@ class SettingsManager:
                     iterable  only those (bump_ev sends ("expcomp",)).
         nodes     restrict the pass to these node names; releasing a preview
                   pin re-converges the camera that WAS pinned and only it.
+
+        Returns the names of connected cameras that were HELD (drain, transfer
+        mode, busy) while this pass was asked to write exposure to them - the
+        apply did not reach them, and update() reports it.
         """
         self._expire_pin(reconcile=False)
         pinned = self.pinned_node()
         with self._lock:
             pending = dict(self._pending)
         only = None if nodes is None else set(nodes)
+        deferred = []
         for m in self.monitors:
             if only is not None and m.name_ not in only:
                 continue
@@ -1665,6 +1712,32 @@ class SettingsManager:
             if getattr(m, "suspend_control", False) \
                     or st.get("controlMode") == "transfer" \
                     or _status_degraded(st):
+                # Skipping is right, but an EXPLICIT exposure apply that lands
+                # while the body is held used to vanish here: update() answered
+                # ok, the UI said "fleet now on camN's exposure", and nothing
+                # ever replayed it - the release only drops the blind cache
+                # (arming a whole-vector force there would re-introduce the
+                # split wipe K5 pins), and the 3 s loop never writes exposure.
+                # The pair stayed split with a green confirmation. Remember the
+                # fields the caller asked for as a debt; _reconcile_node pays
+                # it from `desired` (so a later apply supersedes it) the first
+                # time it can reach the body. Only the exposure fields THIS
+                # call named are owed: a format/WB apply or the 3 s loop asks
+                # for none, so they record nothing.
+                owed = self._exposure_write_set(force, exposure)
+                with m._lock:
+                    if owed:
+                        m._exposure_owed = \
+                            set(getattr(m, "_exposure_owed", ())) | owed
+                    if force:
+                        # An explicit apply that never reached this body: when
+                        # it is released it will read back different from
+                        # `desired`, and that is us lagging, not the body
+                        # having reset (see the reverted tell in
+                        # _reconcile_node).
+                        m._apply_skipped = True
+                if owed:
+                    deferred.append(m.name_)
                 continue
             if not m.is_capturing():
                 # The convergence engine writes SetDeviceProperty over the same
@@ -1681,6 +1754,7 @@ class SettingsManager:
             except Exception as e:  # noqa: BLE001
                 self.events.emit("error", "settings",
                                  "reconcile error: %s" % e, node=m.name_)
+        return deferred
 
     def _reconcile_node(self, m, force, exposure=None):
         with self._lock:
@@ -1708,6 +1782,11 @@ class SettingsManager:
             # fleet vector. That, and the in-pass tell below, are the ONLY
             # implicit exposure writes left.
             exp_write = set(EXPOSURE_FIELDS)
+        # An explicit apply this body was too busy to take (see reconcile_all's
+        # held-body branch): write just those fields, from `desired` as it
+        # stands now.
+        owed = set(getattr(m, "_exposure_owed", ()))
+        exp_write |= owed
         if not force:
             # A body that reset does not announce it. Clearing the blind-field
             # cache on the OFFLINE->CAM_CONNECTED transition is necessary but
@@ -1738,12 +1817,30 @@ class SettingsManager:
             #     body-menu-only on these bodies) or that was ALREADY diverged
             #     last pass. A standing mismatch is a standing divergence; a
             #     reset is a CHANGE, and only a change is a tell.
+            #
+            # And two situations in which a mismatch says nothing about the
+            # body at all, because the cached status is not evidence of what
+            # the body holds NOW:
+            #   * it predates our own last settings write. The verification
+            #     read below is a local; m.status only refreshes on the 2 s
+            #     poll, so for up to 2 s after ANY apply the cache still shows
+            #     the pre-apply value, and a loop pass in that window read
+            #     {"colortemp": 5000} as "the body reverted to 5600" and
+            #     re-pushed the whole exposure vector over a deliberate split
+            #     (audit 2026-10-15).
+            #   * an apply skipped this body while a drain/busy status held it
+            #     (reconcile_all): it lags `desired` because we never wrote.
             with m._lock:
                 prev_bad = set(m.convergence.get("diverged") or []) \
                     | set(m.convergence.get("unsettable") or [])
+                last_seen = m.last_seen
+                apply_skipped = getattr(m, "_apply_skipped", False)
+            cache_stale = last_seen <= getattr(m, "_settings_pushed_at", 0.0)
             writable_now = status.get("writable") or {}
             reverted = []
-            for f, (w, k) in ALL_CONVERGE_FIELDS.items():
+            judged = () if (cache_stale or apply_skipped) \
+                else ALL_CONVERGE_FIELDS.items()
+            for f, (w, k) in judged:
                 if f in EXPOSURE_FIELDS or f in prev_bad:
                     continue
                 k = _readback_key(f, k, status)
@@ -1775,7 +1872,10 @@ class SettingsManager:
         #   * accepted     - cache it (blind fields only; readable ones are
         #     judged by the verification read below, which is stronger).
 
+        wrote = []
+
         def note(field, r, key, value):
+            wrote.append(field)
             if r.get("_unreachable"):
                 return
             if r.get("ok") is False:
@@ -1841,6 +1941,7 @@ class SettingsManager:
                 # operator cannot reach into a permanent "not synced" badge.
                 pushed["expcomp"] = want_ev
                 skip_verify.add("expcomp")
+                wrote.append("expcomp")
             else:
                 note("expcomp", r, ev_key, want_ev)
         # Verify the readable ones settled. Read the CAMERA, not m.snapshot():
@@ -1852,9 +1953,36 @@ class SettingsManager:
         after = http_json(m.ilx + "/api/status", timeout=8)
         if not isinstance(after, dict) or after.get("_unreachable"):
             return                                  # offline: not a divergence
+        if _status_degraded(after):
+            # The re-read can land on the same busy spell the cached status is
+            # guarded against: a body that could not take the SDK mutex inside
+            # ilxctl's 4.5 s answers connected + busy and NO property block
+            # (a frame transfer, or this pass's own writes, can do it). Judging
+            # that marks every readable field diverged and raises a bad-severity
+            # settings_divergent on matched bodies - the node answered and told
+            # us nothing, and PROTOCOL.md says not to count missing keys as
+            # divergence. Leave the previous verdict and strike count alone,
+            # and keep the reconnect force flag for a pass that can verify; the
+            # 3 s cadence is the retry.
+            return
         # The reconnect flag is consumed by a pass that got far enough to push
         # and re-read; an unreachable node above keeps it for the next pass.
         m._exposure_force = False
+        m._apply_skipped = False
+        if wrote:
+            # Stamped AFTER the re-read: any cached status that landed before
+            # this instant may predate what we just wrote. See the reverted
+            # tell above.
+            m._settings_pushed_at = time.time()
+        if owed:
+            # Paid: the pass wrote them and the re-read proves it reached the
+            # body. Anything the pass cannot land now shows as a real diverged
+            # field (it is in exp_write), not as an exposure_split. The `|=`
+            # in reconcile_all may have added to the set meanwhile, so subtract
+            # rather than clear.
+            with m._lock:
+                m._exposure_owed = set(getattr(m, "_exposure_owed", ())) \
+                    - owed
         still, exp_split = [], []
         for field, (which, key) in ALL_CONVERGE_FIELDS.items():
             if field in skip_verify:

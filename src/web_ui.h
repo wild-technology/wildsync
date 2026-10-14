@@ -699,6 +699,7 @@ function stepShot(d){
 async function pollShots(){
   try {
     const next = await (await fetch('/api/shots')).json();
+    if(!Array.isArray(next)) throw new Error('listing failed');   // error object: keep the old list, retry
     const grew = next.length !== shots.length;
     const cur = shots[shotAt] && shots[shotAt].name;
     shots = next;

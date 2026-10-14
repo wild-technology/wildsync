@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — rigd (findings D1..D8).
+"""Audit regression suite — rigd (findings D1..D21).
 
 Every check here FAILS on the pre-fix rigd.py and passes after.
 
@@ -46,6 +46,30 @@ D8  POST /api/reconcile called reconcile_all(force=True) with no exposure=
     rest of the vector and leave exposure alone; POST /api/settings is the
     exposure apply and must still propagate.
 
+D13 State-changing POSTs ran for any cross-origin browser page: a text/plain
+    no-cors fetch is a "simple" request (no preflight), the body-borne
+    {"confirm":"format"} token is attacker-written, and a body-less POST
+    parses as {}. The Origin header is now compared with Host.
+D14 The HTTP server had no socket timeout: a client that vanished (or stalled
+    mid-body) held a thread and a file descriptor until restart, and the
+    first fix attempt turned a body-read timeout into a stderr traceback.
+D15 /api/camera/enabled and /api/node/format coerced with bool(): the string
+    "false" switched a camera ON (persisted) or asked for a quick format.
+D16 Run zip export: two overlapping requests shared one .tmp (a 500 for the
+    second, a half-rewritten file for the first); a failed build left the
+    partial .tmp; the live run was exported (a full copy of a moving target on
+    the volume frame writes depend on); and no free-space check existed.
+D17 A run id with non-latin-1 characters made the zip download a malformed
+    response (a 200 status line followed by a 500 one).
+D18 {"iso":1e999} on /api/settings and /api/settings/preview was a 500
+    (OverflowError out of _validate_field).
+D19 An OFFLINE node was served as connected:true with its last status.
+D20 Unframed POST bodies (Transfer-Encoding, negative Content-Length) were
+    read as "no body" and started a default run.
+D21 An exposure apply that reached a held (draining) camera was reported with
+    no mention of it, and a later deliberate /api/exposure write could be
+    overwritten by the debt it left.
+
 Hermetic: fakenode fakes on loopback only (soaktest's netguard is installed by
 importing it), a throwaway temp home, an rigd HTTP server on an ephemeral
 127.0.0.1 port. No sleeps beyond what the 0.3 s monitor poll needs.
@@ -61,6 +85,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -98,6 +123,18 @@ class Harness:
         rigcore.RIGD_LOG = os.path.join(rigcore.RIG_HOME, "rigd.jsonl")
         rigcore.RUNS_DIR = runmod.RUNS_DIR = os.path.join(self.dir, "runs")
         os.makedirs(rigcore.RIG_HOME, exist_ok=True)
+        # project.startup(), which Rig() runs, re-points RUNS_DIR at the
+        # operator's ACTIVE project, so these fixture runs used to land in the
+        # real survey tree (observed 2026-10-15: audit-latch / audit-drain
+        # junk in ~/wildsync-projects/<project>/runs). An empty projects root
+        # of the harness's own makes startup() fall back to the legacy wrapper
+        # around the temp RUNS_DIR above.
+        self._saved_project = (rigd.project.PROJECTS_ROOT,
+                               rigd.project.ACTIVE_PATH, rigd.project._active)
+        rigd.project.PROJECTS_ROOT = os.path.join(self.dir, "projects")
+        rigd.project.ACTIVE_PATH = os.path.join(rigd.project.PROJECTS_ROOT,
+                                                "active.json")
+        rigd.project._active = None
         # Never the operator's real ~/rig or ~/rig-raw.
         self._sf_path = os.path.join(self.dir, "static_fix.json")
         self._saved = {"NODES": rigd.NODES, "MON": rigd.NodeMonitor,
@@ -148,9 +185,11 @@ class Harness:
         os.utime(self._sf_path, (time.time(), time.time() + 1))
 
     # -- HTTP ---------------------------------------------------------------
-    def req(self, method, path, body=None, raw=None, timeout=20):
+    def req(self, method, path, body=None, raw=None, timeout=20,
+            headers=None):
         """(status_code, parsed_json). `raw` sends bytes verbatim, which is how
-        the malformed-body cases are staged."""
+        the malformed-body cases are staged; `headers` adds request headers
+        (an Origin, a Content-Type)."""
         data = None
         if raw is not None:
             data = raw if isinstance(raw, bytes) else raw.encode()
@@ -160,6 +199,8 @@ class Harness:
                                    data=data, method=method)
         if data is not None:
             r.add_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            r.add_header(k, v)
         try:
             with urllib.request.urlopen(r, timeout=timeout) as fh:
                 return fh.status, _body(fh.read())
@@ -195,6 +236,8 @@ class Harness:
         rigd.Rig._anomaly_loop = self._saved["loop"]
         rigd.RIG = self._saved["RIG"]
         rigcore.http_json = self._saved["http_json"]
+        (rigd.project.PROJECTS_ROOT, rigd.project.ACTIVE_PATH,
+         rigd.project._active) = self._saved_project
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -1696,6 +1739,596 @@ def t_reconcile(h):
 
 
 # ===========================================================================
+# D13 — a browser page on another origin cannot drive the rig
+# ===========================================================================
+def _hc(h, method, path, body=None, headers=None, conn=None):
+    """One request over http.client (urllib cannot send a foreign Origin on a
+    body-less POST without help, and the keep-alive check needs the same
+    connection twice). -> (status, parsed_json, connection)."""
+    import http.client
+    c = conn or http.client.HTTPConnection("127.0.0.1", h.port, timeout=10)
+    data = body if isinstance(body, (bytes, type(None))) else \
+        json.dumps(body).encode()
+    c.request(method, path, body=data, headers=headers or {})
+    r = c.getresponse()
+    return r.status, _body(r.read()), c
+
+
+def t_origin(h):
+    sect("D13 rigd: a cross-origin browser POST is refused before it acts")
+    h.wait_connected("cam2")
+    m2 = h.mon("cam2")
+    evil = {"Origin": "http://evil.example", "Content-Type": "text/plain"}
+    own = "http://127.0.0.1:%d" % h.port
+    enabled0 = m2.camera_enabled
+
+    code, doc, c = _hc(h, "POST", "/api/camera/enabled",
+                       {"node": "cam2", "enabled": False}, evil)
+    check("a text/plain no-cors style POST from another site is a 403",
+          code == 403 and doc.get("ok") is False, "%s %s" % (code, doc))
+    check("...and it changed nothing", m2.camera_enabled == enabled0,
+          "camera_enabled=%r" % m2.camera_enabled)
+    # The refused request left its body unread, so the connection must not be
+    # reused for the next request on it: a clean answer on the SAME client
+    # object (it reconnects because the reply says Connection: close).
+    code2, doc2, _ = _hc(h, "GET", "/api/fleet", conn=c)
+    check("a refusal does not wedge the keep-alive connection",
+          code2 == 200 and isinstance(doc2, dict) and "nodes" in doc2,
+          "%s %s" % (code2, json.dumps(doc2)[:80]))
+    c.close()
+
+    # A body-less POST parses as {}, so a Content-Type check alone is no gate.
+    cancel0 = h.rig._drain_stop.is_set()
+    for path in ("/api/settings/discard", "/api/drain/cancel",
+                 "/api/run/stop"):
+        code, doc, c = _hc(h, "POST", path, None, {"Origin": "http://evil.example"})
+        check("a body-less foreign POST to %s is refused" % path,
+              code == 403, "%s %s" % (code, json.dumps(doc)[:80]))
+        c.close()
+    check("...and the drain was not asked to cancel",
+          h.rig._drain_stop.is_set() == cancel0)
+    code, doc, c = _hc(h, "POST", "/api/camera/enabled",
+                       {"node": "cam2", "enabled": False}, {"Origin": "null"})
+    check("Origin: null (a sandboxed frame) is refused", code == 403
+          and m2.camera_enabled == enabled0, "%s" % code)
+    c.close()
+    code, doc, c = _hc(h, "POST", "/api/camera/enabled",
+                       {"node": "cam2", "enabled": False},
+                       {"Origin": "http://127.0.0.1:%d" % (h.port + 1)})
+    check("the same host on another port is another origin", code == 403,
+          "%s" % code)
+    c.close()
+
+    # Nothing legitimate regresses.
+    code, doc, c = _hc(h, "POST", "/api/camera/enabled",
+                       {"node": "cam2", "enabled": False}, {"Origin": own})
+    check("the UI's own origin (Origin == Host) is accepted and applies",
+          code == 200 and doc.get("ok") is True
+          and m2.camera_enabled is False, "%s %s" % (code, doc))
+    c.close()
+    code, doc, c = _hc(h, "POST", "/api/camera/enabled",
+                       {"node": "cam2", "enabled": True},
+                       {"Origin": own.replace("http://", "HTTP://")})
+    check("the comparison ignores case", code == 200
+          and m2.camera_enabled is True, "%s %s" % (code, doc))
+    c.close()
+    code, doc = h.post("/api/camera/enabled", {"node": "cam2", "enabled": False})
+    check("a client that sends no Origin (curl, urllib, drain) still works",
+          code == 200 and m2.camera_enabled is False, "%s %s" % (code, doc))
+    h.post("/api/camera/enabled", {"node": "cam2", "enabled": True})
+    check("cam2 camera restored", m2.camera_enabled is True)
+    code, doc = h.get("/api/fleet")
+    check("GET is untouched (the UI page itself needs no Origin)",
+          code == 200, str(code))
+
+
+# ===========================================================================
+# D14 — idle and stalled connections are reaped
+# ===========================================================================
+def t_timeout(h):
+    import contextlib
+    import io
+    import socket
+    sect("D14 rigd: a vanished or stalled client does not hold a thread for ever")
+    shipped = rigd.Handler.timeout
+    check("the shipping handler has a positive socket timeout",
+          isinstance(shipped, (int, float)) and not isinstance(shipped, bool)
+          and shipped > 0, repr(shipped))
+    check("...far above the UI's 2 s poll, so a live page never sees it",
+          isinstance(shipped, (int, float)) and shipped >= 30, repr(shipped))
+    rigd.Handler.timeout = 0.5
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            # (a) a connection that sends nothing
+            s = socket.create_connection(("127.0.0.1", h.port), timeout=4)
+            t0 = time.time()
+            try:
+                got = s.recv(10)
+                ended = (got == b"")
+            except OSError as e:
+                got, ended = repr(e), False
+            check("an idle connection is closed by the server",
+                  ended and time.time() - t0 < 3.0,
+                  "recv=%r after %.1f s" % (got, time.time() - t0))
+            s.close()
+
+            # (b) a body that is announced and then never finishes
+            s = socket.create_connection(("127.0.0.1", h.port), timeout=4)
+            s.sendall(b"POST /api/run/stop HTTP/1.1\r\nHost: x\r\n"
+                      b"Content-Length: 1000\r\n\r\nab")
+            buf, t0 = b"", time.time()
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                eof = True
+            except OSError:
+                eof = False
+            check("a stalled body gets a 400 naming the read",
+                  b" 400 " in buf.split(b"\r\n", 1)[0]
+                  and b"could not read the request body" in buf,
+                  buf[:160].decode(errors="replace"))
+            check("...and the connection is closed, not left blocked",
+                  eof and time.time() - t0 < 3.0,
+                  "eof=%s after %.1f s" % (eof, time.time() - t0))
+            s.close()
+            time.sleep(0.3)      # let the handler thread finish and print
+
+            # (c) a live client polling across several timeouts is not cut off
+            import http.client
+            c = http.client.HTTPConnection("127.0.0.1", h.port, timeout=5)
+            ok, t0 = 0, time.time()
+            while time.time() - t0 < 1.4:
+                c.request("GET", "/api/fleet")
+                r = c.getresponse()
+                r.read()
+                ok += (r.status == 200)
+                time.sleep(0.1)
+            c.close()
+            check("a client polling every 0.1 s outlives the timeout",
+                  ok >= 10, "%d good polls in %.1f s" % (ok, time.time() - t0))
+    finally:
+        rigd.Handler.timeout = shipped
+    text = err.getvalue()
+    check("a body-read timeout leaves no traceback on stderr",
+          "Traceback" not in text and "timed out object" not in text,
+          text[-200:])
+
+
+# ===========================================================================
+# D15 — booleans are real booleans
+# ===========================================================================
+def t_booleans(h):
+    sect("D15 rigd: camera/enabled and node/format take real booleans only")
+    h.wait_connected("cam1")
+    h.wait_connected("cam2")
+    m2 = h.mon("cam2")
+    state0 = (m2.camera_enabled, dict(rigcore.load_camera_enabled()))
+    for v in ("false", "0", "", "maybe", "yes", 2, [], None):
+        code, doc = h.post("/api/camera/enabled", {"node": "cam2", "enabled": v})
+        check("camera/enabled refuses enabled=%r" % (v,), is400(code, doc)
+              and "enabled" in (doc.get("error") or ""),
+              "%s %s" % (code, json.dumps(doc)[:90]))
+    check("no refused value switched the camera or was persisted",
+          (m2.camera_enabled, dict(rigcore.load_camera_enabled())) == state0,
+          "now %r / %r" % (m2.camera_enabled, rigcore.load_camera_enabled()))
+    for v, want in ((False, False), (True, True), (0, False), (1, True)):
+        code, doc = h.post("/api/camera/enabled", {"node": "cam2", "enabled": v})
+        check("camera/enabled still accepts %r" % (v,),
+              code == 200 and doc.get("ok") is True
+              and m2.camera_enabled is want, "%s %s" % (code, json.dumps(doc)[:90]))
+    h.post("/api/camera/enabled", {"node": "cam2", "enabled": True})
+
+    t0 = time.time()
+    for v in ("false", "0", "maybe", None, 2, []):
+        code, doc = h.post("/api/node/format", {"node": "cam1",
+                                                "confirm": "format",
+                                                "quick": v})
+        check("node/format refuses quick=%r" % (v,), is400(code, doc)
+              and "quick" in (doc.get("error") or ""),
+              "%s %s" % (code, json.dumps(doc)[:90]))
+    check("no format reached a card",
+          not h.node("cam1").calls_since(t0, "/api/format"),
+          str(h.node("cam1").calls_since(t0, "/api/format")[:2]))
+    for v in (True, False, 0, 1):
+        try:
+            ok = rigd.want_bool(v, '"quick"') is bool(v)
+        except rigd.BadRequest:
+            ok = False
+        check("want_bool still takes quick=%r" % (v,), ok)
+
+
+# ===========================================================================
+# D16/D17 — run zip export
+# ===========================================================================
+def _mkrun(root, rid, files=6, size=64):
+    d = os.path.join(root, rid, "cam1")
+    os.makedirs(d, exist_ok=True)
+    names = []
+    for i in range(files):
+        p = os.path.join(d, "f%02d.jpg" % i)
+        with open(p, "wb") as fh:
+            fh.write(os.urandom(size))
+        names.append(os.path.join(rid, "cam1", "f%02d.jpg" % i))
+    with open(os.path.join(root, rid, "run.json"), "w") as fh:
+        fh.write("{}")
+    return sorted(names + [os.path.join(rid, "run.json")])
+
+
+def t_zip(h):
+    import zipfile
+    sect("D16 rigd: run zip export is serialised, cleans up, and keeps clear "
+         "of the live run and a full volume")
+    exp = os.path.join(h.dir, "exports")
+    saved_active, saved_free = rigd.project.active, rigd.free_mb
+    saved_write, saved_status = zipfile.ZipFile.write, h.rig.runmgr.status
+    # Rig() rebinds rigcore.RUNS_DIR to the ACTIVE PROJECT's runs directory
+    # (project.startup), so the harness's temp RUNS_DIR is not what the run
+    # browser reads. Point both the runs and the exports at this test's own
+    # temp dir, so nothing here lands in the operator's survey tree.
+    saved_runs = rigcore.RUNS_DIR
+    root = os.path.join(h.dir, "runs-zip")
+    os.makedirs(root, exist_ok=True)
+    rigcore.RUNS_DIR = root
+    rigd.project.active = lambda: {"exports_dir": exp, "runs_dir": root}
+    rigd.free_mb = lambda path: 10 ** 7
+
+    def leftovers():
+        return [n for n in os.listdir(exp) if n.endswith(".tmp")] \
+            if os.path.isdir(exp) else []
+    try:
+        # -- two overlapping requests -------------------------------------
+        rid = "261001_0000_dbl"
+        want = _mkrun(root, rid)
+
+        def slow_write(self, *a, **kw):
+            time.sleep(0.05)
+            return saved_write(self, *a, **kw)
+        zipfile.ZipFile.write = slow_write
+        seq = h.rig.events._seq
+        res = {}
+
+        def go(tag, delay):
+            time.sleep(delay)
+            try:
+                res[tag] = h.rig.export_run_zip(rid)
+            except BaseException as e:                         # noqa: BLE001
+                res[tag] = e
+        ts = [threading.Thread(target=go, args=("a", 0.0)),
+              threading.Thread(target=go, args=("b", 0.12))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(20)
+        zipfile.ZipFile.write = saved_write
+        check("two overlapping exports both return the finished zip",
+              isinstance(res.get("a"), str) and res.get("a") == res.get("b"),
+              repr(res))
+        out = res.get("a")
+        if isinstance(out, str):
+            with zipfile.ZipFile(out) as z:
+                check("the published zip is intact and complete",
+                      z.testzip() is None and sorted(z.namelist()) == want,
+                      "%s vs %s" % (sorted(z.namelist())[:3], want[:3]))
+        built = [e for e in h.rig.events.since(seq)["events"]
+                 if e.get("kind") == "export"]
+        check("it was built once, not twice", len(built) == 1, str(len(built)))
+        check("no .tmp is left behind", not leftovers(), str(leftovers()))
+
+        # -- a failed build leaves nothing ---------------------------------
+        rid2 = "261001_0001_fail"
+        _mkrun(root, rid2)
+
+        def boom(self, *a, **kw):
+            raise OSError(28, "No space left on device")
+        zipfile.ZipFile.write = boom
+        try:
+            h.rig.export_run_zip(rid2)
+            err = None
+        except Exception as e:                                 # noqa: BLE001
+            err = e
+        zipfile.ZipFile.write = saved_write
+        check("a build that runs out of space is refused cleanly",
+              isinstance(err, rigcore.RunsError) and "export failed" in str(err),
+              repr(err))
+        check("...and its partial .tmp is removed", not leftovers(),
+              str(leftovers()))
+        check("...and no zip was published",
+              not os.path.exists(os.path.join(exp, rid2 + ".zip")))
+
+        # -- the run being recorded is not exported ------------------------
+        rid3 = "261001_0002_live"
+        _mkrun(root, rid3)
+        h.rig.runmgr.status = lambda: {"active": True, "run_id": rid3}
+        code, doc = h.get("/api/run/zip?id=" + rid3)
+        check("the zip of the run being recorded is refused",
+              is400(code, doc) and "still recording" in (doc.get("error") or ""),
+              "%s %s" % (code, json.dumps(doc)[:120]))
+        check("...nothing was built for it",
+              not os.path.exists(os.path.join(exp, rid3 + ".zip"))
+              and not leftovers())
+        code, doc = h.get("/api/run/zip?id=" + rid)
+        check("a finished run still exports while another records", code == 200,
+              "%s" % code)
+        h.rig.runmgr.status = saved_status
+
+        # -- the volume keeps its headroom ---------------------------------
+        rid4 = "261001_0003_space"
+        names4 = _mkrun(root, rid4)
+        rigd.free_mb = lambda path: rigd.RUNS_DISK_LOW_MB
+        code, doc = h.get("/api/run/zip?id=" + rid4)
+        check("an export that would eat the transect headroom is refused",
+              is400(code, doc) and "free space" in (doc.get("error") or ""),
+              "%s %s" % (code, json.dumps(doc)[:140]))
+        check("...as JSON 4xx, with nothing written",
+              not os.path.exists(os.path.join(exp, rid4 + ".zip"))
+              and not leftovers())
+        rigd.free_mb = lambda path: rigd.RUNS_DISK_LOW_MB + 10
+        out4 = None
+        try:
+            out4 = h.rig.export_run_zip(rid4)
+        except Exception as e:                                 # noqa: BLE001
+            check("with room to spare the export succeeds", False, repr(e))
+        if out4:
+            with zipfile.ZipFile(out4) as z:
+                check("with room to spare it succeeds, every member under "
+                      "<run_id>/, stored not deflated",
+                      sorted(z.namelist()) == names4
+                      and all(i.compress_type == zipfile.ZIP_STORED
+                              for i in z.infolist()),
+                      str(sorted(z.namelist())[:3]))
+        rigd.free_mb = lambda path: None
+        rid5 = "261001_0004_nofree"
+        _mkrun(root, rid5)
+        try:
+            out5 = h.rig.export_run_zip(rid5)
+        except Exception as e:                                 # noqa: BLE001
+            out5 = repr(e)
+        check("an unreadable free-space figure keeps today's behaviour",
+              out5 and os.path.isfile(out5), repr(out5))
+        code, doc = h.get("/api/run/zip?id=261001_9999_nope")
+        check("a run that does not exist is still a 404",
+              code == 404 and doc.get("ok") is False, "%s" % code)
+
+        # -- D17: a non-latin-1 run id --------------------------------------
+        sect("D17 rigd: a run id outside latin-1 downloads as a well-formed "
+             "response")
+        cjk = "251001_0000_サンゴ礁"
+        _mkrun(root, cjk, files=2)
+        rigd.free_mb = lambda path: 10 ** 7
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", h.port, timeout=10)
+        c.request("GET", "/api/run/zip?id=" + urllib.parse.quote(cjk))
+        r = c.getresponse()
+        data = r.read()
+        cd = r.getheader("Content-Disposition") or ""
+        check("the download of a CJK run id is a clean 200 zip",
+              r.status == 200 and data[:2] == b"PK",
+              "%s %r" % (r.status, data[:60]))
+        check("its Content-Disposition is latin-1 safe and carries the "
+              "real name (RFC 5987)",
+              "filename*=UTF-8''251001_0000_%E3%82%B5%E3%83%B3" in cd
+              and all(ord(ch) < 256 for ch in cd), cd)
+        check("Content-Length is the file size", r.getheader("Content-Length")
+              == str(len(data)))
+        c.close()
+        # A raw read: exactly one status line on the wire.
+        import socket
+        s = socket.create_connection(("127.0.0.1", h.port), timeout=10)
+        s.sendall(("GET /api/run/zip?id=%s HTTP/1.1\r\nHost: x\r\n"
+                   "Connection: close\r\n\r\n"
+                   % urllib.parse.quote(cjk)).encode())
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        head = buf.split(b"\r\n\r\n", 1)[0]
+        check("exactly one HTTP status line is sent",
+              head.count(b"HTTP/1.") == 1 and b" 500 " not in head,
+              head[:200].decode(errors="replace"))
+        cdh = rigd.Handler._content_disposition
+        check("an ASCII run id keeps the plain filename form",
+              cdh("260823_1642_reef.zip")
+              == 'attachment; filename="260823_1642_reef.zip"',
+              cdh("260823_1642_reef.zip"))
+        hostile = cdh('a"b\r\nX-Evil: 1.zip')
+        check("quotes and line breaks cannot escape the header",
+              "\r" not in hostile and "\n" not in hostile
+              and hostile.count('"') == 2, repr(hostile))
+    finally:
+        zipfile.ZipFile.write = saved_write
+        rigd.project.active, rigd.free_mb = saved_active, saved_free
+        h.rig.runmgr.status = saved_status
+        rigcore.RUNS_DIR = saved_runs
+
+
+# ===========================================================================
+# D18 — a numeric token that is not finite is a refusal, not a 500
+# ===========================================================================
+def t_overflow(h):
+    sect("D18 rigd: {\"iso\":1e999} is refused, not an OverflowError 500")
+    for path in ("/api/settings", "/api/settings/preview"):
+        seq = h.rig.events._seq
+        code, doc = h.req("POST", path, raw=b'{"iso":1e999}')
+        check("POST %s {iso:1e999} is not a 500" % path, code != 500,
+              "%s %s" % (code, json.dumps(doc)[:120]))
+        check("...it names the field as rejected",
+              "iso" in ((doc or {}).get("rejected") or {}),
+              json.dumps(doc)[:120])
+        errs = [e for e in h.rig.events.since(seq)["events"]
+                if e.get("kind") == "http" and e.get("sev") == "error"]
+        check("...and journals no handler error", not errs,
+              json.dumps(errs[:1])[:140])
+    check("the desired ISO was not touched",
+          h.rig.settings.get()["iso"] != float("inf"),
+          str(h.rig.settings.get()["iso"]))
+    h.post("/api/settings/discard")
+
+
+# ===========================================================================
+# D20 — an unframed body is not an empty body
+# ===========================================================================
+def _raw_exchange(port, data, read_timeout=4.0):
+    """Send raw bytes, read until the server closes or goes quiet.
+    -> (status_code, parsed_body, closed_by_server)."""
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=read_timeout)
+    s.sendall(data)
+    buf, closed = b"", False
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                closed = True
+                break
+            buf += chunk
+            head, sep, body = buf.partition(b"\r\n\r\n")
+            if sep:
+                for ln in head.split(b"\r\n"):
+                    if ln.lower().startswith(b"content-length:"):
+                        if len(body) >= int(ln.split(b":")[1]):
+                            raise StopIteration
+    except StopIteration:
+        # The reply is complete: does the server hang up after it?
+        s.settimeout(1.0)
+        try:
+            closed = (s.recv(1) == b"")
+        except OSError:
+            closed = False
+    except OSError:
+        pass
+    s.close()
+    head, _, body = buf.partition(b"\r\n\r\n")
+    try:
+        code = int(head.split(b" ")[1])
+    except (IndexError, ValueError):
+        code = 0
+    return code, _body(body), closed
+
+
+def t_framing(h):
+    sect("D20 rigd: a chunked or negatively-sized body is refused, not "
+         "treated as no body")
+    chunked = (b"POST /api/run/start HTTP/1.1\r\nHost: x\r\n"
+               b"Transfer-Encoding: chunked\r\n\r\n"
+               b'1d\r\n{"label":"line7","interval":2}\r\n0\r\n\r\n')
+    code, doc, closed = _raw_exchange(h.port, chunked)
+    check("a chunked POST /api/run/start is a 400", is400(code, doc),
+          "%s %s" % (code, json.dumps(doc)[:110]))
+    check("...no run was started", h.rig.runmgr.status().get("active")
+          is not True, json.dumps(h.rig.runmgr.status().get("run_id")))
+    if h.rig.runmgr.status().get("active"):
+        h.rig.runmgr.stop()
+    check("...and the connection is closed rather than re-framed", closed)
+    for path in ("/api/run/start", "/api/settings"):
+        code, doc, closed = _raw_exchange(
+            h.port, ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"
+                     % path).encode())
+        check("Content-Length: -1 on %s is a 400" % path, is400(code, doc),
+              "%s %s" % (code, json.dumps(doc)[:110]))
+        check("...no run was started by it", h.rig.runmgr.status().get("active")
+              is not True)
+        if h.rig.runmgr.status().get("active"):
+            h.rig.runmgr.stop()
+    # A body-less POST with no Content-Length at all is legitimate.
+    code, doc, _ = _raw_exchange(
+        h.port, b"POST /api/settings/discard HTTP/1.1\r\nHost: x\r\n"
+                b"Connection: close\r\n\r\n")
+    check("a POST with no body and no Content-Length still works",
+          code == 200 and isinstance(doc, dict), "%s %s" % (code, doc))
+
+
+# ===========================================================================
+# D19 — an OFFLINE node is not served as connected
+# ===========================================================================
+def t_offline_view(h):
+    sect("D19 rigd: a node that stopped answering is not connected:true")
+    h.wait_connected("cam1")
+    n1, m1 = h.node("cam1"), h.mon("cam1")
+    n1.battery = 61
+    check("precondition: a live node is connected in the fleet view",
+          wait_for(lambda: h.rig._node_view(m1)["connected"] is True
+                   and (m1.snapshot().get("status") or {}).get("battery") == 61,
+                   6.0))
+    n1.set_fault(surface="both", badjson=True)
+    check("cam1 goes OFFLINE",
+          wait_for(lambda: m1.snapshot()["state"]
+                   == rigcore.NodeMonitor.OFFLINE, 10.0),
+          m1.snapshot()["state"])
+    st = m1.snapshot()["status"]
+    check("its cached status no longer says connected",
+          st.get("connected") is False, json.dumps(st)[:120])
+    view = h.rig._node_view(m1)
+    check("/api/fleet shows OFFLINE together with connected:false",
+          view["state"] == "OFFLINE" and view["connected"] is False,
+          "state=%s connected=%r" % (view["state"], view["connected"]))
+    check("the last-seen data is kept for the display", view["battery"] == 61,
+          "battery=%r" % view["battery"])
+    code, doc = h.get("/api/fleet")
+    fl = {n["name"]: n for n in (doc.get("nodes") or [])}
+    check("the HTTP fleet payload agrees",
+          fl.get("cam1", {}).get("connected") is False, json.dumps(
+              {k: fl.get("cam1", {}).get(k) for k in ("state", "connected")}))
+    n1.clear_faults()
+    check("cam1 back", h.wait_connected("cam1", 15.0))
+    check("...and the fleet view says connected again",
+          wait_for(lambda: h.rig._node_view(m1)["connected"] is True, 6.0))
+    n1.battery = 87
+
+
+# ===========================================================================
+# D21 — an exposure apply that a held camera could not take
+# ===========================================================================
+def t_deferred(h):
+    sect("D21 rigd: an apply onto a draining camera is reported, and a "
+         "deliberate per-camera write cancels the debt")
+    h.wait_connected("cam1")
+    h.wait_connected("cam2")
+    m2, n2 = h.mon("cam2"), h.node("cam2")
+    code, desired0 = h.get("/api/settings")
+    want_iso = desired0["iso"]
+    new_iso = 800 if want_iso != 800 else 1600
+    m2.suspend_control = True
+    check("cam2 is held by the drain flag", wait_for(
+        lambda: m2.snapshot()["state"] == rigcore.NodeMonitor.CONNECTED, 4.0))
+    code, doc = h.post("/api/settings", {"iso": new_iso})
+    check("the apply answers which camera has not received it",
+          code == 200 and doc.get("deferred") == ["cam2"]
+          and (doc.get("applied") or {}).get("iso") == new_iso,
+          "%s %s" % (code, json.dumps(doc)[:120]))
+    check("cam2 was not written to", n2.raw("iso") == want_iso,
+          "iso=%s" % n2.raw("iso"))
+    with m2._lock:
+        owed = set(m2._exposure_owed)
+    check("the skipped field is owed", owed == {"iso"}, repr(owed))
+    # The drain flag is released only after the operator tunes cam2 by hand.
+    m2.suspend_control = False
+    code, doc = h.post("/api/exposure", {"node": "cam2", "which": "iso",
+                                         "value": 3200})
+    with m2._lock:
+        owed = set(m2._exposure_owed)
+    check("a deliberate per-camera ISO clears that field's debt",
+          code == 200 and doc.get("ok") is not False and not owed,
+          "%s owed=%r" % (json.dumps(doc)[:60], owed))
+    time.sleep(1.0)
+    h.post("/api/reconcile", {})
+    time.sleep(0.7)
+    check("...so the release does not overwrite it", n2.raw("iso") == 3200,
+          "iso=%s" % n2.raw("iso"))
+    h.post("/api/settings", {"iso": want_iso})
+    check("the fleet is left matched", wait_for(
+        lambda: n2.raw("iso") == want_iso and h.node("cam1").raw("iso")
+        == want_iso, 10.0), "cam1=%s cam2=%s"
+        % (h.node("cam1").raw("iso"), n2.raw("iso")))
+
+
+# ===========================================================================
 def suite(opts=None):
     h = Harness()
     try:
@@ -1707,12 +2340,16 @@ def suite(opts=None):
         # outstanding divergence and no pending reconnect tell, both of which
         # legitimately force an exposure pass. It restores what it changed.
         for name, fn in (("reconcile", t_reconcile),
+                         ("origin", t_origin), ("timeout", t_timeout),
+                         ("booleans", t_booleans), ("deferred", t_deferred),
+                         ("zip", t_zip), ("overflow", t_overflow),
+                         ("framing", t_framing),
                          ("bodies", t_bodies), ("inputs", t_inputs),
                          ("clock", t_clock), ("drain", t_drain),
                          ("ingest", t_ingest_report),
                          ("nonfinite", t_nonfinite), ("busy", t_busy),
                          ("static", t_static), ("latch", t_latch),
-                         ("misc", t_misc)):
+                         ("misc", t_misc), ("offline", t_offline_view)):
             try:
                 fn(h)
             except Exception as e:                             # noqa: BLE001

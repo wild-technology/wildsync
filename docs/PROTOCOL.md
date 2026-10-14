@@ -1209,13 +1209,18 @@ until measured, so intrinsics come entirely from a checkerboard - no priors.
   with no prior, sub-pixel RMS (rig/tests/rigcal_selftest.py, 16 checks).
 - `POST /api/rigcal/stereo/save` - writes ~/rig/stereo_calibration.json;
   vslam.load_stereo_calibration() freezes it into the stereo engine
-  (baseline_calibrated=true) from the next run.
+  (baseline_calibrated=true) from the next run. A solve whose ok is false is
+  refused unless the body carries force:true, and the file it replaces is kept
+  as stereo_calibration.json.prev.
 - `POST /api/rigcal/imu {target: cam1|cam2|both, seconds}` - still-window
-  sampling (refused if the rig moved: gyro/accel variance gates) recording
-  gyro bias, accel norm and the mounting attitude reference per camera IMU
-  (cam1 YB, cam2 Olive); "both" samples simultaneously and records the
-  cam1<->cam2 relative-orientation seed for the fusion filter. Saved to
-  ~/rig/imu_calibration.json. First live calibration recorded 2026-08-27
+  sampling (refused if the rig moved: gyro/accel variance gates, which also
+  reject a steady tilt, more than 1 deg across the window, and a large steady
+  rate, mean over 4 dps) recording gyro bias, accel norm and the mounting
+  attitude reference per camera IMU (cam1 YB, cam2 Olive); "both" samples
+  simultaneously and records the cam1<->cam2 relative-orientation seed for the
+  fusion filter. Saved to ~/rig/imu_calibration.json; each cam entry carries
+  tilt_drift_deg, the largest pitch or roll change from the first third of the
+  window to the last. First live calibration recorded 2026-08-27
   (cam1 gyro bias [-1.06,-1.27,0] dps; the Olive AHRS stream reports
   zeroed gyro at rest - on-device bias correction, noted for fusion).
 
@@ -1396,21 +1401,30 @@ are repeatable. `--write-sums` records a run that was never ingested (a run
 recorded before v1.1.0 gets hashes of its files as they are at that moment, not
 as they were recorded).
 
+**Other exit statuses.** `drain.py` exits 1 on any per-shot error (2 for
+`--dest` or `--limit` while rigd runs). `ingest.py` exits 1 on a refused or
+ambiguous series, conflicts, a hash mismatch, or files on the card with nothing
+matched, and 0 otherwise; `--verify` keeps 0/1/2 as above.
+
 Runs without any of this — no hash columns, no `SHA256SUMS` — load everywhere
 as before; ingest merges an older manifest's rows with empty hash cells.
 
-## Additions 2026-10-15 — the Subsonus over Ethernet
+## Additions 2026-10-15 — the GNSS Compass / Subsonus over Ethernet
 
 A second nav source, `rig/nav_subsonus.py`, with the same consumer contract:
-the Subsonus's ANPP stream over TCP (port 16718 by default; System State
-packet, ID 20, 20 Hz as the unit ships) read into the same `NavReader` state
-as the iKonvert path, so `snapshot()`, `fix_at()`, `flight_row()`, the time
-authority, `/api/nav`, `/api/diag` and the flight log are unchanged.
-Not yet used in the field.
+the ANPP stream of the Advanced Navigation GNSS Compass (the unit on the rig,
+static at 192.168.1.60) or of a Subsonus, over TCP (port 16718 by default;
+System State packet, ID 20; 20 Hz as a Subsonus ships) read into the same
+`NavReader` state as the iKonvert path, so `snapshot()`, `fix_at()`,
+`flight_row()`, the time authority, `/api/nav`, `/api/diag` and the flight log
+are unchanged. The GNSS Compass sends the 100-byte System State and the
+Subsonus the 116-byte one; both are decoded, and the 100-byte layout was
+confirmed live on the GNSS Compass on 2026-10-15. Not yet used in the field.
 
 - **Selection.** `WILDSYNC_NAV`, else `"source"` in `~/rig/nav.json`, else
-  the iKonvert. `anpp://<host>[:<port>]` (or `subsonus://`) selects the
-  Subsonus; any other value is a serial device path for the iKonvert.
+  the iKonvert. `anpp://<host>[:<port>]` (or `subsonus://`) selects this
+  source, whichever unit answers; any other value is a serial device path for
+  the iKonvert.
 - **What each packet becomes.** The N2K-shaped samples nav.py already
   decodes, emitted only when the unit says the value is real: 129025 and
   129029 (lat/lon with a GNSS fix of 2D or better; `method_str` maps the
@@ -1420,20 +1434,151 @@ Not yet used in the field.
   127250 (true heading, no variation — `heading_mag_xplore` stays empty),
   127257 (attitude), 129026 (COG/SOG from the NED velocity). No depth. The
   stand-in source address is 254.
-- **Layout guard.** The published System State field table is inconsistent;
-  the reader uses the only layout that sums to the stated 116 bytes
-  (statuses u32, unix time at 8, latitude at 16) and sanity-checks every
-  packet. A packet whose latitude/longitude is not finite or in range is
-  counted in `health()["suspect_layout"]` and yields no position. The
-  100-byte layout of the other Advanced Navigation units is decoded as well.
+- **Layout guard.** The Subsonus's published 116-byte System State field table
+  is inconsistent; the reader uses the only layout that sums to the stated 116
+  bytes (statuses u32, unix time at 8, latitude at 16), which is not confirmed
+  on a unit, and sanity-checks every packet it decodes. A packet whose
+  latitude/longitude is not finite or in range is counted in
+  `health()["suspect_layout"]` and yields no position.
 - **Raw log.** One line per packet, `!ANPP,<id>,<hex data>`, through the
   ordinary raw hook into `nmea_raw.log`; `NavReader.feed_line()` routes such
-  a line back through the packet decoder, so `navlog.replay()` reproduces a
-  Subsonus run.
+  a line back through the packet decoder, so `navlog.replay()` reproduces an
+  Ethernet nav run.
 - **`health()`** adds `transport: "anpp-tcp"`, `host`, `tcp_port`,
   `packets`, `bytes_skipped`, `packet_ids`, `suspect_layout`, `fix`,
-  `utc_init`, `heading_init`, `layout`. `port` is the `anpp://` URL and
-  `baud` is 0. The `nav_gateway_down` anomaly names the Subsonus and
+  `utc_init`, `heading_init`, `layout` (`common-100`, the GNSS Compass's, or
+  `subsonus-116`). `port` is the `anpp://` URL and `baud` is 0. The
+  `nav_gateway_down` anomaly's text says "Subsonus" for either unit and
   distinguishes a dark socket from a connected-but-silent port.
-- Nothing is written to the unit. Regression: `audit_subsonus.py` (S1–S6)
+- The reader writes nothing to the unit. Regression: `audit_subsonus.py` (S1–S6)
   in the gate.
+
+## Additions 2026-10-15 — audit fixes
+
+Contract changes only. Behaviour fixes that leave the documented shape alone
+are in `CHANGELOG.md`.
+
+### Time model
+
+- **EXIF without sub-seconds.** When the body wrote no SubSecTimeOriginal, the
+  EXIF offset's bar, and so `time_err_ms` on an `exif` row, is 1.5 s plus the
+  fleet clock error. That is looser than a soft edge (250 ms), so the soft edge
+  wins and the frame is stamped `gpio_edge_soft`.
+- **EXIF offset lifetime.** The EXIF offset is re-measured at every run start
+  and cleared at run start. When that calibration fails the camera has no EXIF
+  offset for the run and frames fall back to edge, then command.
+- **Presentation boundary.** The ingest XMP date fields (`CreateDate`,
+  `DateTimeOriginal`, `DateCreated`) are in the presentation timebase (host
+  epoch plus `run.json` `time.gps_offset_s`). `wildsync:capture_epoch` remains
+  the HOST epoch, as in `index.jsonl` and the manifest epoch column.
+  `wildsync:gps_offset_s` is present only when a correction was applied.
+
+### rigd
+
+- **Boolean body fields.** `/api/run/start` (`auto_capture`), `/api/strobe`
+  (`enabled`), `/api/camera/enabled` (`enabled`) and `/api/node/format`
+  (`quick`) accept only JSON `true`/`false` or `0`/`1`. Any other value,
+  including a truthy string, is refused: `/api/run/start` returns `ok:false`
+  with an error naming the field, `/api/strobe` returns `ok:false`, and the
+  other two answer 400 naming the field.
+- **Deferred exposure.** `POST /api/settings` (and `SettingsManager.update`)
+  may add an optional `deferred` array of camera names whose exposure apply
+  could not be delivered because the body was held (drain, transfer mode,
+  degraded status). The skipped exposure fields are owed per node and written
+  from `desired` on the first reconcile pass that can reach it; release still
+  does not force the whole exposure vector. A deliberate `POST /api/exposure`
+  on that node cancels the owed field. A format/WB-only apply owes nothing.
+- **Origin check.** All POST endpoints refuse (403, `{ok:false,error}`) a
+  request whose `Origin` header is present and is `null` or differs from the
+  `Host` header. Requests without an `Origin` header (curl, scripts, the test
+  tools) are unaffected. A reverse proxy that rewrites `Host` but not `Origin`
+  would be refused.
+- **Body framing.** POST bodies must be framed with `Content-Length`. A
+  `Transfer-Encoding` header or a negative `Content-Length` is a 400 (the
+  connection is closed); a missing `Content-Length` still means an empty body.
+- **`GET /api/fleet`.** A node whose state is OFFLINE always reports
+  `connected:false`. Its last-seen battery, id and model remain and
+  `status.stale` is true.
+- **`GET /api/run/zip`.** 400 `{ok:false,error}` when the run is still
+  recording or the export would leave less than the 5000 MB runs-volume
+  low-water mark free; 404 only for a missing run.
+- **Desired-vector bounds.** `colortemp` 2500-9900, `wb_mode` 0-65535,
+  `rawtype` 0-6 and `program` 1-0x804F. Anything else is rejected with a
+  reason; a persisted out-of-range value falls back to the default on load.
+- **`unpulled.jsonl`.** Besides 'abandoned after N pull attempts', a worker
+  writes a line with reason 'run stopped with frame still pending after N
+  attempts' for each frame still pending when the run stops. `cmd_epoch` is the
+  claimed command when one was held.
+
+### piagent
+
+- **Body framing.** A missing or zero `Content-Length` is an empty body (all
+  defaults). A `Transfer-Encoding` header, a non-numeric or negative
+  `Content-Length`, or a body over 1 MiB is a 400 and the connection is closed.
+- **`/gpio/fire`.** A `strobe_pulse_ms` that is not a number (when
+  `strobe_at_epoch` is set) is refused with 400 'strobe_pulse_ms is not a
+  number' before any line is driven. `null` and 0 still mean the 5 ms default
+  and the width is clamped 1..100 ms.
+
+### ilxctl
+
+- **Origin check.** For every non-GET/HEAD request, if an `Origin` header is
+  present it must match `Host`, else 403
+  `{ok:false,error:"cross-origin request refused"}`. Requests without `Origin`
+  (rigd, drain, curl) are unaffected. This does not stop DNS rebinding.
+- **`/api/card/pull`, `/api/card/delete`.** `contentId` (0..4294967295) is
+  required, and `fileId` (0..65535) is required on pull. A missing,
+  non-integer or out-of-range id is a 400 naming the field, never clamped or
+  defaulted.
+- **`/api/format`, `/api/node/format`.** `quick` is a JSON boolean or 0/1;
+  absent means quick; any other value is a 400.
+- **`/liveview.jpg`.** After a failed grab the node may re-serve its cached
+  frame only if it is under about 1.5 s old (`X-LiveView-Age-Ms` still reports
+  it). Otherwise it answers 503, or 409 `busy:true` when the SDK is held.
+- **`/api/spool/prune`.** Never deletes and never overwrites. A name already
+  present in `<save-dir>-archive` is kept as `NAME~N.EXT`. The response shape
+  is unchanged.
+- **`/api/shots`.** The node answers 500 `{ok:false,error}` for an unreadable
+  directory and `[]` only for an empty or absent one (`dir=raw` before a drain
+  is absent, so `[]`).
+- **`saveDirOk`.** `/api/status` gains `saveDirOk` (bool), present on a
+  connected body in remote control mode: true while the SDK holds the PC-save
+  directory, false when registration failed or the session dropped before the
+  replay completed (frames then stay on the card). The `/api/connect` ok reply
+  gains `"saveDirOk":false` only when registration failed after 3 attempts.
+  rigd does not consume it yet.
+
+### Nav
+
+- **`/api/nav` `depth_below_surface_m`.** A number only for a waterline offset
+  (>= 0). With a keel offset it is null; `depth_m` and `depth_offset_m` still
+  carry the raw values.
+- **GNSS method.** Lat/lon/alt from a 129029 whose method nibble is 0
+  (no_fix), 6 (estimated), 7 (manual) or 8 (simulate) are withheld from the
+  snapshot and `flight_log` (empty cells, `valid=false`) even if 129025 keeps
+  repeating coordinates; sats, hdop and `fix_source` stay. Methods 1-5, 15
+  (N/A) and 129025-only senders are unchanged.
+
+### Calibration and ingest
+
+- **IMU stillness gate.** Stricter; the thresholds and the new `tilt_drift_deg`
+  field are under `POST /api/rigcal/imu` in Rig calibration.
+- **Stereo save.** The refusal of a failed solve and the `force:true` override
+  are under `POST /api/rigcal/stereo/save` in Rig calibration. The Calib tab
+  confirms with the verdict text before sending `force:true`.
+- **Pair synchronisation.** Calibration pairs not fired on the GPIO path,
+  measured over the skew budget, or with no skew figure are rejected. The Calib
+  tab pair records carry a `sync` block.
+- **Ingest alignment.** The journalled `exif_offset` also arbitrates between
+  alignments that fit about equally (missing first/last frame, extra card
+  file). With no journal such a tie is refused ('ambiguous: offset', exit 1)
+  instead of matched.
+- **Ingest lone series.** A lone card series that nothing attributes (no
+  per-node `camN` directory, no matching journal offset, no other camera
+  resolved first) is refused as ambiguous, like a tied pair of series.
+- **Exit codes.** `drain.py` and `ingest.py` now exit non-zero on failure; the
+  statuses are under Run provenance, Hashes, Commands.
+
+Needs confirming on hardware: the node-side Origin and framing checks against
+the rig UI and rigd traffic, the idle census and deferred-exposure replay on a
+live pair, and the strobe line idle level at piagent restart with the XR256.

@@ -45,7 +45,7 @@ was the one in use on 2026-08-20.
 | **Rig host** | a Mac (Apple Silicon) or a Jetson Orin NX, wired to the rig switch |
 | Rig switch and PoE | a PoE switch for the nodes. cam1 is on its own 802.3at injector, cam2 on the switch: two nodes firing in sync overran the switch's PoE budget and it dropped a port every time until cam1 was isolated (`docs/FIELD-RUN.md`, Topology; `docs/PI-SETUP.md` §8) |
 | 12 V supply for the camera bodies | 10–18 V DC at the camera connector, at least 40 W momentary (`docs/harness-and-strobe.md` §2) |
-| Navigation | a Subsonus RTK antenna, either on an NMEA 2000 backbone through a Digital Yacht **iKonvert** gateway to the host's USB ([product page](https://digitalyacht.co.uk/product/ikonvert-nmea-2000-to-usb/), [quick start guide](https://digitalyachtamerica.com/download/ikonvert-usb-quick-start-guide-v2_02/?wpdmdl=5667)), or on the rig switch over Ethernet (section 7, not yet used in the field) |
+| Navigation | an Advanced Navigation **GNSS Compass** (a Subsonus is read the same way), either on an NMEA 2000 backbone through a Digital Yacht **iKonvert** gateway to the host's USB ([product page](https://digitalyacht.co.uk/product/ikonvert-nmea-2000-to-usb/), [quick start guide](https://digitalyachtamerica.com/download/ikonvert-usb-quick-start-guide-v2_02/?wpdmdl=5667)), or on the rig switch over Ethernet, static at 192.168.1.60 (section 7.1, not yet used in the field) |
 | Strobe (optional) | an XR256, its trigger interface board and a regulated 24 V supply (`docs/xr256-jetson-trigger.md`) |
 
 ### Network
@@ -125,16 +125,24 @@ and what stops working without it).
 ### 3a. Mac host (launchd)
 
 ```sh
-/opt/homebrew/bin/python3 -m pip install -r requirements.txt   # the interpreter the launchd job runs
 mkdir -p ~/rig
+/opt/homebrew/bin/python3 -m venv ~/rig/venv
+~/rig/venv/bin/python3 -m pip install -r requirements.txt   # the interpreter the launchd job runs
 sed "s|__REPO__|$(pwd)|g; s|__HOME__|$HOME|g" deploy/rigd.launchd.plist \
   > ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
 launchctl bootstrap gui/$(id -u) \
   ~/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist
 ```
 
-The plist runs `/opt/homebrew/bin/python3`; edit `ProgramArguments` if Python is
-somewhere else. The agent is `org.wildtechnology.wildsync.rigd` (restart it with
+Homebrew's Python is externally managed (PEP 668), so `pip install` into it
+stops with `externally-managed-environment` and installs nothing; the packages
+go in the venv instead. The plist runs `~/rig/venv/bin/python3` (the `sed`
+fills in `__HOME__`), which is a link to the Homebrew interpreter; to use a
+different Python, create the venv with that one. An agent installed before this
+needs its plist regenerated with the `sed` above and a `launchctl bootout`,
+then `bootstrap`, to pick the venv up.
+
+The agent is `org.wildtechnology.wildsync.rigd` (restart it with
 `launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd`, stop and
 remove it with `launchctl bootout gui/$(id -u)/org.wildtechnology.wildsync.rigd`),
 it restarts if `rigd` dies, and its log is `~/rig/rigd-launchd.log`. The UI is at
@@ -199,11 +207,14 @@ deploy/deploy.sh node      cam1    # build ilxctl, udev rules, Olive link, start
 On a Jetson host, run `deploy/deploy.sh jetson` (section 3b) before
 `deploy.sh node`: `node` points a node's chrony at the host only when the host
 is already the rig's chrony server. If a node was deployed first, run `node` for
-it again.
+it again. (`deploy.sh all` already runs `jetson` first.)
 
-Repeat for `cam2` (and `cam3` if fitted). `deploy/deploy.sh all` runs `node` for
-every reachable node and then `jetson`; use it from a Jetson host only, since
-`jetson` installs with apt and a systemd unit.
+Repeat for `cam2` (and `cam3` if fitted). `deploy/deploy.sh all` runs `jetson`
+and then `node` for every reachable node, so the host is already the chrony
+server when each node is pointed at it; use it from a Jetson host only, since
+`jetson` installs with apt and a systemd unit. It tries every node even if one
+fails, and exits nonzero (naming the failed nodes) if any step failed. An
+unreachable node is skipped and is not a failure.
 
 - `trust` pushes the host's ssh key; every other step assumes passwordless ssh.
 - `provision` sends the SDK (`lib-linux/` and `include/`), the Makefile and
@@ -300,8 +311,8 @@ Details, configuration values and the fusion roadmap: `docs/olive-imu.md`.
 ## 7. The navigation gateway (iKonvert, RAW mode)
 
 The iKonvert is a Digital Yacht NMEA 2000 to USB gateway. It carries the
-Subsonus's position, heading and GPS time, and the boat's other N2K data such as
-depth, into `rigd`.
+GNSS Compass's position, heading and GPS time, and the boat's other N2K data
+such as depth, into `rigd`.
 
 1. Connect the iKonvert to the NMEA 2000 backbone and its USB to the host. **Its
    processor is powered from the N2K bus, not from USB**: with the bus unpowered
@@ -323,47 +334,63 @@ carries that one position, with depth and heading empty. A mid-line loss of a
 live bus is not filled from it: those rows are empty and `nav_no_fix` is raised
 (`docs/FIELD-RUN.md`, anomalies).
 
-### 7.1 The Subsonus over Ethernet (no iKonvert)
+### 7.1 The GNSS Compass over Ethernet (no iKonvert)
 
-Supported, not yet used in the field. The Subsonus surface unit also speaks
-Advanced Navigation's packet protocol (ANPP) over TCP on ports 16718–16721 and
-streams its System State packet at 20 Hz on them out of the box. `rigd` can
-read that stream instead of the iKonvert (`rig/nav_subsonus.py`); position,
-heading, attitude, COG/SOG and GPS time then arrive without the NMEA 2000 bus.
-Depth and magnetic heading are not in that packet: `depth_from_xplore9` and
-`heading_mag_xplore` stay empty (the true heading is in `/api/nav`).
+Supported, not yet used in the field. The unit on the rig is an Advanced
+Navigation GNSS Compass (its web UI header reads "GNSS COMPASS"); the Subsonus
+surface unit is the other Advanced Navigation unit the same code reads. Both
+speak Advanced Navigation's packet protocol (ANPP) over TCP, port 16718 by
+default (a Subsonus streams on 16718–16721), and send a System State packet
+(ID 20; 20 Hz on a Subsonus out of the box). `rigd` can read that stream
+instead of the iKonvert (`rig/nav_subsonus.py`); position, heading, attitude,
+COG/SOG and GPS time then arrive without the NMEA 2000 bus. The GNSS Compass
+sends the 100-byte System State layout, confirmed on the rig on 2026-10-15;
+the Subsonus sends a 116-byte one, taken from the published reference and not
+confirmed on a unit. Depth and magnetic heading are not in that packet:
+`depth_from_xplore9` and `heading_mag_xplore` stay empty (the true heading is
+in `/api/nav`).
 
-1. Plug the Subsonus's Ethernet into the rig switch. **Out of the box it is a
-   DHCP client**, and the rig network has no DHCP server, so it has no address
-   until one is given. Either give it a static address in its web UI
-   (Configuration → Ethernet Settings; e.g. `192.168.1.60/24`, reached once
-   through a network that does have DHCP), or run a DHCP server on the rig
-   segment. With an address it also answers to its zeroconf name,
-   `an-subsonus-1.local` (or the name set on the unit).
+1. Plug the GNSS Compass's Ethernet into the rig switch. Ours keeps a static
+   address, `192.168.1.60/24` (gateway and DNS `192.168.1.1`); it shipped on
+   `192.168.2.220`, unreachable from the rig subnet, and was re-addressed over
+   ANPP packet 11. If it is ever moved to another subnet, re-address it from
+   any host on its current subnet, either in its web UI (Configuration →
+   Ethernet Settings; login required) or from a script over ANPP packet 11 on
+   TCP 16718. The packet's fields are permanent (u8), mode (u8; bit 0 is DHCP,
+   keep the other bits 0 on write), then IP address, netmask, gateway and DNS
+   (each a big-endian u32), then the three serial-number words echoed from a
+   read. The unit re-addresses itself immediately and sends no acknowledgement.
+   A Subsonus also answers to its zeroconf name, `an-subsonus-1.local` (or the
+   name set on the unit).
 2. Tell `rigd` where it is — either, on the host:
 
    ```sh
    echo '{"source": "anpp://192.168.1.60"}' > ~/rig/nav.json
    ```
 
-   or `WILDSYNC_NAV=anpp://an-subsonus-1.local` in the service environment —
+   or `WILDSYNC_NAV=anpp://192.168.1.60` in the service environment —
    and restart `rigd`. `WILDSYNC_NAV` wins over `nav.json`; with neither,
    `rigd` looks for the iKonvert as before. The port defaults to 16718.
 3. Verify: `python3 rig/nav_subsonus.py anpp://<address>` prints a line a
-   second with the packet count, fix type (`rtk_fixed` is the goal), UTC
-   status, position and heading. `suspect` must stay 0: the packet layout was
-   taken from the published ANPP reference, whose field table is
-   inconsistent, and a non-zero count means this firmware's layout differs
-   (the reader then records no position rather than a wrong one). In the UI
-   the header reads `nav fix` and `/api/diag`'s `nav` block shows
-   `transport: anpp-tcp` with `packets` climbing.
+   second with the packet count, fix type (`3d` or better on the GNSS Compass;
+   `rtk_fixed` only when corrections reach it, which needs an NTRIP source
+   reachable from the unit), UTC status, position and heading. `suspect` must
+   stay 0: a non-zero count means the packet layout is not the one the reader
+   expects (it then records no position rather than a wrong one). The GNSS
+   Compass's 100-byte layout was confirmed on the rig; the Subsonus's 116-byte
+   layout was taken from the published ANPP reference, whose field table is
+   inconsistent, and has not been confirmed on a unit. In the UI the header
+   reads `nav fix` and `/api/diag`'s `nav` block shows `transport: anpp-tcp`
+   with `packets` climbing and `layout: common-100` on a GNSS Compass
+   (`subsonus-116` on a Subsonus).
 4. If the socket connects but `packets` stays 0, the unit is not streaming on
    that port: enable the System State packet (ID 20) on the ANPP port in its
    web UI.
 
 Every packet is written to the run's `nmea_raw.log` as an `!ANPP,<id>,<hex>`
-line, so `navlog.replay()` reproduces a Subsonus run as it does an iKonvert
-run. Nothing is ever written to the unit.
+line, so `navlog.replay()` reproduces an Ethernet nav run as it does an
+iKonvert run. The reader never writes anything to the unit; re-addressing it
+(step 1) is a separate, deliberate act.
 
 ## 8. The strobe node
 

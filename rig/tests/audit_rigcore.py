@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — rigcore (findings K1-K10).
+"""Audit regression suite — rigcore (findings K1-K17).
 
 K1  NodeMonitor.clock_offset_s()/clock_offset_info() (contract C1): the host
     Mac's clock is not disciplined (187 ms behind NTP, ~60 ppm) while the two
@@ -24,6 +24,13 @@ K4  focus_mode may only ever be 1 (MF). POST /api/focus/mode 2 put the live
 
 K5  reconcile_all must not push into a body a card drain holds in transfer
     mode (suspend_control).
+
+K5b An exposure apply that reaches a body while a drain (or transfer mode, or
+    a busy status) holds it was reported ok and never replayed: the release
+    only drops the blind cache, the 3 s loop never writes exposure, so the
+    pair stayed split behind a green "fleet now on camN's exposure". The
+    skipped fields are now owed and paid, from `desired`, on the first pass
+    that can reach the body - without arming a whole-vector force (K5).
 
 K6  EventLog resolves RIGD_LOG at construction, not at class definition, and
     the journal really does rotate at MAX_BYTES.
@@ -55,10 +62,29 @@ K13 ilxctl answers /api/status with a degraded body (connected + busy, no
     transfer" - so a body that CANNOT shoot was promoted to CAM_CONNECTED and
     the whole settings vector was pushed into it.
 
+K13c The pass's own verification re-read can land in the same busy spell. A
+    degraded body there marked every readable field diverged and raised a
+    bad-severity settings_divergent on two matched bodies; it now leaves the
+    previous verdict alone.
+
 K14 piagent stamps /health's epoch on entry and publishes the handler's
     work_ms. It is published as a diagnostic (work_ms/link_ms) and
     deliberately NOT folded into offset_s or out of rtt_ms - see the comment
     in NodeMonitor._tick.
+
+K15 The "reverted" tell read m.status, which only refreshes on the 2 s poll, so
+    for up to 2 s after ANY settings apply a 3 s loop pass saw the pre-apply
+    value, concluded the body had been reset and re-pushed the whole exposure
+    vector over a deliberate per-camera split (the same hazard, for a body
+    that lagged `desired` because a drain held it, is covered in K5b).
+
+K16 colortemp / wb_mode / rawtype / program had no bounds: a cleared Kelvin box
+    persisted colortemp 0 and was re-pushed every 3 s, and a Movie_* program
+    could enter the fleet vector.
+
+K17 _validate_field let OverflowError escape: json.loads turns 1e999 into inf
+    without parse_constant, so {"iso":1e999} was a 500 from /api/settings and,
+    from a hand-edited desired.json, a rigd that would not start.
 
 Hermetic: temp dirs only, loopback fakes only (soaktest's netguard is
 installed by importing it), monitors are ticked by hand rather than started.
@@ -663,6 +689,141 @@ def k5_suspend_control(opts):
               and b.raw("filetype") == S.get()["filetype"],
               "store=%s filetype=%s"
               % (b.raw("store_dest"), b.raw("filetype")))
+    finally:
+        f.close()
+
+
+def k5b_apply_during_drain(opts):
+    sect("K5b an exposure apply that lands on a held body is paid on release")
+    f = Fleet()
+    try:
+        S, a, b = f.settings, f.node("cam1"), f.node("cam2")
+        mb = f.mon("cam2")
+        f.settle()
+        base = b.raw("iso")
+        want = 800 if base != 800 else 1600
+
+        # 1. The auto-drain after Stop holds cam2; the operator applies a new
+        #    ISO to the fleet in the meantime.
+        mb.suspend_control = True
+        f.tick()
+        t0 = time.time()
+        b.clear_counts()
+        rep = S.update({"iso": want})
+        check("the apply lands on the free body and not on the drained one",
+              a.raw("iso") == want and b.raw("iso") == base
+              and _ilx_calls(b, t0) == 0,
+              "cam1=%s cam2=%s (was %s) ilx calls into cam2=%d"
+              % (a.raw("iso"), b.raw("iso"), base, _ilx_calls(b, t0)))
+        check("the reply says which body has not received it",
+              rep.get("deferred") == ["cam2"], json.dumps(rep))
+
+        # 2. Still held: the 3 s loop must not write into it either.
+        S.reconcile_all(force=False)
+        f.tick()
+        check("the loop does not push into the body while the drain holds it",
+              len(b.pushed()) == 0 and b.raw("iso") == base,
+              "pushes=%s iso=%s" % ([p[1:] for p in b.pushed()][:6],
+                                    b.raw("iso")))
+
+        # 3. The drain lets go. The debt is paid by the ordinary 3 s pass.
+        mb.suspend_control = False
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("the pair is back on the applied ISO after the release",
+              b.raw("iso") == want,
+              "cam2 iso=%s want=%s (the apply was silently lost)"
+              % (b.raw("iso"), want))
+        check("the exposure split clears", f.mon("cam2").convergence.get(
+            "exposure_split") == [] and f.mon("cam2").convergence.get("synced"),
+              json.dumps(f.mon("cam2").convergence))
+        check("the debt is consumed", not getattr(mb, "_exposure_owed", None),
+              repr(getattr(mb, "_exposure_owed", None)))
+
+        # 4. ...and paid ONCE: a deliberate split made afterwards survives.
+        b.drift(iso=3200)
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("a per-camera tweak after the release is not overwritten",
+              b.raw("iso") == 3200, "iso=%s" % b.raw("iso"))
+
+        # 5. A format-only apply while held owes no exposure.
+        _split(f, iso=1250)
+        mb.suspend_control = True
+        f.tick()
+        rep = S.update({"colortemp": 5000})
+        check("a format-only apply defers nothing",
+              not rep.get("deferred"), json.dumps(rep))
+        mb.suspend_control = False
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("and its release does not push exposure",
+              b.raw("iso") == 1250, "iso=%s" % b.raw("iso"))
+        check("the non-exposure field still follows the fleet",
+              b.raw("colortemp") == 5000, str(b.raw("colortemp")))
+
+        # 6. A body left in transfer mode (no drain flag) defers too, and the
+        #    SDK sees no write while it is there.
+        b.label_override = {"controlMode": "transfer"}
+        f.tick()
+        with mb._lock:
+            mb.state = mb.CONNECTED
+        t0 = time.time()
+        b.clear_counts()
+        S.update({"iso": want})
+        check("nothing is written into a transfer-mode session",
+              _ilx_calls(b, t0) == 0, "%d calls" % _ilx_calls(b, t0))
+        b.label_override = {}
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("the apply lands once controlMode is back to remote",
+              b.raw("iso") == want, "iso=%s want=%s" % (b.raw("iso"), want))
+
+        # 6b. So does a body whose last status was degraded (busy, no property
+        #     block): nothing to converge against, so nothing is pushed.
+        with mb._lock:
+            mb.status = _degraded_status()
+            mb.state = mb.CONNECTED
+        t0 = time.time()
+        b.clear_counts()
+        rep = S.update({"iso": 1600})
+        check("a busy-degraded body is skipped and reported as deferred",
+              _ilx_calls(b, t0) == 0 and rep.get("deferred") == ["cam2"],
+              "%d calls, %s" % (_ilx_calls(b, t0), json.dumps(rep)))
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("and receives it once it answers with a property block again",
+              b.raw("iso") == 1600, "iso=%s" % b.raw("iso"))
+
+        # 7. A later apply supersedes the debt (it is paid from `desired`).
+        mb.suspend_control = True
+        f.tick()
+        S.update({"iso": 100})
+        S.update({"iso": 200})
+        mb.suspend_control = False
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("the debt pays the LATEST applied value",
+              b.raw("iso") == 200, "iso=%s" % b.raw("iso"))
+
+        # 8. A deliberate /api/exposure write clears the field's debt.
+        mb.suspend_control = True
+        f.tick()
+        S.update({"iso": want})
+        with mb._lock:
+            owed_before = set(getattr(mb, "_exposure_owed", ()))
+        check("an apply during the drain records the debt",
+              owed_before == {"iso"}, repr(owed_before))
     finally:
         f.close()
 
@@ -1425,6 +1586,246 @@ def k13b_no_reconcile_into_a_busy_body(opts):
         f.close()
 
 
+def k13c_busy_verify_read_is_not_divergence(opts):
+    sect("K13 a busy verify re-read is not a divergence either")
+    f = Fleet()
+    real = rigcore.http_json
+    try:
+        S, b, mb = f.settings, f.node("cam2"), f.mon("cam2")
+        f.settle()
+        check("precondition: cam2 reads synced",
+              mb.convergence.get("synced") is True,
+              json.dumps(mb.convergence))
+
+        # The cached status is healthy; the pass pushes something and its
+        # re-read lands in a busy spell (frame transfer, or its own writes
+        # holding the SDK mutex past ilxctl's 4.5 s bound).
+        busy = {"on": False}
+
+        def stub(url, body=None, timeout=8):
+            if busy["on"] and url.startswith(mb.ilx) \
+                    and url.endswith("/api/status"):
+                return _degraded_status()
+            return real(url, body, timeout)
+        rigcore.http_json = stub
+        mb._exposure_force = True          # a reconnect tell is pending
+        busy["on"] = True
+        strikes = getattr(mb, "_diverge_strikes", 0)
+        s0 = f.seq()
+        S.reconcile_all(force=True, exposure=False)
+        S.reconcile_all(force=True, exposure=False)
+        rigcore.http_json = real
+        conv = mb.convergence
+        check("a degraded verify read leaves the verdict at synced",
+              conv.get("synced") is True and conv.get("diverged") == [],
+              json.dumps(conv))
+        check("it counts no divergence strike and journals no alarm",
+              getattr(mb, "_diverge_strikes", 0) == strikes
+              and not any(e["kind"] == "settings_divergent"
+                          for e in f.evs(s0)),
+              "strikes=%s evs=%s" % (getattr(mb, "_diverge_strikes", 0),
+                                     [(e["kind"], e["msg"][:50])
+                                      for e in f.evs(s0)]))
+        check("the reconnect force flag survives to a pass that can verify",
+              getattr(mb, "_exposure_force", False) is True,
+              repr(getattr(mb, "_exposure_force", None)))
+
+        # The next pass with a healthy read verifies normally.
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("a following healthy pass verifies and keeps synced",
+              mb.convergence.get("synced") is True
+              and not getattr(mb, "_exposure_force", True),
+              json.dumps(mb.convergence))
+
+        # A real divergence is still flagged on healthy reads.
+        b.label_override = {"filetypeValue": 1}
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("a genuinely divergent body is still reported",
+              mb.convergence.get("synced") is False
+              and "filetype" in (mb.convergence.get("diverged") or []),
+              json.dumps(mb.convergence))
+        b.label_override = {}
+    finally:
+        rigcore.http_json = real
+        f.close()
+
+
+# ===========================================================================
+# K15 — a status older than our own write is not a "the body reset" tell
+# ===========================================================================
+def k15_stale_cache_after_apply(opts):
+    sect("K15 a pre-apply cached status does not read as a body reset")
+    f = Fleet()
+    try:
+        S, b, mb = f.settings, f.node("cam2"), f.mon("cam2")
+        f.settle()
+        _split(f)                       # cam2 on iso 3200 / aperture 400
+
+        # The existing K2 checks tick after every update, which refreshes the
+        # cache; the live rig does not: m.status is rewritten by the 2 s poll,
+        # and a 3 s loop pass can land in between.
+        S.update({"colortemp": 5000})
+        b.clear_counts()
+        S.reconcile_all(force=False)
+        check("a loop pass against the pre-apply cache leaves the split alone",
+              b.raw("iso") == 3200 and b.raw("aperture") == 400,
+              "iso=%s aperture=%s (the stale colorTemp read as 'reverted' and "
+              "the whole exposure vector was re-pushed)"
+              % (b.raw("iso"), b.raw("aperture")))
+        check("and writes no exposure at all",
+              not b.pushed("iso", "aperture", "shutter", "expcomp"),
+              "pushes=%s" % [p[1:] for p in b.pushed()][:6])
+        check("the blind-field cache is not dropped by it either",
+              not b.pushed("rawtype"),
+              "%d blind re-pushes" % len(b.pushed("rawtype")))
+        f.tick()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("a pass on the refreshed cache still leaves it alone",
+              b.raw("iso") == 3200 and b.raw("aperture") == 400,
+              "iso=%s aperture=%s" % (b.raw("iso"), b.raw("aperture")))
+
+        # The real tell must keep working: a readable non-exposure field that
+        # reverted AFTER our write, seen in a poll that postdates it.
+        b.drift(colortemp=5600)
+        f.tick()
+        b.clear_counts()
+        S.reconcile_all(force=False)
+        f.tick()
+        check("a genuine revert (seen in a fresh poll) re-pushes exposure",
+              b.raw("iso") == S.get()["iso"],
+              "iso=%s want=%s" % (b.raw("iso"), S.get()["iso"]))
+        check("and drops the blind-field cache",
+              len(b.pushed("rawtype")) >= 1,
+              "%d blind re-pushes" % len(b.pushed("rawtype")))
+    finally:
+        f.close()
+
+
+# ===========================================================================
+# K16 — white balance / RAW type / program have bounds
+# ===========================================================================
+def k16_wb_raw_program_bounds(opts):
+    sect("K16 colortemp, wb_mode, rawtype and program are range-checked")
+    f = Fleet()
+    try:
+        S = f.settings
+        def _disk():
+            if not os.path.exists(rigcore.DESIRED_PATH):
+                return ""
+            with open(rigcore.DESIRED_PATH) as fh:
+                return fh.read()
+        disk0 = _disk()
+        before = dict(S.get())
+        bad = [("colortemp", 0), ("colortemp", -5), ("colortemp", 10 ** 12),
+               ("colortemp", 100), ("program", 0x8050), ("program", 0),
+               ("rawtype", 99), ("rawtype", -1), ("wb_mode", -1),
+               ("wb_mode", 1 << 20)]
+        for field, v in bad:
+            rep = S.update({field: v})
+            check("%s=%r is refused" % (field, v),
+                  field in rep["rejected"] and not rep["applied"],
+                  json.dumps(rep))
+        check("the desired vector is untouched by the refusals",
+              S.get() == before,
+              json.dumps({k: (before[k], S.get()[k]) for k in before
+                          if S.get()[k] != before[k]}))
+        check("and desired.json is not rewritten with them", _disk() == disk0,
+              "desired.json changed")
+        # What the UI sends for an emptied Kelvin box.
+        rep = S.update({"colortemp": int("0")})
+        check("a cleared Kelvin box (+'' -> 0) cannot reach the fleet",
+              "colortemp" in rep["rejected"], json.dumps(rep))
+        for field, v in (("colortemp", 5000), ("colortemp", 2500),
+                         ("colortemp", 9900), ("wb_mode", 0),
+                         ("wb_mode", 256), ("rawtype", 0), ("rawtype", 5),
+                         ("program", 1)):
+            rep = S.update({field: v})
+            check("%s=%r is still accepted" % (field, v),
+                  rep["applied"].get(field) == v and not rep["rejected"],
+                  json.dumps(rep))
+        rep = S.preview({"colortemp": 0}, node="cam1")
+        check("the preview path shares the bound",
+              "colortemp" in (rep.get("rejected") or {}), json.dumps(rep))
+    finally:
+        f.close()
+
+    # A desired.json written before the bound existed heals on load.
+    f = Fleet(desired_json=json.dumps({"colortemp": 0, "program": 0x8050,
+                                       "iso": 800}), make_settings=False)
+    try:
+        S = rigcore.SettingsManager(f.monitors, f.events)
+        g = S.get()
+        check("a persisted colortemp 0 and a Movie_* program fall back to the "
+              "defaults on load",
+              g["colortemp"] == rigcore.DEFAULT_DESIRED["colortemp"]
+              and g["program"] == rigcore.DEFAULT_DESIRED["program"],
+              "colortemp=%s program=%s" % (g["colortemp"], g["program"]))
+        check("they are reported as dropped", all(
+            k in S._load_dropped for k in ("colortemp", "program")),
+              json.dumps(S._load_dropped))
+        check("the rest of the saved vector still loads", g["iso"] == 800,
+              str(g["iso"]))
+    finally:
+        f.close()
+
+
+# ===========================================================================
+# K17 — a non-finite number is a rejection, not an exception
+# ===========================================================================
+def k17_nonfinite_numbers(opts):
+    sect("K17 1e999 is refused by _validate_field, update and preview")
+    f = Fleet()
+    try:
+        S = f.settings
+        huge = json.loads('{"v": 1e999}')["v"]
+        check("precondition: json.loads turns 1e999 into inf without "
+              "parse_constant", huge == float("inf"), repr(huge))
+        for field in ("iso", "shutter", "expcomp", "colortemp"):
+            for v in (float("inf"), float("-inf"), float("nan"), huge,
+                      -huge):
+                got, err = _call(S._validate_field, field, v)
+                check("_validate_field(%s, %r) returns a refusal, never "
+                      "raises" % (field, v),
+                      err is None and got[0] is None
+                      and "not a number" in str(got[1]),
+                      "%s / %r" % (err, got))
+        rep, err = _call(S.update, {"iso": huge})
+        check("update({'iso': 1e999}) rejects it and applies nothing",
+              err is None and "iso" in rep["rejected"] and not rep["applied"],
+              "%s / %s" % (err, json.dumps(rep)))
+        rep, err = _call(S.preview, {"iso": huge}, node="cam1")
+        check("preview({'iso': 1e999}) rejects it",
+              err is None and "iso" in (rep.get("rejected") or {}),
+              "%s / %s" % (err, json.dumps(rep)))
+        check("the desired ISO is untouched",
+              S.get()["iso"] == rigcore.DEFAULT_DESIRED["iso"],
+              str(S.get()["iso"]))
+    finally:
+        f.close()
+
+    # A hand-edited desired.json holding 1e999 used to raise out of
+    # SettingsManager.__init__ - rigd would not start.
+    f = Fleet(desired_json='{"iso": 1e999, "aperture": 900}',
+              make_settings=False)
+    try:
+        S, err = _call(rigcore.SettingsManager, f.monitors, f.events)
+        check("a desired.json holding 1e999 still loads",
+              err is None, str(err))
+        if S is not None:
+            check("the bad field falls back and the rest is kept",
+                  S.get()["iso"] == rigcore.DEFAULT_DESIRED["iso"]
+                  and S.get()["aperture"] == 900,
+                  "iso=%s aperture=%s" % (S.get()["iso"],
+                                          S.get()["aperture"]))
+    finally:
+        f.close()
+
+
 # ===========================================================================
 # K14 — piagent's handler time is published, not folded into the offset
 # ===========================================================================
@@ -1501,6 +1902,7 @@ SUITE = [
     ("K3 format readback", k3_format_readback),
     ("K4 focus policy", k4_focus_mode_policy),
     ("K5 suspend_control", k5_suspend_control),
+    ("K5 apply during drain", k5b_apply_during_drain),
     ("K6 event log", k6_eventlog),
     ("K7 run ids", k7_run_ids),
     ("K8 desired.json", k8_desired_json),
@@ -1511,7 +1913,11 @@ SUITE = [
     ("K12 preview release", k12_preview_release_reconverges),
     ("K13 busy status", k13_busy_status_is_not_connected),
     ("K13 busy reconcile", k13b_no_reconcile_into_a_busy_body),
+    ("K13 busy verify read", k13c_busy_verify_read_is_not_divergence),
     ("K14 clock work_ms", k14_clock_work_ms),
+    ("K15 stale cache", k15_stale_cache_after_apply),
+    ("K16 setting bounds", k16_wb_raw_program_bounds),
+    ("K17 non-finite", k17_nonfinite_numbers),
 ]
 
 

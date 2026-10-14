@@ -5,9 +5,13 @@
 # distribution's own apt packages (listed per section), whose version is
 # whatever Ubuntu ships for that release (Jetson: JetPack 6 / Ubuntu 22.04;
 # camera nodes: Ubuntu 24.04). On a macOS or other development host, install
-# the pip set with
+# the pip set into a venv with
 #
-#     python3 -m pip install -r requirements.txt
+#     python3 -m venv ~/rig/venv && ~/rig/venv/bin/python3 -m pip install -r requirements.txt
+#
+# (Homebrew's Python is externally managed, PEP 668, and refuses a global pip
+# install; docs/INSTALL.md section 3a is the Mac host procedure, and its launchd
+# agent runs that venv's interpreter.)
 #
 # Policy: docs/PROTOCOL.md ("Deliverables & boundaries") specifies the Python
 # standard library only for the services, with pyserial the one permitted

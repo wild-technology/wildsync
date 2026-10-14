@@ -92,7 +92,14 @@ std::string dirFor(const std::string& which) {
     return which == "raw" ? g_saveDir + "-raw" : g_saveDir;
 }
 
-std::string shotsJson(const std::string& dir) {
+// false = the directory could not be read (err says why). An unreadable
+// directory is NOT an empty one: run.py takes the run-start listing as the
+// baseline of frames to ignore, so a failed read answered as `[]` made every
+// frame already in the spool look new, get pulled as survey data and deleted
+// from the node (PROTOCOL.md: a failed listing and an empty spool differ).
+// ENOENT stays `[]` - the raw dir does not exist until a card drain starts,
+// and a missing spool really holds nothing.
+bool shotsJson(const std::string& dir, std::string& out, std::string& err) {
     std::vector<std::pair<std::string, long long>> files;
     if (DIR* d = ::opendir(dir.c_str())) {
         while (const dirent* e = ::readdir(d)) {
@@ -103,15 +110,19 @@ std::string shotsJson(const std::string& dir) {
             files.emplace_back(n, static_cast<long long>(st.st_size));
         }
         ::closedir(d);
+    } else if (errno != ENOENT) {
+        err = std::strerror(errno);
+        return false;
     }
     std::sort(files.begin(), files.end());
-    std::string out = "[";
+    out = "[";
     for (std::size_t i = 0; i < files.size(); ++i) {
         if (i) out += ',';
         out += "{\"name\":\"" + files[i].first +
                "\",\"size\":" + std::to_string(files[i].second) + "}";
     }
-    return out + "]";
+    out += "]";
+    return true;
 }
 
 // Minimal JSON scalar extraction. The UI only ever sends flat objects of
@@ -186,6 +197,25 @@ bool jsonIntStrict(const std::string& body, const std::string& key, long long& o
         return false;
     }
     out = static_cast<long long>(v);
+    return true;
+}
+
+// A card content/file id for the destructive card endpoints: present, an
+// integer, and inside [0, maxId] - REJECTED otherwise, never clamped. jsonInt
+// clamps both ways, so an absent or garbage id came back as 0 and a too-large
+// one as its ceiling; card/delete then removed content 0 on the card (and
+// card/pull fetched it) from a body that never named an id, and a ceiling one
+// past CrInt32u max wrapped to 0 in the cast. An explicit 0 stays valid: the
+// drain sends whatever /api/card/list reports.
+bool jsonIdStrict(const std::string& body, const char* key, long long maxId,
+                  long long& out, std::string& why) {
+    long long v = 0;
+    if (!jsonIntStrict(body, key, v, why)) return false;
+    if (v < 0 || v > maxId) {
+        why = "out of range 0.." + std::to_string(maxId) + ": " + std::to_string(v);
+        return false;
+    }
+    out = v;
     return true;
 }
 
@@ -290,6 +320,22 @@ bool numFieldOk(const httplib::Request& req, httplib::Response& res, const char*
     std::string why;
     if (jsonIntStrict(req.body, key, v, why)) return true;
     fail(res, std::string("bad \"") + key + "\": " + why);
+    return false;
+}
+
+// numFieldOk's sibling for the fields that are NOT integers (intervalSec) or
+// that the page may send fractional (counts, delays; jsonInt truncates them).
+// Absent keeps the default; present must be a finite number. Without it
+// jsonNum swallowed the parse error into the default, so "ms":null became a
+// 1 s Release-Down hold and "intervalSec":"abc" started an unlimited 1 Hz
+// host intervalometer - the X3 failure on endpoints X3 did not cover.
+bool numFieldFiniteOk(const httplib::Request& req, httplib::Response& res, const char* key) {
+    std::string sv;
+    if (!jsonFind(req.body, key, sv)) return true;    // absent: default applies
+    char* end = nullptr;
+    const double v = std::strtod(sv.c_str(), &end);
+    if (end != sv.c_str() && end != nullptr && *end == '\0' && std::isfinite(v)) return true;
+    fail(res, std::string("bad \"") + key + "\": not a number: \"" + sv + "\"");
     return false;
 }
 
@@ -403,13 +449,13 @@ int main(int argc, char** argv) {
         return cams.empty() ? 1 : 0;
     }
 
-    auto doConnect = [&](std::string& err) {
-        const auto cams = g_cam.enumerate(3);
-        if (cams.empty()) {
-            err = "no camera found - check USB, that the camera is on, and that "
-                  "USB Connection Mode is PC Remote";
-            return false;
-        }
+    // Which enumerated body this instance owns. One rule for every path that
+    // connects: doConnect and the transfer-mode reconnect in /api/card/mode.
+    // The latter had its own loop that ignored --camera and the ILX-LR1
+    // preference, so on a multi-body host a drain's switch to transfer mode
+    // dropped the claimed body and reclaimed whichever one the SDK listed
+    // first. Returns the index, or -1 with err set.
+    auto pickCamera = [&](const std::vector<CameraInfo>& cams, std::string& err) -> int {
         // With two bodies on the bench, "the first one" is not good enough: each
         // instance has to claim a specific camera and keep claiming the same one
         // across restarts. --match wins, then --camera, then prefer an ILX-LR1.
@@ -426,13 +472,13 @@ int main(int argc, char** argv) {
         if (pick < 0 && !camMatch.empty()) {
             err = "no camera matching '" + camMatch + "' among " +
                   std::to_string(cams.size()) + " found";
-            return false;
+            return -1;
         }
         if (pick < 0 && camIndex >= 0) {
             if (camIndex >= static_cast<int>(cams.size())) {
                 err = "--camera " + std::to_string(camIndex) + " but only " +
                       std::to_string(cams.size()) + " camera(s) found";
-                return false;
+                return -1;
             }
             pick = camIndex;
         }
@@ -442,18 +488,83 @@ int main(int argc, char** argv) {
                 if (cams[i].model.find("ILX-LR1") != std::string::npos)
                     pick = static_cast<int>(i);
         }
+        return pick;
+    };
+
+    auto doConnect = [&](std::string& err) {
+        const auto cams = g_cam.enumerate(3);
+        if (cams.empty()) {
+            err = "no camera found - check USB, that the camera is on, and that "
+                  "USB Connection Mode is PC Remote";
+            return false;
+        }
+        const int pick = pickCamera(cams, err);
+        if (pick < 0) return false;
         g_cam.log("Claiming [" + std::to_string(pick) + "] " + cams[pick].model +
                   " " + cams[pick].id);
         if (!g_cam.connect(pick, err)) return false;
         // Always give the SDK somewhere to put frames, in case the camera is
         // set to send them to the host rather than the card.
+        // A failed registration used to be logged once and the connect still
+        // answered ok, with nothing to retry it: the rig then shot normally
+        // and transferred nothing (the spool pull is the rig's only frame
+        // path). Retry briefly - a transient SDK refusal clears - and if it
+        // still fails say so in the log and in the connect reply
+        // (saveDirOk:false); Camera keeps the wanted directory, so the
+        // replay on the next reconnect tries again. Still returns true: a
+        // connected body must not become a connect-failure loop.
         std::string e2;
-        if (!g_cam.setSaveDir(saveDir, e2)) g_cam.log("SetSaveInfo: " + e2);
-        else g_cam.log("Frames sent to the PC will be saved in " + saveDir);
+        bool saved = false;
+        for (int attempt = 1; attempt <= 3 && !saved; ++attempt) {
+            saved = g_cam.setSaveDir(saveDir, e2);
+            if (saved) break;
+            g_cam.log("SetSaveInfo (attempt " + std::to_string(attempt) + "/3): " + e2);
+            if (attempt < 3) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (saved) g_cam.log("Frames sent to the PC will be saved in " + saveDir);
+        else g_cam.log("Save directory not registered - frames will stay on the camera card");
         return true;
     };
 
+    // The model, plus saveDirOk:false when the connect succeeded without a
+    // registered PC-save directory (see doConnect).
+    auto connectedBody = [] {
+        return "\"model\":\"" + g_cam.modelName() + "\"" +
+               (g_cam.saveDirOk() ? std::string() : std::string(",\"saveDirOk\":false"));
+    };
+
     // ----- routes ----------------------------------------------------------
+    // A browser on the rig LAN can be made to POST here from any web page: a
+    // text/plain body is CORS-"simple", so it goes out with no preflight, and
+    // the confirm tokens in the body (format, power, card/delete, prune) are
+    // plain text the page can write. A browser always labels such a request
+    // with Origin; curl, urllib, rigd, the drain and the fakes never send one,
+    // and this daemon's own page is same-origin (Origin == Host). So a state-
+    // changing request whose Origin is not this Host - or is the literal
+    // "null" - is refused, and one with no Origin passes unchanged. Not a
+    // Content-Type rule: the documented `curl -d` workflow sends urlencoded.
+    // A DNS-rebound page has Origin == Host and is not stopped by this.
+    g_srv.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (req.method == "GET" || req.method == "HEAD" || !req.has_header("Origin"))
+            return httplib::Server::HandlerResponse::Unhandled;
+        std::string origin = req.get_header_value("Origin");
+        const std::size_t scheme = origin.find("://");
+        if (scheme != std::string::npos) origin = origin.substr(scheme + 3);
+        const std::size_t slash = origin.find('/');
+        if (slash != std::string::npos) origin.resize(slash);
+        std::string host = req.get_header_value("Host");
+        const auto lower = [](std::string& v) {
+            for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        };
+        lower(origin);
+        lower(host);
+        if (scheme != std::string::npos && !host.empty() && origin == host)
+            return httplib::Server::HandlerResponse::Unhandled;
+        g_cam.log("REFUSED cross-origin " + req.method + " " + req.path);
+        fail(res, "cross-origin request refused", 403);
+        return httplib::Server::HandlerResponse::Handled;
+    });
+
     g_srv.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(kIndexHtml, "text/html; charset=utf-8");
     });
@@ -485,7 +596,7 @@ int main(int argc, char** argv) {
         ConnectGate gate{g_connectBusy};
         std::string err;
         if (doConnect(err)) {
-            ok(res, "\"model\":\"" + g_cam.modelName() + "\"");
+            ok(res, connectedBody());
         } else if (err.find("connect in progress") != std::string::npos) {
             pendingConnect(res);               // lost a race with the SDK side
         } else if (err == "already connected" && g_cam.isConnected()) {
@@ -527,11 +638,14 @@ int main(int argc, char** argv) {
     });
 
     g_srv.Post("/api/shutter/hold", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldFiniteOk(req, res, "ms")) return;         // X3
         const int ms = static_cast<int>(jsonInt(req.body, "ms", 1000, 0, 60000));
         guarded(res, [&](std::string& e) { return g_cam.holdShutter(ms, e); });
     });
 
     g_srv.Post("/api/interval/start", [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldFiniteOk(req, res, "intervalSec") ||
+            !numFieldFiniteOk(req, res, "count")) return;      // X3
         const double sec = jsonNum(req.body, "intervalSec", 1.0);
         const int count = static_cast<int>(jsonInt(req.body, "count", 0, 0, 1000000));
         const bool af = jsonBool(req.body, "af", false);
@@ -547,6 +661,9 @@ int main(int argc, char** argv) {
     // The camera's own Interval REC ----------------------------------------
     g_srv.Post("/api/camera-interval/config",
                [](const httplib::Request& req, httplib::Response& res) {
+        if (!numFieldFiniteOk(req, res, "intervalSec") ||
+            !numFieldFiniteOk(req, res, "shots") ||
+            !numFieldFiniteOk(req, res, "startDelaySec")) return;   // X3
         const double sec = jsonNum(req.body, "intervalSec", 1.0);
         const int shots = static_cast<int>(jsonInt(req.body, "shots", 0, 0, 1000000));
         const int delay = static_cast<int>(jsonInt(req.body, "startDelaySec", -1, -1, 86400));
@@ -630,7 +747,21 @@ int main(int argc, char** argv) {
                             "application/json");
             return;
         }
-        const bool quick = jsonInt(req.body, "quick", 1, 0, 1) != 0;
+        // quick is a boolean or 0/1 (rigd sends 1/0). Absent keeps the
+        // documented default; anything else is refused. Reading it with
+        // jsonInt turned {"quick":false} into the default (stod threw on the
+        // word), so a requested FULL format ran as a quick one and still
+        // answered ok:true; jsonBool is no better, it maps garbage to false.
+        bool quick = true;
+        std::string qv;
+        if (jsonFind(req.body, "quick", qv)) {
+            if (qv == "true" || qv == "1") quick = true;
+            else if (qv == "false" || qv == "0") quick = false;
+            else {
+                fail(res, "bad \"quick\": not true/false/1/0: \"" + qv + "\"");
+                return;
+            }
+        }
         guarded(res, [&](std::string& e) { return g_cam.formatMedia(quick, e); });
     });
 
@@ -698,7 +829,12 @@ int main(int argc, char** argv) {
     // ----- captures ---------------------------------------------------------
     g_srv.Get("/api/shots", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Cache-Control", "no-store");
-        res.set_content(shotsJson(dirFor(req.get_param_value("dir"))), "application/json");
+        std::string out, err;
+        if (!shotsJson(dirFor(req.get_param_value("dir")), out, err)) {
+            fail(res, "cannot list frames: " + err, 500);
+            return;
+        }
+        res.set_content(out, "application/json");
     });
 
     // Remove one served file. The host calls this after it has verified its
@@ -782,11 +918,22 @@ int main(int argc, char** argv) {
     });
 
     g_srv.Post("/api/card/pull", [](const httplib::Request& req, httplib::Response& res) {
-        const long long cid = jsonInt(req.body, "contentId", -1, 0, 1LL << 32);
-        const long long fid = jsonInt(req.body, "fileId", -1, 0, 1LL << 16);
+        // Strict ids (see jsonIdStrict): a missing or garbage one used to be
+        // clamped to 0 and pull content 0 under the caller's name. contentId
+        // is a CrInt32u, fileId the listing's CrInt16u.
+        long long cid = 0, fid = 0;
+        std::string why;
+        if (!jsonIdStrict(req.body, "contentId", 0xFFFFFFFFLL, cid, why)) {
+            fail(res, "bad \"contentId\": " + why, 400);
+            return;
+        }
+        if (!jsonIdStrict(req.body, "fileId", 0xFFFFLL, fid, why)) {
+            fail(res, "bad \"fileId\": " + why, 400);
+            return;
+        }
         std::string name = jsonStr(req.body, "name");
-        if (cid < 0 || fid < 0 || !safeShotName(name)) {
-            fail(res, "need contentId, fileId and a safe name", 400);
+        if (!safeShotName(name)) {
+            fail(res, "need a safe name", 400);
             return;
         }
         const std::string dir = dirFor("raw");
@@ -815,9 +962,12 @@ int main(int argc, char** argv) {
                             "application/json");
             return;
         }
-        const long long cid = jsonInt(req.body, "contentId", -1, 0, 1LL << 32);
-        if (cid < 0) {
-            fail(res, "need contentId", 400);
+        // The confirm token says "delete something", not WHAT: the id has to
+        // be named, or {"confirm":"delete"} alone deleted content 0.
+        long long cid = 0;
+        std::string why;
+        if (!jsonIdStrict(req.body, "contentId", 0xFFFFFFFFLL, cid, why)) {
+            fail(res, "bad \"contentId\": " + why, 400);
             return;
         }
         std::string err;
@@ -860,13 +1010,15 @@ int main(int argc, char** argv) {
         std::string err;
         if (m == SDK::CrSdkControlMode_RemoteTransfer) {
             // Bare connect in transfer mode: no PC-save setup (it cannot shoot).
+            // Same pick as doConnect: reclaim the body this instance owns.
             const auto cams = g_cam.enumerate(3);
-            int pick = -1;
-            for (std::size_t i = 0; i < cams.size(); ++i)
-                if (camMatch.empty() || cams[i].id.find(camMatch) != std::string::npos ||
-                    cams[i].model.find(camMatch) != std::string::npos) { pick = static_cast<int>(i); break; }
-            if (pick < 0) {
+            if (cams.empty()) {
                 fail(res, "no camera found to reconnect in transfer mode", 503);
+                return;
+            }
+            const int pick = pickCamera(cams, err);
+            if (pick < 0) {
+                fail(res, err, 503);
                 return;
             }
             if (!g_cam.connect(pick, err, m)) {
@@ -942,6 +1094,7 @@ int main(int argc, char** argv) {
         static std::mutex lvMutex;
         static std::vector<unsigned char> lvCache;
         static std::chrono::steady_clock::time_point lvAt{};
+        constexpr long long kLvStaleMaxMs = 1500;   // oldest frame a failed grab may re-serve
         std::lock_guard<std::mutex> lk(lvMutex);
         const auto now = std::chrono::steady_clock::now();
         const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - lvAt);
@@ -951,10 +1104,23 @@ int main(int argc, char** argv) {
             if (g_cam.liveViewJpeg(jpg, err)) {
                 lvCache.swap(jpg);
                 lvAt = now;
-            } else if (lvCache.empty()) {
-                if (Camera::isBusyError(err)) sdkBusy(res, err);
-                else fail(res, err, 503);
-                return;
+            } else {
+                // A failed grab may fall back to the last frame only for a
+                // blip. rigd's proxy and the built-in page treat any 200 as a
+                // live picture and neither reads X-LiveView-Age-Ms, so a cache
+                // that outlived the stream (body off, USB gone, live view
+                // refused) was shown as fresh for ever. Aged AFTER the grab:
+                // a busy acquisition can wait up to kSdkWait inside it. Past
+                // the bound the cache is dropped, so a later failure cannot
+                // resurrect a frame from before the outage.
+                const auto stale = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - lvAt);
+                if (lvCache.empty() || stale.count() > kLvStaleMaxMs) {
+                    lvCache.clear();
+                    if (Camera::isBusyError(err)) sdkBusy(res, err);
+                    else fail(res, err, 503);
+                    return;
+                }
             }
         }
         const auto served = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -968,7 +1134,8 @@ int main(int argc, char** argv) {
     // after a week) and every new frame then collides with an old name and
     // lands as NAME(n).JPG. Moves files older than `older_than_s` (default a
     // day), keeping the newest `keep` (default 50), into <dir>-archive — never
-    // deletes. Requires {"confirm":"prune"}.
+    // deletes, and never overwrites: a name already in the archive is kept
+    // under a numeric tag (ILX00183~1.JPG). Requires {"confirm":"prune"}.
     g_srv.Post("/api/spool/prune", [](const httplib::Request& req, httplib::Response& res) {
         if (jsonStr(req.body, "confirm") != "prune") {
             res.status = 400;
@@ -997,8 +1164,31 @@ int main(int argc, char** argv) {
         long long moved = 0, kept = 0;
         for (std::size_t i = 0; i < ents.size(); ++i) {
             if (static_cast<long long>(i) < keep || ents[i].mtime > cutoff) { ++kept; continue; }
-            if (std::rename((g_saveDir + "/" + ents[i].name).c_str(),
-                            (archive + "/" + ents[i].name).c_str()) == 0) ++moved;
+            // rename() replaces an existing destination silently, and the body
+            // recycles names (the NAME(n) collisions above; the counter wraps
+            // after a card swap or format). A frame archived by an earlier
+            // prune is one that never drained, so it can be the only copy:
+            // keep a colliding name under a numeric tag instead of over it.
+            // Anything not provably absent (an lstat error other than ENOENT)
+            // counts as present.
+            const auto present = [](const std::string& p) {
+                struct stat ast{};
+                return ::lstat(p.c_str(), &ast) == 0 || errno != ENOENT;
+            };
+            const std::string& nm = ents[i].name;
+            std::string dst = archive + "/" + nm;
+            if (present(dst)) {
+                const std::size_t dot = nm.rfind('.');
+                const std::string stem = (dot == std::string::npos || dot == 0) ? nm : nm.substr(0, dot);
+                const std::string ext = (dot == std::string::npos || dot == 0) ? "" : nm.substr(dot);
+                bool found = false;
+                for (int n = 1; n <= 10000 && !found; ++n) {
+                    const std::string cand = archive + "/" + stem + "~" + std::to_string(n) + ext;
+                    if (!present(cand)) { dst = cand; found = true; }
+                }
+                if (!found) continue;           // leave it in the spool
+            }
+            if (std::rename((g_saveDir + "/" + nm).c_str(), dst.c_str()) == 0) ++moved;
         }
         g_cam.log("Spool prune: moved " + std::to_string(moved) + " to " + archive);
         ok(res, "\"moved\":" + std::to_string(moved) + ",\"kept\":" + std::to_string(kept) +

@@ -589,7 +589,16 @@ bool Camera::connect(int index, std::string& err, SDK::CrSdkControlMode mode) {
         bool pending;
         {
             std::lock_guard<std::mutex> clk(m_connectMutex);
-            pending = (m_connectResult == 0);
+            // An abandoned attempt never writes a result, so it reads as
+            // "still pending" for ever: abandon() could not take the SDK to
+            // release the handle (a call wedged past kSdkWait) and a timed-out
+            // connect left m_connectResult at 0. Every later connect, rigd's
+            // backoff retries included, then answered "connect in progress"
+            // and never reached the stale-handle release below. The abandon
+            // flag is the discriminator: connect() clears it at the start of
+            // each attempt, so a handshake really in flight still reads as
+            // pending.
+            pending = (m_connectResult == 0) && !m_attemptAbandoned;
         }
         if (m_connected) {
             // A second racing /api/connect must not overwrite (and leak) the
@@ -896,6 +905,7 @@ void Camera::OnConnected(SDK::DeviceConnectionVersioin) {
 
 void Camera::OnDisconnected(CrInt32u error) {
     m_connected = false;
+    m_saveDirOk = false;        // the SDK drops the save location with the session
     log("Disconnected (" + crErrorString(error) + ")");
     // X4: a session drop mid-pull left cardPull waiting out its full timeout
     // (180 s per file - nothing else ever notified m_rtCv). Fail the pull in
@@ -1674,6 +1684,7 @@ bool Camera::configureCameraInterval(double intervalSec, int shots, int startDel
     // min/max/step - on the ILX-LR1 that is 1.0s to 60.0s in 1.0s steps.
     // Sending anything outside that range is silently ignored, so check first.
     long long ticks = static_cast<long long>(intervalSec * 10.0 + 0.5);
+    const long long askedTicks = ticks;
     PropRange r;
     if (getPropRange(SDK::CrDeviceProperty_IntervalRec_ShootingInterval, r)) {
         if (r.valid && (ticks < r.min || ticks > r.max)) {
@@ -1696,16 +1707,26 @@ bool Camera::configureCameraInterval(double intervalSec, int shots, int startDel
         !setPropLocked(SDK::CrDeviceProperty_IntervalRec_NumberOfShots, shots, err)) {
         return false;
     }
+    // The start delay is best effort - the body may lock the property in this
+    // mode, and a refusal must not fail a configure that works without it -
+    // but the log must not claim a delay the body never took.
+    std::string delayErr;
+    bool delayApplied = false;
     if (startDelaySec >= 0) {
-        std::string ignored;
-        setPropLocked(SDK::CrDeviceProperty_IntervalRec_ShootingStartTime, startDelaySec,
-                      ignored);
+        delayApplied = setPropLocked(SDK::CrDeviceProperty_IntervalRec_ShootingStartTime,
+                                     startDelaySec, delayErr);
     }
     std::ostringstream os;
     os << "Camera interval configured: " << std::fixed << std::setprecision(1)
-       << (ticks / 10.0) << "s"
-       << (shots > 0 ? ", " + std::to_string(shots) + " shots" : "")
-       << (startDelaySec >= 0 ? ", " + std::to_string(startDelaySec) + "s delay" : "");
+       << (ticks / 10.0) << "s";
+    if (ticks != askedTicks) {
+        os << " (asked " << (askedTicks / 10.0) << "s, body step snapped it)";
+    }
+    os << (shots > 0 ? ", " + std::to_string(shots) + " shots" : "");
+    if (startDelaySec >= 0) {
+        if (delayApplied) os << ", " << startDelaySec << "s delay";
+        else os << ", start delay NOT applied (" << delayErr << ")";
+    }
     log(os.str());
     return true;
 }
@@ -2292,6 +2313,14 @@ bool Camera::setSaveDir(const std::string& dir, std::string& err) {
         err = "not connected";
         return false;
     }
+    // Record the WANTED directory before trying, not after it works: the
+    // OnConnected replay only fires for a non-empty m_saveDir, so a first
+    // registration that failed (a refused SetSaveInfo, a directory that could
+    // not be made yet) left nothing to retry on the next spontaneous
+    // reconnect and every frame stayed on the card, silently. saveDirOk says
+    // whether the SDK actually holds it.
+    m_saveDir = dir;
+    m_saveDirOk = false;
     // The SDK will not create the destination itself: pointing SetSaveInfo at a
     // missing directory fails with 0x810c, and the only visible symptom is that
     // frames never leave the camera. A freshly provisioned node has no
@@ -2308,9 +2337,10 @@ bool Camera::setSaveDir(const std::string& dir, std::string& err) {
         err = "SetSaveInfo failed: " + crErrorString(e);
         return false;
     }
-    // Remember it: the SDK forgets the save location across a reconnect, and a
-    // spontaneous reconnect (CrReconnecting_ON) does not go through connect().
-    m_saveDir = dir;
+    // The SDK forgets the save location across a reconnect, and a spontaneous
+    // reconnect (CrReconnecting_ON) does not go through connect(); m_saveDir
+    // (set above) is what OnConnected replays.
+    m_saveDirOk = true;
     return true;
 }
 
@@ -2795,6 +2825,12 @@ std::string Camera::statusJson() {
         // and the monitor gate on this string.
         emitStr("controlMode", m_mode == SDK::CrSdkControlMode_RemoteTransfer
                                     ? "transfer" : "remote");
+        // Whether the SDK holds the PC-save directory. False on a connected
+        // body means frames are staying on the card and the spool will not
+        // fill; a transfer session never registers one, so it is not reported.
+        if (m_mode != SDK::CrSdkControlMode_RemoteTransfer) {
+            os << ",\"saveDirOk\":" << (m_saveDirOk.load() ? "true" : "false");
+        }
         os << ",\"writable\":{";
         for (size_t i = 0; i < flags.size(); ++i) {
             if (i) os << ",";

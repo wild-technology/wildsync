@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite — run (findings R1-R10, rig/run.py).
+"""Audit regression suite — run (findings R1-R26, rig/run.py).
 
 Every check below FAILS on the pre-fix code and PASSES after. What each one
 reproduces, in the words of the defect it pins:
@@ -54,6 +54,46 @@ R12 (2026-08-24) The pre-deployment review of the R1-R11 fix. (a) a RAW half
     (g) the card-review fallback's clk_off=0.0 was handed to imu_snapshot as
     the outward host->node conversion offset.
 
+R13 (2026-10-15) The frames an ADOPTED worker finds already on its node
+    (the "taken before adoption" backlog) each claimed a fire command, so the
+    first command queued after adoption went to a frame exposed before the
+    worker existed and every later frame of the camera took the command of the
+    shot after its own - a persistent one-period shift labelled gpio_edge.
+R14 PullWorker has no `events` of its own: the flight_log failure handlers
+    (header open at start, row write mid-run) raised AttributeError - killing
+    the worker before its first pull, or losing a frame after its spool copy
+    was deleted - and the stop path closed a flight_log that was already None.
+R15 A standalone strobe (a camera-less strobe node - the Jetson's XR256)
+    answered with its pulse instant and nothing read it, so no frame carried a
+    `strobe` and the per-pair acceptance verdict never existed.
+R16 `pulled` counted FILES: a RAW+JPEG release counted twice, so stop()'s
+    final-shot grace ended before the last shot was listed and the
+    frames_missing alarm was blind to a camera that had stopped delivering.
+R17 run.json's sync.shots / skew_ms_max / skew_ms_p95 covered only the last
+    1000 shots of a run, hiding the worst skew of a longer transect.
+R18 start() held the run lock across reset_edge_cursors(), one blocking HTTP
+    call per monitor (3 s for an unplugged slot), stalling every status poll
+    and every pull worker's known-frames bookkeeping.
+R19 A camera switched off after three failed fires kept its stale fail_streak,
+    so _dead_fire_node() kept the grid paused for a node that is neither
+    judged nor probed - until stop/start.
+R20 A body that wrote no SubSecTimeOriginal published whole-second EXIF with
+    the few-ms bar of the edge it was calibrated against, and that bar beat a
+    soft edge in _edge_result.
+R21 Frames taken BETWEEN runs (bench Capture, a bare calibrate) were never in
+    known_frames, so a camera joining the next run late had them classed as
+    "taken during the run" and pulled into the transect as survey data.
+R22 A camera filename reused after a counter rollover was skipped for the rest
+    of the run (`seen` never aged), never pulled and never deleted.
+R23 A failed run-start EXIF calibration kept the previous run's offset and its
+    error bar, while the event said the offset was unmeasured.
+R24 Frames still pending when a run stopped left no unpulled.jsonl record, and
+    the next run baselined them away.
+R25 A pull worker that outlived stop() indexed its frame (and counted its
+    orphans) into the NEXT run.
+R26 String "false" armed auto-capture on /api/run/start and the strobe on
+    /api/strobe; Infinity escaped int() as OverflowError.
+
 Hermetic: in-process fakes on loopback only (soaktest's netguard is installed
 by importing it), temp run roots, no sleeps beyond what the code under test
 needs. Runs in ~60 s.
@@ -61,9 +101,11 @@ needs. Runs in ~60 s.
 Run standalone:  python3 rig/tests/audit_run.py
 """
 
+import io
 import json
 import os
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -549,7 +591,14 @@ def _r4_raw_jpeg_one_release(opts):
         node.add_frame(epoch=t0, name="ILX09001.JPG")
         node.add_frame(epoch=t0 + 0.5, name="ILX09002.JPG")
 
-        wait_for(lambda: w.stats().get("pulled", 0) >= 3, 15)
+        # Three FILES, two exposures. Waits on the files and the rows, not on
+        # `pulled`: that counts exposures, and a count of 3 never comes.
+        def _landed():
+            fs = os.listdir(os.path.join(root, "cam1"))
+            return (len([f for f in fs if f.lower().endswith(".jpg")]) >= 2
+                    and any(f.lower().endswith(".arw") for f in fs)
+                    and len(_rows(root, "cam1")[1]) >= 2)
+        wait_for(_landed, 15)
         _hdr, rows = _rows(root, "cam1")
         by_orig = {e["orig"]: e for e in _index(env, root)}
         check("the RAW half adds no second flight_log row",
@@ -1658,6 +1707,1015 @@ def _r12g_card_review_imu_window(opts):
         env.close()
 
 
+# ===========================================================================
+# R13-R26 (2026-10-15) - the run-group audit
+# ===========================================================================
+def _unit_worker(env, node_name="cam1", **kw):
+    """A PullWorker on a real (unticked) monitor with `_handle` replaced by a
+    recorder, so claims can be read without a download. The monitor's listing
+    is a list the test edits."""
+    mon = env.mon(node_name)
+    listing = {"names": []}
+    mon.is_connected = lambda: True
+    mon.shots = lambda: [{"name": n, "size": 10} for n in listing["names"]]
+    cam_dir = os.path.join(env.dir, "unit", node_name)
+    w = runmod.PullWorker(mon, cam_dir, env.runmgr, **kw)
+    w.handled = {}
+
+    def _handle(name, size):
+        w.handled[name] = w.cmd_epoch.get(name)
+        return True
+    w._handle = _handle
+    return w, listing
+
+
+def _run_catching(worker):
+    """worker.run() on this thread; the exceptions that escape it, as text."""
+    try:
+        worker.run()
+    except Exception as e:                                   # noqa: BLE001
+        return ["%s: %s" % (type(e).__name__, e)]
+    return []
+
+
+def _forget_but(env, names, node="cam1"):
+    """rigd's memory of a node's spool, reset to exactly `names`. A worker's
+    own baseline records everything it lists, so each worker under test needs
+    the memory put back to what an EARLIER run would have left."""
+    with env.runmgr._lock:
+        env.runmgr._known_frames[node] = {n: None for n in names}
+
+
+# ===========================================================================
+# R13 - an adopted worker's backlog frames own no fire command
+# ===========================================================================
+def _r13_adoption_backlog_claims_no_command(opts):
+    sect("R13 frames exposed before adoption do not claim the first command")
+    env = Env([("cam1", "127.0.0.160", 1)], poll=0.4, threaded=False,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        backlog = ["ILX00001.JPG", "ILX00002.JPG", "ILX00003.JPG"]
+        # rigd has watched this node's save dir before (an earlier run in this
+        # process), which is what makes the unlisted names a "backlog".
+        env.runmgr.remember_frames("cam1", ["ILXOLD00.JPG"])
+
+        w, listing = _unit_worker(env, adopted=True)
+        listing["names"] = ["ILXOLD00.JPG"] + backlog
+        _forget_but(env, ["ILXOLD00.JPG"])
+        check("the adopted worker baselines and finds the backlog",
+              w._baseline() is True)
+        # The camera fires: a command is queued in the window between
+        # adoption and the worker's first poll.
+        t_cmd = time.time() + 0.3
+        w.note_command(t_cmd, path="gpio", fire_seq=77, edge_seq=0)
+        w._poll_once()
+        check("no backlog frame claimed the queued command",
+              all(w.handled.get(n) is None for n in backlog)
+              and all(n in w.handled for n in backlog),
+              "claims=%s" % {n: (w.handled.get(n) or {}).get("fire_seq")
+                             for n in backlog})
+        with w._lock:
+            queued = [r.get("fire_seq") for r in w._cmds]
+        check("the command is still queued for the next survey frame",
+              queued == [77], str(queued))
+        listing["names"].append("ILX00004.JPG")      # the first survey frame
+        w._poll_once()
+        check("and the post-adoption survey frame claims it",
+              (w.handled.get("ILX00004.JPG") or {}).get("fire_seq") == 77,
+              str(w.handled.get("ILX00004.JPG")))
+
+        # Control: a worker that existed from run start and baselined late
+        # owns the commands of the frames shot during its listing outage.
+        w2, listing2 = _unit_worker(env, adopted=False)
+        listing2["names"] = ["ILXOLD00.JPG"] + backlog
+        _forget_but(env, ["ILXOLD00.JPG"])
+        check("a late baseline succeeds", w2._baseline(late=True) is True)
+        for k in range(3):
+            w2.note_command(time.time() + 0.1 * k, path="gpio",
+                            fire_seq=10 + k, edge_seq=0)
+        w2._poll_once()
+        got = [(w2.handled.get(n) or {}).get("fire_seq") for n in backlog]
+        check("a LATE worker's backlog frames still claim their own commands",
+              got == [10, 11, 12], str(got))
+
+        # Rollover: a backlog name that has been pulled and deleted comes back
+        # as a new exposure and is an ordinary frame.
+        w3, listing3 = _unit_worker(env, adopted=True)
+        listing3["names"] = ["ILXOLD00.JPG"] + backlog
+        _forget_but(env, ["ILXOLD00.JPG"])
+        w3._baseline()
+
+        def _handle_gone(name, size):
+            w3.handled[name] = w3.cmd_epoch.get(name)
+            getattr(w3, "_gone", set()).add(name)        # confirmed delete
+            return True
+        w3._handle = _handle_gone
+        w3._poll_once()
+        listing3["names"] = ["ILXOLD00.JPG"]  # deleted from the node...
+        w3._poll_once()
+        listing3["names"] = ["ILXOLD00.JPG"] + backlog     # ...and reissued
+        w3.note_command(time.time() + 0.3, path="gpio", fire_seq=88,
+                        edge_seq=0)
+        w3.handled.clear()
+        w3._poll_once()                       # the numbers have wrapped
+        check("a recycled backlog name is no longer barred from a command",
+              (w3.handled.get("ILX00001.JPG") or {}).get("fire_seq") == 88,
+              str(w3.handled))
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R14 - the flight_log failure handlers must not raise
+# ===========================================================================
+def _r14_flight_log_failures_do_not_raise(opts):
+    sect("R14 a flight_log that cannot be written degrades, it does not crash")
+    env = Env([("cam1", "127.0.0.161", 1)], poll=0.4, threaded=False,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        # (1) startup: flight_log.csv is a directory, so open() raises OSError.
+        w, _l = _unit_worker(env)
+        os.makedirs(os.path.join(w.cam_dir, "flight_log.csv"))
+        w._baseline = lambda late=False: True
+        polls = []
+        w._poll_once = lambda: polls.append(1)
+        errs = []
+        seq0 = env.seq()
+        th = threading.Thread(target=lambda: errs.extend(_run_catching(w)),
+                              daemon=True)
+        th.start()
+        primed = w.primed.wait(5)
+        w.stop()
+        th.join(5)
+        check("a flight_log that cannot be opened does not kill the worker",
+              not errs and primed and bool(polls), "errors=%s primed=%s polls=%d"
+              % (errs, primed, len(polls)))
+        check("the loss is reported through the run's event log",
+              any(e["kind"] == "pull" and "cannot be written" in e["msg"]
+                  for e in env.evs(since=seq0)),
+              str([e["msg"][:60] for e in env.evs(since=seq0)]))
+
+        # (2) mid-run: the row write fails after the frame is on host disk.
+        w2, _l2 = _unit_worker(env)
+
+        class _Full:
+            def writerow(self, row):
+                raise OSError(28, "No space left on device")
+        w2._flight = _Full()
+        w2._flight_fh = io.StringIO()
+        seq1 = env.seq()
+        t = time.time()
+        raised = None
+        try:
+            w2._write_flight("Cam1_x.jpg", "ILX00001.JPG", t, t, "exif", 0.0,
+                             w2._timebase[1], 0.0)
+        except Exception as e:                               # noqa: BLE001
+            raised = "%s: %s" % (type(e).__name__, e)
+        check("a failed row write returns instead of losing the frame",
+              raised is None, str(raised))
+        check("the flight_log is dropped and the loss reported once",
+              w2._flight is None and w2._flight_fh is None
+              and any(e["kind"] == "pull" and "stopped accepting rows"
+                      in e["msg"] for e in env.evs(since=seq1)))
+
+        # (3) the stop path of a worker whose flight_log degraded mid-run.
+        w3, _l3 = _unit_worker(env)
+        w3._baseline = lambda late=False: True
+        w3._poll_once = lambda: None
+        errs3 = []
+        th3 = threading.Thread(target=lambda: errs3.extend(_run_catching(w3)),
+                               daemon=True)
+        th3.start()
+        w3.primed.wait(5)
+        try:
+            w3._flight_fh.close()
+        except Exception:                                     # noqa: BLE001
+            pass
+        w3._flight_fh = None
+        w3._flight = None
+        w3.stop()
+        th3.join(5)
+        check("stopping a worker whose flight_log already failed is clean",
+              not errs3 and not th3.is_alive(), str(errs3))
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R15 - a standalone strobe's instant reaches the cameras' frames
+# ===========================================================================
+def _r15_standalone_strobe_reaches_the_frames(opts):
+    sect("R15 a camera-less strobe node's pulse instant is recorded per frame")
+    env = Env([("cam1", "127.0.0.162", 1), ("cam2", "127.0.0.163", 2)],
+              poll=0.4, threaded=True, nav=FakeNav(), imu_node="cam9")
+    real = runmod.http_json
+    mode = {"m": "real"}
+    host2 = "http://%s:8081/gpio/strobe" % "127.0.0.163"
+
+    def _hj(url, *a, **kw):
+        if url.startswith(host2):
+            if mode["m"] == "late":
+                return {"ok": True, "strobe_epoch": time.time(),
+                        "strobe_late_ms": 9.0}
+            if mode["m"] == "fail":
+                return {"ok": False, "error": "injected: no pulse"}
+            if mode["m"] == "fast":
+                return {"ok": True, "strobe_epoch": 5555.0,
+                        "strobe_late_ms": 0.2}
+        return real(url, *a, **kw)
+
+    def _held_shot(w):
+        """One capture_once with the puller held off, so the command record
+        can be read before a frame claims it. -> (report, newest record)."""
+        env.runmgr.begin_calibration_fire("cam1", hold_s=30)
+        try:
+            rep = env.runmgr.capture_once()
+            with w._lock:
+                rec = w._cmds[-1] if w._cmds else None
+            return rep, rec
+        finally:
+            env.runmgr.end_calibration_fire("cam1")
+
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        env.wait_state("cam2", "CAM_CONNECTED")
+        rs = env.runmgr.set_strobe({"enabled": True, "node": "cam2",
+                                    "delta_ms": 10.0, "pulse_ms": 5})
+        check("strobe configured on cam2", rs.get("ok") is True)
+        # The strobe node's camera is gone but its Pi answers: the
+        # camera-less XR256 host of docs/FIELD-RUN.md.
+        # ...and ilxctl's reconnect reports success without the body being
+        # claimed, so it stays out of the run for the whole test.
+        env.node("cam2").set_fault("ilx", connect_lies=True)
+        env.node("cam2").connected = False
+        check("cam2 leaves CAM_CONNECTED but stays reachable",
+              bool(wait_for(lambda: not env.mon("cam2").is_connected(), 15))
+              and env.mon("cam2").state != rigcore.NodeMonitor.OFFLINE)
+        r = env.runmgr.start({"label": "r15", "calibrate": False})
+        root = r["root"]
+        _wait_calibrated(env, 20)
+        w = env.runmgr.workers["cam1"]
+        w.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w)
+        runmod.http_json = _hj
+
+        rep, rec = _held_shot(w)
+        want = rep["target"] + 0.010
+        got = (rec or {}).get("strobe_epoch")
+        check("the shot's command record carries the strobe instant",
+              got is not None and abs(got - want) < 0.05,
+              "strobe_epoch=%s want %.4f" % (got, want))
+        ok = wait_for(lambda: len(_index(env, root)) >= 1, 15)
+        ent = (_index(env, root) or [{}])[-1]
+        off = ent.get("clk_off") or 0.0
+        check("the indexed frame carries it, for the pair verdict",
+              ok and ent.get("strobe") is not None
+              and abs(ent["strobe"] - (want - off)) < 0.05,
+              json.dumps(ent)[:200])
+        _drain_spool(env, "cam1", w)
+
+        # A late flash is reported, as the in-fire path reports it.
+        mode["m"] = "late"
+        seq0 = env.seq()
+        _held_shot(w)
+        check("a standalone flash pulsed late is reported, naming the node",
+              any(e["kind"] == "strobe_late" and e.get("node") == "cam2"
+                  for e in env.evs(since=seq0)),
+              str([e["kind"] for e in env.evs(since=seq0)][-6:]))
+        _drain_spool(env, "cam1", w)
+
+        # A refused flash records nothing and says so.
+        mode["m"] = "fail"
+        seq1 = env.seq()
+        rep, rec = _held_shot(w)
+        check("a failed standalone flash attaches no instant",
+              rec is not None and rec.get("strobe_epoch") is None,
+              str(rec))
+        check("and strobe_fail is still raised",
+              any(e["kind"] == "strobe_fail" for e in env.evs(since=seq1)))
+        _drain_spool(env, "cam1", w)
+
+        # Ordering: the flash answers BEFORE the camera's command is queued.
+        mode["m"] = "fast"
+        real_lead = env.runmgr._trigger_lead
+
+        def _slow_lead(node):
+            time.sleep(0.25)
+            return real_lead(node)
+        env.runmgr._trigger_lead = _slow_lead
+        try:
+            rep, rec = _held_shot(w)
+        finally:
+            env.runmgr._trigger_lead = real_lead
+        check("the instant is attached when the flash replies first",
+              rec is not None and rec.get("strobe_epoch") == 5555.0, str(rec))
+    finally:
+        runmod.http_json = real
+        env.close()
+
+
+# ===========================================================================
+# R16 - `pulled` counts exposures, not files
+# ===========================================================================
+def _r16_pulled_counts_exposures(opts):
+    sect("R16 RAW+JPEG is one exposure to stop()'s grace and the alarm")
+    env = Env([("cam1", "127.0.0.164", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        r = env.runmgr.start({"label": "r16", "calibrate": False})
+        root = r["root"]
+        _wait_calibrated(env, 20)
+        w = env.runmgr.workers["cam1"]
+        w.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w)
+        node = env.node("cam1")
+        t0 = time.time() - 2.0
+        env.timesync.set_exif_offset("cam1", 0.0)
+        # Two exposures, three files: release A delivers both halves, B a JPEG.
+        node.add_frame(epoch=t0, name="ILX09101.ARW")
+        node.add_frame(epoch=t0, name="ILX09101.JPG")
+        node.add_frame(epoch=t0 + 0.5, name="ILX09102.JPG")
+
+        def _landed():
+            fs = os.listdir(os.path.join(root, "cam1"))
+            return (len([f for f in fs if f.lower().endswith(".jpg")]) >= 2
+                    and any(f.lower().endswith(".arw") for f in fs)
+                    and len(_rows(root, "cam1")[1]) >= 2
+                    and not w._pending)
+        check("three files landed for two exposures", bool(wait_for(_landed, 15)))
+        check("pulled counts exposures, not files",
+              w.stats()["pulled"] == 2, "pulled=%s" % w.stats()["pulled"])
+
+        # stop()'s grace keeps waiting for a shot that was fired and has not
+        # been delivered: three exposures fired, two delivered.
+        with env.runmgr._lock:
+            env.runmgr.active["fired"]["cam1"] = 3
+            fired = dict(env.runmgr.active["fired"])
+        lag = [n for n, x in env.runmgr.workers.items()
+               if x.stats().get("pulled", 0) < fired.get(n, 0)]
+        check("the final-shot grace still sees the undelivered shot",
+              lag == ["cam1"], str(lag))
+
+        # The accounting alarm: 8 fired, 2 exposures landed, 1 calibration
+        # frame kept out, nothing pending (inflight allowance 2) -> 3 never
+        # arrived. Counting files said 2.
+        with env.runmgr._lock:
+            env.runmgr.active["fired"]["cam1"] = 8
+        env.runmgr._warned_at.pop("frames_missing:cam1", None)
+        seq0 = env.seq()
+        env.runmgr._watch_frame_accounting()
+        check("frames_missing fires for a camera that stopped delivering",
+              any(e["kind"] == "frames_missing" and e.get("node") == "cam1"
+                  for e in env.evs(since=seq0)),
+              str([e["kind"] for e in env.evs(since=seq0)]))
+        with env.runmgr._lock:
+            env.runmgr.active["fired"]["cam1"] = 2
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R17 - the run's sync record covers the whole run
+# ===========================================================================
+def _r17_run_skew_record_is_not_windowed(opts):
+    sect("R17 sync.shots / skew_ms_max / skew_ms_p95 cover every shot")
+    env = Env([("cam1", "127.0.0.165", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        r = env.runmgr.start({"label": "r17", "calibrate": False})
+        root = r["root"]
+        _wait_calibrated(env, 20)
+        rm = env.runmgr
+
+        def shot(i, skew_ms):
+            t = 1000.0 + i
+            rm._judge_shot(t, {"cam1": {"ok": True, "path": "gpio",
+                                        "exposure_epoch": t},
+                               "cam2": {"ok": True, "path": "gpio",
+                                        "exposure_epoch": t + skew_ms / 1e3}},
+                           roster=["cam1", "cam2"])
+        def skew_of(i):
+            return 14.0 if 100 <= i < 200 else 0.5      # the bad ones are OLD
+        for i in range(800):
+            shot(i, skew_of(i))
+        st = rm.status()["sync"]
+        check("a run of 1000 shots or fewer is unchanged",
+              st["shots"] == 800 and st["skew_ms_max"] == 14.0, str(st))
+        for i in range(800, 1500):
+            shot(i, skew_of(i))
+        st = rm.status()["sync"]
+        check("sync.shots counts all 1500 shots", st["shots"] == 1500,
+              "shots=%s" % st["shots"])
+        check("skew_ms_max still holds the worst shot of the whole run",
+              st["skew_ms_max"] == 14.0, "skew_ms_max=%s" % st["skew_ms_max"])
+        rm._write_run_json()
+        doc = json.load(open(os.path.join(root, "run.json")))["sync"]
+        check("run.json agrees: shots, max, and a p95 over the whole run",
+              doc["shots"] == 1500 and doc["skew_ms_max"] == 14.0
+              and doc["skew_ms_p95"] == 14.0, json.dumps(doc)[:200])
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R18 - start() does its edge-cursor I/O outside the run lock
+# ===========================================================================
+def _r18_start_io_is_outside_the_run_lock(opts):
+    sect("R18 reset_edge_cursors runs outside the run lock")
+    env = Env([("cam1", "127.0.0.166", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        rm = env.runmgr
+        locked, first = [], threading.Event()
+
+        def slow_reset():
+            locked.append(rm._lock.locked())
+            first.set()
+            time.sleep(0.6)             # an unplugged slot costs 3 s of this
+        rm.reset_edge_cursors = slow_reset
+        out = {}
+        th = threading.Thread(
+            target=lambda: out.update(rm.start({"label": "r18",
+                                                "calibrate": False})),
+            daemon=True)
+        th.start()
+        entered = first.wait(10)
+        t0 = time.time()
+        rm.known_frames("cam1")        # takes the run lock, as every worker does
+        dt = time.time() - t0
+        th.join(20)
+        check("the run started", out.get("ok") is True, json.dumps(out)[:120])
+        check("the edge-cursor reset did not hold the run lock",
+              entered and not any(locked), "lock held at call: %s" % locked)
+        check("a pull worker's bookkeeping is not stalled behind it",
+              dt < 0.2, "known_frames blocked %.2f s" % dt)
+        _wait_calibrated(env, 20)
+        n = len(locked)
+        r2 = rm.start({"label": "r18b", "calibrate": False})
+        check("a double-submitted Start is refused",
+              r2.get("ok") is False and "already active" in str(r2.get("error")),
+              json.dumps(r2)[:120])
+        check("and it does not reset the live run's edge cursors",
+              len(locked) == n, "resets %d -> %d" % (n, len(locked)))
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R19 - a switched-off camera's stale fail_streak does not hold the grid
+# ===========================================================================
+def _r19_switched_off_camera_does_not_pause_the_grid(opts):
+    sect("R19 a camera switched off after failing is not a dead node")
+    env = Env([("cam1", "127.0.0.167", 1), ("cam2", "127.0.0.168", 2)],
+              poll=0.4, threaded=False, nav=FakeNav(), imu_node="cam9")
+    try:
+        rm = env.runmgr
+        rm.active = {"run_id": "r19", "fired": {}, "skews_ms": [],
+                     "failed_fires": 0, "unpaired_shots": 0, "fail_streak": {},
+                     "late_shots": 0, "orphans": {}}
+        try:
+            for _ in range(3):
+                rm._judge_shot(time.time(),
+                               {"cam1": {"ok": True, "path": "gpio"},
+                                "cam2": {"ok": False, "error": "no frame"}},
+                               roster=["cam1", "cam2"])
+            check("three failed fires make cam2 the dead node",
+                  rm._dead_fire_node() == "cam2", str(rm._dead_fire_node()))
+            env.mon("cam2").camera_enabled = False
+            check("switched off, it no longer holds the grid paused",
+                  rm._dead_fire_node() is None, str(rm._dead_fire_node()))
+            env.mon("cam2").camera_enabled = True
+            check("switched back on, an unproven body pauses it again",
+                  rm._dead_fire_node() == "cam2", str(rm._dead_fire_node()))
+        finally:
+            rm.active = None
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R20 - a body without SubSec does not publish a few-ms EXIF bar
+# ===========================================================================
+def _jpeg_without_subsec(epoch):
+    from PIL import Image
+    im = Image.new("RGB", (48, 36), (90, 40, 60))
+    ex = Image.Exif()
+    ex[0x8769] = {0x9003: time.strftime("%Y:%m:%d %H:%M:%S",
+                                        time.localtime(epoch))}
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", exif=ex.tobytes(), quality=60)
+    return buf.getvalue()
+
+
+def _no_subsec(node):
+    """Make `node` deliver frames whose EXIF has DateTimeOriginal only."""
+    def add(epoch=None, name=None, exif=True, size_bytes=None):
+        with node._lock:
+            node._shot_seq += 1
+            ep = time.time() if epoch is None else epoch
+            nm = name or "ILX%05d.JPG" % node._shot_seq
+            data = _jpeg_without_subsec(ep + node.clock_skew_s)
+            node.shots.append({"name": nm, "size": len(data), "bytes": data,
+                               "epoch": ep})
+        return nm
+    node.add_frame = add
+
+
+def _edge_frame(env, root, node, w, name, *, fire_seq, t, edge=True):
+    """One scheduled shot -> (index entry, flight_log row)."""
+    w.note_command(t, path="gpio", fire_seq=fire_seq, edge_seq=0)
+    if edge:
+        node.push_edge(epoch=t, fire_seq=fire_seq)
+    node.add_frame(epoch=t, name=name)
+    wait_for(lambda: any(e["orig"] == name for e in _index(env, root)), 20)
+    got = {e["orig"]: e for e in _index(env, root)}.get(name)
+    row = None if got is None else {x["filename"]: x for x in
+                                    _rows(root, "cam1")[1]}.get(got["file"])
+    return got, row
+
+
+def _r20_whole_second_exif_has_a_whole_second_bar(opts):
+    sect("R20 EXIF without SubSec is worth ~1.5 s and cannot beat a soft edge")
+    if not runmod.PIL_AVAILABLE:
+        note("R20 skipped: Pillow is not available on this host")
+        return
+    env = Env([("cam1", "127.0.0.169", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        node = env.node("cam1")
+        _no_subsec(node)
+        r = env.runmgr.start({"label": "r20", "calibrate": False})
+        root = r["root"]
+        _wait_calibrated(env, 20)
+        w = env.runmgr.workers["cam1"]
+        w.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w)
+        env.runmgr.active["config"]["auto_capture"] = True
+        env.runmgr.active["config"]["interval_s"] = 0.5
+        err = env.runmgr.exif_err("cam1")
+        check("calibrating on a SubSec-less frame records a whole-second bar",
+              err is not None and err >= 1.5, "exif_uncertainty=%s" % err)
+
+        # The node cannot stamp its edges in the kernel: the edge is soft
+        # (250 ms) and EXIF is the only other instant.
+        node.hw_reject = "domain"
+        t = time.time()
+        got, row = _edge_frame(env, root, node, w, "ILXR2000.JPG",
+                               fire_seq=8000, t=t)
+        check("a whole-second EXIF stamp does not displace the soft edge",
+              got is not None and got.get("src") == "gpio_edge_soft",
+              "src=%r" % (got or {}).get("src"))
+        terr = None if row is None else row.get("time_err_ms")
+        check("and the row carries the soft edge's bar",
+              terr not in (None, "") and 240.0 <= float(terr) < 1000.0,
+              "time_err_ms=%r" % terr)
+
+        # No edge at all: the exif row's bar is the whole-second one.
+        got2, row2 = _edge_frame(env, root, node, w, "ILXR2001.JPG",
+                                 fire_seq=8001, t=time.time() + 1.0,
+                                 edge=False)
+        terr2 = None if row2 is None else row2.get("time_err_ms")
+        check("an exif row publishes at least 1500 ms",
+              got2 is not None and got2.get("src") == "exif"
+              and terr2 not in (None, "") and float(terr2) >= 1500.0,
+              "src=%r time_err_ms=%r" % ((got2 or {}).get("src"), terr2))
+
+        # A body that DOES write SubSec keeps its tight bar.
+        env.runmgr.stop()
+        del node.add_frame
+        node.hw_reject = None
+        env.runmgr.start({"label": "r20b", "calibrate": False})
+        _wait_calibrated(env, 20)
+        err2 = env.runmgr.exif_err("cam1")
+        check("with SubSec the bar stays at a few ms",
+              err2 is not None and err2 < 0.05, "exif_uncertainty=%s" % err2)
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R21 - frames taken between runs are known, so a late joiner leaves them
+# ===========================================================================
+def _r21_between_run_frames_are_not_backlog(opts):
+    sect("R21 an idle spool census keeps bench frames out of a late join")
+    env = Env([("cam1", "127.0.0.170", 1), ("cam2", "127.0.0.171", 2)],
+              poll=0.4, threaded=True, nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        env.wait_state("cam2", "CAM_CONNECTED")
+        rm = env.runmgr
+        n1, n2 = env.node("cam1"), env.node("cam2")
+        census = getattr(rm, "_census_once", lambda: None)
+
+        # (a) an earlier run listed this node.
+        n2.add_frame(epoch=time.time() - 900, name="ILX00100.JPG")
+        census()
+        check("the idle census lists a connected node",
+              "ILX00100.JPG" in (rm.known_frames("cam2") or {}),
+              str(rm.known_frames("cam2")))
+        # (b) bench shots between runs, seen by the next census tick.
+        n2.add_frame(epoch=time.time() - 30, name="ILX00101.JPG")
+        n2.add_frame(epoch=time.time() - 29, name="ILX00102.JPG")
+        census()
+        bench = ["ILX00101.JPG", "ILX00102.JPG"]
+        check("bench frames are known once the census has run",
+              all(b in (rm.known_frames("cam2") or {}) for b in bench))
+
+        # (c) a bench Capture is recorded within seconds, not at the next tick.
+        rm.CENSUS_AFTER_SHOT_S = 0.3
+        rm.capture_once()
+        newest = lambda n: n.shots[-1]["name"] if n.shots else None  # noqa: E731
+        check("a bench Capture is censused shortly after the shot",
+              bool(wait_for(lambda: newest(n1) in (rm.known_frames("cam1")
+                                                   or {}), 8))
+              and bool(wait_for(lambda: newest(n2) in (rm.known_frames("cam2")
+                                                       or {}), 8)),
+              "cam1 %s known=%s" % (newest(n1), list(rm.known_frames("cam1")
+                                                     or {})[-3:]))
+
+        # (d) a listing that finishes after a run has begun is discarded.
+        mon1 = env.mon("cam1")
+
+        def _list_while_run_begins():
+            rm.active = {"run_id": "racing"}
+            return [{"name": "ILXRACE01.JPG", "size": 1}]
+        mon1.shots = _list_while_run_begins
+        try:
+            census()
+        finally:
+            del mon1.shots
+            rm.active = None
+        check("a census listing taken as a run begins is discarded",
+              "ILXRACE01.JPG" not in (rm.known_frames("cam1") or {}))
+
+        # (e) cam2 is away at run start and joins late.
+        prerun = [s["name"] for s in n2.shots
+                  if s["name"] not in ("ILX00100.JPG",) + tuple(bench)]
+        n2.down()
+        check("cam2 reaches OFFLINE",
+              bool(wait_for(lambda: env.mon("cam2").state
+                            == rigcore.NodeMonitor.OFFLINE, 15)))
+        r = rm.start({"label": "r21", "calibrate": False})
+        root = r["root"]
+        check("the run starts without cam2", r.get("nodes") == ["cam1"],
+              json.dumps(r.get("nodes")))
+        # While a run is open the census lists nothing.
+        calls = []
+        real_shots = mon1.shots
+        mon1.shots = lambda: calls.append(1) or real_shots()
+        try:
+            census()
+        finally:
+            del mon1.shots
+        check("no census listing is taken while a run is open", not calls)
+        during = n2.add_frame(epoch=time.time(), name="ILX00103.JPG")
+        n2.up()
+        check("cam2 is adopted", bool(wait_for(lambda: "cam2" in rm.workers,
+                                               20)))
+        w2 = rm.workers.get("cam2")
+        if w2 is None:
+            return
+        w2.primed.wait(timeout=10)
+        known_old = ["ILX00100.JPG"] + bench + prerun
+        check("the pre-run frames are baselined, not backlog",
+              all(n in w2.seen for n in known_old),
+              "seen=%s" % sorted(w2.seen))
+        check("the worker reports exactly one frame to recover",
+              any(e["kind"] == "pull" and "1 taken before adoption"
+                  in e["msg"] for e in env.evs(node="cam2")),
+              str([e["msg"] for e in env.evs(node="cam2")
+                   if e["kind"] == "pull"]))
+        got = wait_for(lambda: len(_rows(root, "cam2")[1]) >= 1, 25)
+        origs = sorted(str(e.get("orig")) for e in _index(env, root)
+                       if e.get("cam") == 2)
+        check("only the frame shot during the run is pulled into it",
+              bool(got) and origs == [during], "cam2 pulled %s" % origs)
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R22 - a reused camera filename is a new exposure
+# ===========================================================================
+def _r22_reissued_filename_is_pulled_again(opts):
+    sect("R22 a name pulled and deleted, then reissued, is pulled again")
+    env = Env([("cam1", "127.0.0.172", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    real_rig = rigcore.http_json
+    real = runmod.http_json
+    gate = {"fail_delete": False, "empty_until": 0.0}
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        node = env.node("cam1")
+        node.add_frame(epoch=time.time() - 600, name="ILXOLD00.JPG")
+        host = node.host
+
+        def _hj(url, *a, **kw):
+            # The stock fake acknowledges a delete and keeps the file; make it
+            # behave like ilxctl so a deleted name can actually come back.
+            if url.startswith("http://%s:8080/api/shots/delete" % host):
+                body = a[0] if a else kw.get("body")
+                if gate["fail_delete"]:
+                    return {"ok": False, "error": "injected: unlink failed"}
+                with node._lock:
+                    node.shots[:] = [s for s in node.shots
+                                     if s["name"] != body["name"]]
+                return {"ok": True}
+            return real(url, *a, **kw)
+
+        def _listing(url, *a, **kw):
+            if url.endswith("/api/shots") and time.time() < gate["empty_until"]:
+                return []                 # opendir failed: reads as empty
+            return real_rig(url, *a, **kw)
+        runmod.http_json = _hj
+        rigcore.http_json = _listing
+
+        r = env.runmgr.start({"label": "r22", "calibrate": False})
+        root = r["root"]
+        _wait_calibrated(env, 20)
+        w = env.runmgr.workers["cam1"]
+        w.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w)
+        env.timesync.set_exif_offset("cam1", 0.0)
+
+        node.add_frame(epoch=time.time(), name="ILX09999.JPG")
+        check("the frame is pulled", bool(wait_for(lambda: w.pulled == 1, 15)),
+              json.dumps(w.stats()))
+        check("and deleted from the node",
+              bool(wait_for(lambda: not any(s["name"] == "ILX09999.JPG"
+                                            for s in node.shots), 5)))
+        time.sleep(1.0)               # a poll lists the spool without the name
+        # The numbering wraps ~9999 exposures later, long after the 30 s
+        # window in which a same-stem file is taken for a RAW sibling.
+        w._stem_dest.clear()
+        node.add_frame(epoch=time.time(), name="ILX09999.JPG")   # wrapped
+        check("the same name reissued is pulled as a new exposure",
+              bool(wait_for(lambda: w.pulled == 2, 15)), json.dumps(w.stats()))
+        rows = _rows(root, "cam1")[1]
+        origs = sorted(str(e.get("orig")) for e in _index(env, root))
+        check("two rows, two distinct files, one camera name",
+              len(rows) == 2 and len({x["filename"] for x in rows}) == 2
+              and origs == ["ILX09999.JPG", "ILX09999.JPG"],
+              "rows=%d origs=%s" % (len(rows), origs))
+        check("nothing was abandoned or left unpulled",
+              w.failed == 0 and not os.path.exists(
+                  os.path.join(root, "unpulled.jsonl")))
+
+        # A delete that fails leaves the file on the node: listing it again
+        # must not pull it twice.
+        gate["fail_delete"] = True
+        node.add_frame(epoch=time.time(), name="ILX09998.JPG")
+        check("a frame whose delete fails is pulled once",
+              bool(wait_for(lambda: w.pulled == 3 and w.dump_fails >= 1, 15)),
+              json.dumps(w.stats()))
+        time.sleep(1.6)
+        check("and is not pulled again while it stays on the node",
+              w.pulled == 3, "pulled=%s" % w.pulled)
+        gate["fail_delete"] = False
+
+        # A listing that fails open (reads as empty) must not make the
+        # run-start baseline look new when it comes back.
+        gate["empty_until"] = time.time() + 1.5
+        time.sleep(3.0)
+        check("an empty listing does not re-pull the baseline",
+              w.pulled == 3 and "ILXOLD00.JPG" in w.seen
+              and not any(str(e.get("orig")) == "ILXOLD00.JPG"
+                          for e in _index(env, root)),
+              json.dumps(w.stats()))
+    finally:
+        runmod.http_json = real
+        rigcore.http_json = real_rig
+        env.close()
+
+
+# ===========================================================================
+# R23 - a failed run-start calibration does not keep the last run's offset
+# ===========================================================================
+def _r23_failed_calibration_clears_the_old_offset(opts):
+    sect("R23 an offset from the previous run is not carried into this one")
+    env = Env([("cam1", "127.0.0.173", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        mon = env.mon("cam1")
+        env.timesync.set_exif_offset("cam1", 3.0)       # last run's figure
+        env.runmgr.exif_uncertainty["cam1"] = 0.003
+        mon.shutter = lambda af=False: {"ok": False,
+                                        "error": "injected: shutter refused"}
+        try:
+            env.runmgr.start({"label": "r23", "calibrate": False})
+            _wait_calibrated(env, 20)
+        finally:
+            del mon.shutter
+        t = time.time()
+        check("no offset survives a failed calibration",
+              env.timesync.correct_exif("cam1", t) is None
+              and "cam1" not in env.timesync.exif_offset,
+              str(env.timesync.exif_offset))
+        check("and no error bar is left to describe it",
+              env.runmgr.exif_err("cam1") is None,
+              str(env.runmgr.exif_err("cam1")))
+        env.runmgr.stop()
+
+        # Positive control: a working calibration measures it again.
+        env.runmgr.start({"label": "r23b", "calibrate": False})
+        _wait_calibrated(env, 20)
+        off = env.timesync.exif_offset.get("cam1")
+        check("a successful calibration sets the offset and its bar",
+              off is not None and abs(off) < 1.5
+              and env.runmgr.exif_err("cam1") is not None,
+              "offset=%s err=%s" % (off, env.runmgr.exif_err("cam1")))
+
+        # A camera that rejoins mid-run keeps THIS run's offset.
+        env.runmgr.active["config"].update({"auto_capture": True,
+                                            "interval_s": 0.5})
+        env.runmgr._adopt_calibrate(mon)
+        check("a mid-run rejoin does not clear the run's offset",
+              env.timesync.exif_offset.get("cam1") == off,
+              "%s -> %s" % (off, env.timesync.exif_offset.get("cam1")))
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R24 - frames pending at stop leave a record
+# ===========================================================================
+def _r24_pending_at_stop_is_recorded(opts):
+    sect("R24 a frame still pending when the run stops lands in unpulled.jsonl")
+    env = Env([("cam1", "127.0.0.174", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    real_hb = runmod.http_bytes
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        node = env.node("cam1")
+        # A run whose every frame was pulled leaves no sidecar.
+        r = env.runmgr.start({"label": "r24a", "calibrate": False})
+        root_a = r["root"]
+        _wait_calibrated(env, 20)
+        w = env.runmgr.workers["cam1"]
+        w.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w)
+        node.add_frame(epoch=time.time(), name="ILXOK001.JPG")
+        wait_for(lambda: w.pulled == 1, 15)
+        env.runmgr.stop()
+        check("a normal stop writes no unpulled.jsonl",
+              not os.path.exists(os.path.join(root_a, "unpulled.jsonl")))
+
+        # A run stopped while a download keeps failing.
+        r = env.runmgr.start({"label": "r24b", "calibrate": False})
+        root = r["root"]
+        _wait_calibrated(env, 20)
+        w = env.runmgr.workers["cam1"]
+        w.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w)
+        host = node.host
+
+        def _hb(url, *a, **kw):
+            if url.startswith("http://%s:8080/shot/" % host):
+                return None, "injected: link down"
+            return real_hb(url, *a, **kw)
+        runmod.http_bytes = _hb
+        t0 = time.time()
+        w.note_command(t0, path="gpio", fire_seq=5100, edge_seq=0)
+        node.add_frame(epoch=t0, name="ILXPEND1.JPG")
+        check("the frame is claimed and failing its first pull",
+              bool(wait_for(lambda: (w._pending.get("ILXPEND1.JPG") or {})
+                            .get("attempts", 0) >= 1, 10)),
+              str(w._pending))
+        seq0 = env.seq()
+        env.runmgr.stop()
+        path = os.path.join(root, "unpulled.jsonl")
+        recs = ([json.loads(l) for l in open(path) if l.strip()]
+                if os.path.exists(path) else [])
+        check("stop leaves a record of the frame it could not pull",
+              len(recs) == 1 and recs[0].get("orig") == "ILXPEND1.JPG"
+              and recs[0].get("cam") == "cam1", json.dumps(recs)[:200])
+        check("the record says why and carries the claimed command",
+              bool(recs) and "stopped" in recs[0].get("reason", "")
+              and abs(recs[0].get("cmd_epoch", 0) - t0) < 1e-3,
+              json.dumps(recs)[:200])
+        check("the stop names the loss to the operator",
+              any(e["kind"] == "pull_fail" and "ILXPEND1.JPG" in e["msg"]
+                  for e in env.evs(since=seq0)))
+        check("the frame is not counted as failed or pulled",
+              w.failed == 0 and w.pulled == 0, json.dumps(w.stats()))
+    finally:
+        runmod.http_bytes = real_hb
+        env.close()
+
+
+# ===========================================================================
+# R25 - a straggling worker's frame is not indexed into the next run
+# ===========================================================================
+def _r25_straggler_does_not_index_into_the_next_run(opts):
+    sect("R25 a worker that outlives stop() cannot touch the next run")
+    env = Env([("cam1", "127.0.0.175", 1)], poll=0.4, threaded=True,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        env.wait_state("cam1", "CAM_CONNECTED")
+        rm = env.runmgr
+        ra = rm.start({"label": "r25a", "calibrate": False})
+        _wait_calibrated(env, 20)
+        w_old = rm.workers["cam1"]
+        w_old.primed.wait(timeout=8)
+        rm.stop()
+        rb = rm.start({"label": "r25b", "calibrate": False})
+        root_b = rb["root"]
+        check("the second run is a different run",
+              ra["run_id"] != rb["run_id"], "%s / %s"
+              % (ra["run_id"], rb["run_id"]))
+        _wait_calibrated(env, 20)
+        w_new = rm.workers["cam1"]
+        w_new.primed.wait(timeout=8)
+        _drain_spool(env, "cam1", w_new)
+
+        # The old worker was still downloading when stop() gave up on it; its
+        # download finishes now. Its flight_log is still open in real life.
+        w_old._flight = None
+        t = time.time()
+        seq0 = env.seq()
+        w_old._write_flight("Cam1_late.jpg", "ILXLATE1.JPG", t, t, "exif",
+                            0.0, w_old._timebase[1], 0.0)
+        w_old.note_command(time.time() - 60, path="gpio")      # long expired
+        w_old._expire_commands()
+        names = [str(e.get("orig")) for e in _index(env, root_b)]
+        check("its frame is not in the next run's index",
+              "ILXLATE1.JPG" not in names, str(names))
+        with rm._lock:
+            orph = dict(rm.active["orphans"])
+        check("its orphan count is not charged to the next run",
+              not orph.get("cam1"), str(orph))
+        check("the late frame is reported, naming both",
+              any(e["kind"] == "run" and "Cam1_late.jpg" in e["msg"]
+                  and ra["run_id"] in e["msg"] for e in env.evs(since=seq0)),
+              str([e["msg"][:80] for e in env.evs(since=seq0)][-3:]))
+
+        # Control: the new run's own worker indexes normally.
+        w_new._write_flight("Cam1_ok.jpg", "ILXOK001.JPG", t, t, "exif", 0.0,
+                            w_new._timebase[1], 0.0)
+        names = [str(e.get("orig")) for e in _index(env, root_b)]
+        check("the current run's worker still indexes", "ILXOK001.JPG" in names,
+              str(names))
+    finally:
+        env.close()
+
+
+# ===========================================================================
+# R26 - a string is not consent
+# ===========================================================================
+def _r26_strings_do_not_arm_anything(opts):
+    sect("R26 \"false\" does not start auto-capture or arm the strobe")
+    env = Env([("cam1", "127.0.0.176", 1)], poll=0.4, threaded=False,
+              nav=FakeNav(), imu_node="cam9")
+    try:
+        rm = env.runmgr
+        bad = []
+        for v in ("false", "0", "no", "off", "true", [], {}):
+            cfg, err, _w = rm._validate_config({"auto_capture": v,
+                                                "interval_s": 2})
+            if cfg is not None or "auto_capture" not in str(err):
+                bad.append(v)
+        check("a non-boolean auto_capture is refused, naming the field",
+              not bad, "accepted: %r" % bad)
+        good = []
+        for v, want in ((True, True), (False, False), (1, True), (0, False)):
+            cfg, err, _w = rm._validate_config({"auto_capture": v,
+                                                "interval_s": 2})
+            good.append(cfg is not None and cfg["auto_capture"] is want)
+        check("real booleans (and 0/1) still validate, as real booleans",
+              all(good), str(good))
+        try:
+            cfg, err, _w = rm._validate_config({"frames": float("inf")})
+            ok = cfg is None and "frames" in str(err)
+        except OverflowError as e:
+            ok = False
+            err = "OverflowError: %s" % e
+        check("frames=Infinity is refused, not an OverflowError", ok, str(err))
+
+        before = rm.get_strobe()
+        rs = rm.set_strobe({"enabled": "false"})
+        check("a string 'enabled' is refused and the strobe stays as it was",
+              rs.get("ok") is False and rm.get_strobe() == before,
+              json.dumps(rs)[:120])
+        try:
+            rp = rm.set_strobe({"pulse_ms": float("inf")})
+        except OverflowError as e:
+            rp = {"ok": "OverflowError: %s" % e}
+        check("pulse_ms=Infinity is refused, not an OverflowError",
+              rp.get("ok") is False, json.dumps(rp)[:120])
+        ok_on = rm.set_strobe({"enabled": True})
+        ok_off = rm.set_strobe({"enabled": False})
+        check("true/false still arm and disarm it",
+              ok_on.get("ok") and ok_on["strobe"]["enabled"] is True
+              and ok_off.get("ok") and ok_off["strobe"]["enabled"] is False)
+    finally:
+        env.close()
+
+
 # ---------------------------------------------------------------------------
 def suite(opts):
     _r1_offline_member_pauses(opts)
@@ -1684,6 +2742,20 @@ def suite(opts):
     _r12e_worker_retries_its_baseline(opts)
     _r12f_run_json_clock_record(opts)
     _r12g_card_review_imu_window(opts)
+    _r13_adoption_backlog_claims_no_command(opts)
+    _r14_flight_log_failures_do_not_raise(opts)
+    _r15_standalone_strobe_reaches_the_frames(opts)
+    _r16_pulled_counts_exposures(opts)
+    _r17_run_skew_record_is_not_windowed(opts)
+    _r18_start_io_is_outside_the_run_lock(opts)
+    _r19_switched_off_camera_does_not_pause_the_grid(opts)
+    _r20_whole_second_exif_has_a_whole_second_bar(opts)
+    _r21_between_run_frames_are_not_backlog(opts)
+    _r22_reissued_filename_is_pulled_again(opts)
+    _r23_failed_calibration_clears_the_old_offset(opts)
+    _r24_pending_at_stop_is_recorded(opts)
+    _r25_straggler_does_not_index_into_the_next_run(opts)
+    _r26_strings_do_not_arm_anything(opts)
 
 
 if __name__ == "__main__":

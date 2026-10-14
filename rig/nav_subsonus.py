@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""nav_subsonus — the Subsonus over Ethernet as the rig's navigation source.
+"""nav_subsonus — the GNSS Compass over Ethernet as the rig's nav source.
 
 The nav path to date is NMEA 2000 -> iKonvert -> USB serial (rig/nav.py). The
-Subsonus surface unit also speaks Advanced Navigation's binary packet protocol
-(ANPP) over TCP, on ports 16718-16721, and out of the box streams its System
-State packet (ID 20) at 20 Hz on them. This module reads that stream and feeds
-it into the SAME NavReader state — the per-PGN history rings, TimeAuthority,
-snapshot()/fix_at()/flight_row(), the raw log and navlog.replay() — so rigd,
-run.py and the UI see one nav contract whichever cable is plugged in.
+unit on the rig is an Advanced Navigation GNSS Compass, at 192.168.1.60 on the
+rig switch; the Subsonus surface unit is the other AN unit this code reads.
+Both speak Advanced Navigation's binary packet protocol (ANPP) over TCP, port
+16718 by default (a Subsonus streams on 16718-16721), and send a System State
+packet (ID 20; 20 Hz on a Subsonus out of the box). The 100-byte layout the
+GNSS Compass sends is the one confirmed on hardware; the 116-byte Subsonus
+layout is from the published reference and unconfirmed. This module reads that
+stream and feeds it into the SAME NavReader state — the per-PGN history rings,
+TimeAuthority, snapshot()/fix_at()/flight_row(), the raw log and
+navlog.replay() — so rigd, run.py and the UI see one nav contract whichever
+cable is plugged in.
 
 Wire format (docs.advancednavigation.com/subsonus/ANPP)
 -------------------------------------------------------
@@ -30,8 +35,8 @@ Wire format (docs.advancednavigation.com/subsonus/ANPP)
   bytes. Until a live unit confirms it, every decoded packet is sanity-checked
   (finite latitude within +-90, longitude within +-180) and a packet that
   fails is counted in health()["suspect_layout"] and NOT turned into a
-  position. The 100-byte layout the other AN units use (u16 statuses,
-  latitude at 8) is decoded too, so a Certus/Spatial on the bench works.
+  position. The 100-byte layout (u16 statuses, latitude at 8) is decoded too:
+  it is the GNSS Compass's, and the one confirmed on the rig.
 
   filter status bits: 0 orientation filter initialised, 1 navigation filter
   initialised, 2 heading initialised, 3 UTC time initialised, 4-6 GNSS fix

@@ -21,7 +21,12 @@
   <string>org.wildtechnology.wildsync.rigd</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/python3</string>
+    <!-- The venv from docs/INSTALL.md 3a, not /opt/homebrew/bin/python3:
+         Homebrew's Python is externally managed (PEP 668) and refuses the pip
+         install of requirements.txt, so the packages live in the venv. Its
+         python3 is a link to the Homebrew interpreter, so launchd and the
+         timing behaviour below are unchanged. -->
+    <string>__HOME__/rig/venv/bin/python3</string>
     <string>-u</string>
     <string>__REPO__/rig/rigd.py</string>
   </array>

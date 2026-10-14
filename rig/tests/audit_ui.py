@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit regression suite - ui (rig/rig_ui.html), findings U1-U15.
+"""Audit regression suite - ui (rig/rig_ui.html), findings U1-U18.
 
 rig_ui.html is browser JavaScript, so this suite does what soaktest does for
 the Python side: it runs the REAL file. The page's <script> is loaded into
@@ -44,6 +44,19 @@ U14 renderFmtReadback - a format field the body did not report was dropped
 U15 the fleet exposure apply - only a COMPLETELY empty body was refused, so a
     partial one was posted and reported with the same green line as a full
     apply (and the verdict was then erased by the hydrate that follows it).
+
+U16 preflight/pfCheck - counted every CONNECTED node as a camera, so one the
+    operator had switched off (which the run roster drops) appeared in the
+    cameras row, hid the "only one camera" stereo warning, let "no camera
+    connected" pass when only switched-off ones answered, and inflated the
+    GPIO row. A switched-off node must still be accepted as the strobe host.
+
+U17 pollMapLive/mapLiveFix - read nv.fix and nv.online, which /api/nav never
+    sends (it is the flat NavReader snapshot), so the live trail and Follow
+    never moved. A STATIC armed position must still not be plotted.
+
+U18 applyVerdict - an exposure apply that a drained/busy camera had not taken
+    was reported with the same green "fleet now on camN's exposure" line.
 
 U12 the card drain - the flow that gets the irreplaceable RAWs off the cards,
     blocks the next transect while it runs and can wedge a body - had NO UI at
@@ -809,6 +822,89 @@ try{
 
   fetch = __oldFetch;
 }catch(e){ T('U12 drain API calls', false, 'threw ' + e); }
+
+// ---- U16 pre-flight counts only the cameras that will shoot --------------
+try{
+  var pfN = function(name, num, on){
+    return node({name:name, cam_num:num, camera_enabled:on, model:'ILX-LR1'}); };
+  var pfF = function(nodes){ return {nodes:nodes, run:{}, jetson_free_mb:90000,
+                                      jetson_disk_low_mb:5000}; };
+  var pfNoNav = {present:false};
+  var saveStrobe = STROBE;
+
+  STROBE = {enabled:false, node:'cam3', delta_ms:0};
+  var r16 = pfCheck(pfF([pfN('cam1',1,true), pfN('cam2',2,false), pfN('cam3',3,false)]),
+                    {desired:{}}, {anomalies:[]}, pfNoNav);
+  var camRow = r16.rows.filter(function(x){ return x.k==='cameras'; })[0] || {};
+  THAS('U16 the cameras row names the enabled camera', camRow.v, 'cam1');
+  TNOT('U16 ... and not a camera the operator switched off', camRow.v, 'cam2');
+  TNOT('U16 ... nor the other switched-off one', camRow.v, 'cam3');
+  THAS('U16 one enabled camera of three warns there is no stereo pair',
+       r16.warn.join('|'), 'only 1 camera connected');
+  var syncRow = r16.rows.filter(function(x){ return x.k==='sync'; })[0] || {};
+  THAS('U16 the GPIO row counts the cameras that will shoot', syncRow.v, 'all 1');
+
+  var r16b = pfCheck(pfF([pfN('cam1',1,false), pfN('cam2',2,false)]),
+                     {desired:{}}, {anomalies:[]}, pfNoNav);
+  THAS('U16 with every camera switched off Start is blocked', r16b.hard.join('|'),
+       'no camera enabled');
+  var r16c = pfCheck(pfF([]), {desired:{}}, {anomalies:[]}, pfNoNav);
+  THAS('U16 with no node answering the block still says not connected',
+       r16c.hard.join('|'), 'no camera connected');
+
+  // A switched-off camera's Pi is still a legitimate strobe host.
+  STROBE = {enabled:true, node:'cam2', delta_ms:5};
+  var r16d = pfCheck(pfF([pfN('cam1',1,true), pfN('cam2',2,false)]),
+                     {desired:{}}, {anomalies:[]}, pfNoNav);
+  TNOT('U16 a strobe armed on a switched-off but answering node is not '
+       + '"not connected"', r16d.hard.join('|'), 'not connected');
+  STROBE = {enabled:true, node:'cam9', delta_ms:5};
+  var r16e = pfCheck(pfF([pfN('cam1',1,true), pfN('cam2',2,true)]),
+                     {desired:{}}, {anomalies:[]}, pfNoNav);
+  THAS('U16 a strobe armed on a node that is not there still blocks',
+       r16e.hard.join('|'), 'not connected');
+  STROBE = saveStrobe;
+}catch(e){ T('U16 preflight', false, 'threw ' + e); }
+
+// ---- U17 the Map tab's live trail reads the fields /api/nav sends ----------
+try{
+  MAP.live = []; MAP.follow = true; MAP.view = {cx:0, cy:0, scale:1};
+  var live1 = {present:true, fix_kind:'live', valid:true, lat:47.6, lon:-122.3,
+               gateway_online:true};
+  mapLiveFix(live1);
+  TEQ('U17 a live fix starts the trail', MAP.live.length, 1);
+  mapLiveFix(live1);
+  TEQ('U17 the same position is not plotted twice', MAP.live.length, 1);
+  mapLiveFix({present:true, fix_kind:'live', valid:true, lat:47.6001, lon:-122.3,
+              gateway_online:true});
+  TEQ('U17 a position more than 0.5 m on extends the trail', MAP.live.length, 2);
+  var lastPt = MAP.live[MAP.live.length-1];
+  T('U17 Follow recentres the view on the new fix',
+    MAP.view.cx === lastPt.x && MAP.view.cy === lastPt.y,
+    'view ' + MAP.view.cx + ',' + MAP.view.cy + ' want ' + lastPt.x + ',' + lastPt.y);
+  mapLiveFix({present:true, fix_kind:'static', valid:false, lat:47.7, lon:-122.4,
+              static_fix:'quay'});
+  TEQ('U17 an armed STATIC position is not plotted as a track', MAP.live.length, 2);
+  mapLiveFix({present:false});
+  mapLiveFix(null);
+  mapLiveFix({present:true, valid:true, lat:null, lon:null});
+  TEQ('U17 no source, no reply or no position plots nothing', MAP.live.length, 2);
+  MAP.live = []; MAP.follow = false; MAP.view = null;
+}catch(e){ T('U17 map live trail', false, 'threw ' + e); }
+
+// ---- U18 an exposure apply a held camera has not taken is not green -------
+try{
+  var vd = applyVerdict('cam1', ['iso'], [], ['cam2']);
+  THAS('U18 a deferred apply is reported amber', vd, 'var(--warn)');
+  TNOT('U18 ... and never wears the success colour', vd, 'var(--ok)');
+  THAS('U18 ... it names the held camera', vd, 'cam2');
+  THAS('U18 ... and says it will receive the exposure when released', vd,
+       'when released');
+  THAS('U18 with nothing deferred the apply still reads as success',
+       applyVerdict('cam1', ['iso'], [], []), 'var(--ok)');
+  TNOT('U18 a hostile camera name cannot inject markup',
+       applyVerdict('cam1', ['iso'], [], ['<img src=x>']), '<img src=x>');
+}catch(e){ T('U18 deferred verdict', false, 'threw ' + e); }
 
 return JSON.stringify(__R);
 """

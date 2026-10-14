@@ -17,7 +17,8 @@
 #     reference — and chrony elects one master by comparing NTP reference IDs.
 #     The Ubuntu pool in /etc/chrony/chrony.conf is untouched and still wins
 #     whenever the boat has internet.
-# Hostname is preserved and no packages are touched or upgraded.
+# The hostname is kept (a named card is written back as hostname:, an unnamed
+# one keeps the image default) and no packages are touched or upgraded.
 #
 # The chrony step is identical on every card: it derives its own slot from the
 # hostname (pi-camN) and needs no per-node editing. Adding cam4 is one entry in
@@ -27,8 +28,21 @@
 #   __PASSWD_HASH__   the existing `passwd:` value on the card (unchanged)
 #   __CARD_KEY__      the existing ssh-ed25519 line on the card (kept)
 #   __HOST_KEY__      this host's ~/.ssh/id_ed25519.pub
-preserve_hostname: true
+#   __NAME_BLOCK__    the card's own hostname: (with manage_etc_hosts: true),
+#                     or preserve_hostname: true when the card has none. Not
+#                     both: cloud-init ignores hostname: under
+#                     preserve_hostname, which is why the old fixed
+#                     preserve_hostname line renamed every fresh card to the
+#                     image default.
+__NAME_BLOCK__
 ssh_deletekeys: false
+# Create the groups BEFORE the user (cloud-init's user step fails on a group
+# that does not exist). Idempotent where the image already has them, and
+# docs/PI-SETUP.md section 3 declares the same three on a fresh card.
+groups:
+  - gpio
+  - i2c
+  - spi
 users:
   - name: ubuntu
     gecos: wildsync camera node
@@ -71,8 +85,8 @@ runcmd:
 
       n="$(hostname -s)"; n="${n#pi-cam}"
       case "$n" in ''|*[!0-9]*)
-        # Card not named yet (preserve_hostname keeps the image default on a
-        # fresh node): fall back to this node's WIRED address, which is what
+        # Card not named (no hostname: on it, so preserve_hostname keeps the
+        # image default): fall back to this node's WIRED address, which is what
         # the election compares anyway. en*/eth* only — the rig switch and the
         # Starlink Wi-Fi both live on 192.168.1.0/24 and wlan0 is not the rig.
         n="$(ip -4 -o addr show | awk -v s="$SUBNET." '$2 ~ /^(en|eth)/ {split($4,a,"/"); if (index(a[1],s)==1){split(a[1],b,"."); print b[4]-200; exit}}')" ;;

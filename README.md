@@ -10,17 +10,17 @@ Camera Remote SDK, fires it through a GPIO trigger harness, and reads that
 camera's IMU (an **Olive olixVision**, or a Yahboom unit on a node set up for
 it). The host schedules every camera to expose at one shared instant, pulls the
 frames, renames them, and writes a per-camera flight log binding each frame to
-position and orientation. Position, heading and GPS time come from a
-**Subsonus** RTK antenna over NMEA 2000, through an **iKonvert** gateway on the
-host's USB (or, not yet used in the field, from the Subsonus directly over
-Ethernet; `docs/INSTALL.md` §7.1). On a Jetson host the **XR256** strobe can be
-fired into the shared instant as well.
+position and orientation. Position, heading and GPS time come from an
+Advanced Navigation **GNSS Compass** over NMEA 2000, through an **iKonvert**
+gateway on the host's USB (or, not yet used in the field, from the unit
+directly over Ethernet; `docs/INSTALL.md` §7.1). On a Jetson host the **XR256**
+strobe can be fired into the shared instant as well.
 
 ```
                      ┌──────────────────────────────────────────────┐
    browser ─────────►│ rig host: Mac or Jetson Orin NX              │
                      │ rigd + web UI :9090                          │
-   Subsonus ─ N2K ─► │ iKonvert on USB                              │
+ GNSS Compass ─N2K─► │ iKonvert on USB                              │
                      │ Jetson only: chrony master, strobe agent     │──► XR256 (opto board)
                      │ (piagent, strobe role) :8081                 │
                      └───┬───────────────────────────┬──────────────┘
@@ -159,7 +159,7 @@ a process boundary.
 
 | Process | Host | Port | Language | Owns |
 |---|---|---|---|---|
-| `rigd` | rig host (Mac or Jetson) | 9090 | Python 3 | fleet state, desired settings, runs, web UI, nav (iKonvert, or the Subsonus over Ethernet) |
+| `rigd` | rig host (Mac or Jetson) | 9090 | Python 3 | fleet state, desired settings, runs, web UI, nav (iKonvert, or the GNSS Compass / Subsonus over Ethernet) |
 | `piagent` (strobe role) | Jetson host only | 8081 | Python 3, stdlib | the XR256 trigger line, nothing else (`PIAGENT_ROLE=strobe`) |
 | `ilxctl` | each Pi | 8080 | C++17 | the camera over USB via Sony's SDK — settings, live view, image transfer |
 | `piagent` | each Pi | 8081 | Python 3, stdlib | GPIO harness (FOCUS/TRIGGER/EXPOSURE), the node's IMU, node health |
@@ -188,8 +188,9 @@ State on disk:
 ## Requirements
 
 **Mac host:** macOS on Apple Silicon with Python 3 and the packages in
-[`requirements.txt`](requirements.txt) (`python3 -m pip install -r
-requirements.txt`). No camera is attached to the host, so a Mac that only runs
+[`requirements.txt`](requirements.txt), installed in a venv because Homebrew's
+Python refuses a global `pip install` (`docs/INSTALL.md` section 3a has the
+commands). No camera is attached to the host, so a Mac that only runs
 `rigd` does not build `ilxctl`; it stages the Linux SDK for the nodes (below).
 
 **Jetson Orin NX host:** JetPack 6 (Ubuntu 22.04, Python 3.10 — the code also
@@ -219,7 +220,8 @@ and to provision them; a development build on a Mac needs the macOS package.
 [`requirements.txt`](requirements.txt), grouped by the part of the system that
 imports them. Where `deploy.sh` installs them it uses apt packages (see
 the Jetson host and Camera nodes above), not pip; `pip install -r
-requirements.txt` is for a Mac or other development host.
+requirements.txt` is for a Mac (in a venv, `docs/INSTALL.md` section 3a) or
+other development host.
 
 `rig/tests/devrig.py` runs the full UI against two fake cameras on any host,
 with no hardware.

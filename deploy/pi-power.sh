@@ -4,6 +4,8 @@
 #
 #   deploy/pi-power.sh cam1            # apply (config.txt + governor), then reboot
 #   deploy/pi-power.sh cam2 --no-reboot
+#   deploy/pi-power.sh cam3 --strip    # undo: remove the trim, then reboot
+#   usage: pi-power.sh <camN> [--strip] [--no-reboot]
 #
 # What it does, and why each line exists (bench, 2026-08-23: with both nodes
 # firing synchronously one node's PoE port dropped every time; either node
@@ -25,25 +27,53 @@
 #     dedicated injector - not capped clocks - is the actual fix for the
 #     2026-08-23 brown-out. Trimming cam3 would surrender performance to solve
 #     a problem it does not have. cam3 is listed below only so this tool can
-#     ADDRESS the box (e.g. to strip a trim someone applied by mistake); being
-#     addressable is not permission to trim it.
+#     ADDRESS the box (e.g. to strip a trim someone applied by mistake, with
+#     --strip); being addressable is not permission to trim it.
+#
+# --strip is the undo. This header and docs/PI-SETUP.md both said a mistaken
+# trim could be stripped with this tool, but it only ever applied: the config
+# block was removed and re-appended, and the governor unit was always
+# installed, so the only argument that did anything was --no-reboot. Any other
+# second argument was ignored and the node was trimmed and rebooted - a guessed
+# '--remove' on cam3 did exactly what the docs forbid. Unknown options now
+# stop the script before it touches the node.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-name="${1:?usage: pi-power.sh <camN> [--no-reboot]}"
+name="${1:?usage: pi-power.sh <camN> [--strip] [--no-reboot]}"
+shift
+MODE=apply
+REBOOT=1
+for opt in "$@"; do
+  case "$opt" in
+    --strip) MODE=strip;;
+    --no-reboot) REBOOT=0;;
+    *) echo "unknown option '$opt'" >&2
+       echo "usage: pi-power.sh <camN> [--strip] [--no-reboot]" >&2
+       exit 2;;
+  esac
+done
 case "$name" in cam1) ip=192.168.1.201;; cam2) ip=192.168.1.202;; cam3) ip=192.168.1.203;; *) echo "unknown node $name" >&2; exit 1;; esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$ip"
 
-$SSH 'bash -s' <<'REMOTE'
+# MODE is one of two fixed words (checked above), so passing it through the
+# remote command line is safe.
+$SSH "MODE=$MODE bash -s" <<'REMOTE'
 set -u
 CFG=/boot/firmware/config.txt
-sudo cp "$CFG" "$CFG.bak-power-$(date +%Y%m%d-%H%M%S)"
-# strip any earlier power block (ours), then append the current one
-sudo python3 - <<'PY'
-import re, io
+sudo cp "$CFG" "$CFG.bak-power-$(date +%Y%m%d-%H%M%S)" || exit 1
+# strip any earlier power block (ours); apply then appends the current one, and
+# strip leaves the file without it. One set of patterns serves both modes so
+# the undo can never drift from what the apply writes.
+sudo python3 - "$MODE" <<'PY' || exit 1
+import re, sys
+mode = sys.argv[1]
 p = "/boot/firmware/config.txt"
 s = open(p).read()
 s = re.sub(r"\n# >>> wildsync power.*?# <<< wildsync power\n", "\n", s, flags=re.S)
 s = re.sub(r"\n\[pi5\]\n# wildsync power trim \(deploy/pi-resync/install.sh --pi5-power-trim\)\narm_freq=\d+\ndtoverlay=disable-wifi\ndtoverlay=disable-bt\n\[all\]\n", "\n", s)
+if mode == "strip":
+    open(p, "w").write(s.rstrip("\n") + "\n")
+    sys.exit(0)
 block = """
 # >>> wildsync power (deploy/pi-power.sh) — keep two synchronized nodes inside the PoE budget
 [pi5]
@@ -58,6 +88,15 @@ dtoverlay=disable-bt
 """
 open(p, "w").write(s.rstrip("\n") + "\n" + block)
 PY
+if [ "$MODE" = strip ]; then
+  # The governor was set by this unit at boot, so it goes with it; the running
+  # governor and clock revert at the reboot, not before.
+  sudo systemctl disable --now wildsync-power.service >/dev/null 2>&1 || true
+  sudo rm -f /etc/systemd/system/wildsync-power.service
+  sudo systemctl daemon-reload
+  echo "$(hostname): power block removed from config.txt ($(grep -c 'wildsync power' "$CFG" || true) markers left); wildsync-power.service removed; governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor) until reboot"
+  exit 0
+fi
 # governor at the floor, every boot
 sudo tee /etc/systemd/system/wildsync-power.service >/dev/null <<'UNIT'
 [Unit]
@@ -75,7 +114,12 @@ sudo systemctl enable --now wildsync-power.service >/dev/null 2>&1
 echo "$(hostname): config.txt power block written; governor now $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor); cur $(vcgencmd measure_clock arm | cut -d= -f2) Hz"
 REMOTE
 
-if [ "${2:-}" != "--no-reboot" ]; then
+rc=$?
+# A failed remote step followed by a reboot would hide the failure and leave a
+# half-written node to come back up.
+[ "$rc" -eq 0 ] || { echo "$name: remote step failed (exit $rc) - not rebooting" >&2; exit "$rc"; }
+
+if [ "$REBOOT" -eq 1 ]; then
   echo "rebooting $name for config.txt to take effect"
   $SSH 'sudo reboot' 2>/dev/null
 fi

@@ -173,10 +173,14 @@ chpasswd:
   with an HDMI screen and a keyboard when the network is the thing that is
   broken. Generate it locally with `openssl passwd -6` (typed interactively) and
   paste the hash. **Never commit a hash or a password to this repo.** Drop
-  `passwd:`, `lock_passwd:` and `ssh_pwauth:` entirely if you want key-only.
-- `hostname:`, not `preserve_hostname: true`. The resync template preserves the
-  hostname because it re-provisions an already-named node; a fresh card has to
-  be named here, and the name is what the chrony step keys off.
+  `passwd:`, `lock_passwd:` and `ssh_pwauth:` entirely if you want key-only
+  (`deploy/pi-resync/install.sh` then refuses the card, because it carries the
+  existing hash over; add one by hand before running it).
+- `hostname:`, not `preserve_hostname: true`. A fresh card has to be named
+  here, and the name is what the chrony step keys off. `deploy/pi-resync/install.sh`
+  keeps a card's `hostname:` (with `manage_etc_hosts: true`) when it rewrites
+  `user-data`, and writes `preserve_hostname: true` only for a card that has
+  none, i.e. one already booted from an earlier run of the template.
 
 ### `network-config`
 
@@ -567,8 +571,11 @@ instant makes that spike larger, not smaller.
 - Do **not** run `deploy/pi-power.sh cam3`. It caps `arm_freq`, sets
   `dtoverlay=disable-wifi` / `disable-bt`, and pins the cpufreq governor to
   `powersave`. cam3 is listed in that script's address table only so the tool
-  can *reach* the box — e.g. to strip a trim someone applied by mistake.
-  Being addressable is not permission to trim.
+  can *reach* the box — e.g. to strip a trim someone applied by mistake with
+  `deploy/pi-power.sh cam3 --strip`, which removes the config block and the
+  governor unit and reboots (`--no-reboot` skips that; an unknown option stops
+  the script before it touches the node). Being addressable is not permission
+  to trim.
 - Do **not** pass `--pi5-power-trim` when writing cam3's card with
   `deploy/pi-resync/install.sh`.
 - `pi-power.sh` is **opt-in, per node, always run by hand**. `deploy.sh` does

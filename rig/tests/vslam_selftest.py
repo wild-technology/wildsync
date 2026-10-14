@@ -22,6 +22,9 @@ What it checks:
     direction, the PnP chain must come out METRIC within 10%, the GPS
     cross-check ratio must sit near 1.0, a single-plane (mono-degenerate)
     scene must still track, and missing cam2 halves must fall back cleanly
+  * a saved stereo calibration: frozen R,T come with the file's own K1 focal
+    (a guessed focal scaled every metre by f_guess/f_true), a missing K1 keeps
+    the caller's intrinsics, and the status says which one is in use
   * auto mode: a cam1+cam2 dir decides stereo, a cam1-only dir decides mono
   * the JSON/PLY writers
 
@@ -516,6 +519,79 @@ def test_stereo_unpaired(f1s, f2s):
           "cam2_dropped=%d" % eng.stats["cam2_dropped"])
 
 
+def _fake_cal(**over):
+    cal = {"R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "T": [-BASE_M, 0.0, 0.0],
+           "baseline_m": BASE_M, "image_size": [640, 480],
+           "K1": [[500.0, 0, 320.0], [0, 500.0, 240.0], [0, 0, 1]],
+           "K2": [[500.0, 0, 320.0], [0, 500.0, 240.0], [0, 0, 1]]}
+    cal.update(over)
+    return cal
+
+
+def test_saved_calibration(f1s, f2s):
+    sect("stereo: a saved calibration brings its own focal (R,T are only "
+         "metric against that K)")
+    real = vslam.load_stereo_calibration
+    guess = vslam.Intrinsics(width=640, height=480, focal_px=350.0)
+    kw = dict(_engine_kw(), intrinsics=guess)
+    try:
+        vslam.load_stereo_calibration = lambda *a, **k: _fake_cal()
+        r = vslam.VslamRunner(mode="stereo", engine_kw=kw)
+        eng = r.engine
+        check("the engine uses the file's K1 focal, not the guess",
+              abs(eng.intrinsics.focal_px - 500.0) < 1e-9,
+              "focal %s" % eng.intrinsics.focal_px)
+        check("the caller's own Intrinsics object is not modified",
+              guess.focal_px == 350.0)
+        check("extrinsics are frozen from the file",
+              eng.baseline_calibrated and eng._ext is not None)
+        ups = _feed_stereo(eng, f1s, f2s)
+        exp = STEP_M * (len(ups) - 1)
+        got = _path_len(ups)
+        check("the metric path is within 3% of truth", len(ups) >= 8
+              and 0.97 * exp < got < 1.03 * exp,
+              "vo %.2f m vs true %.2f m (%d updates)" % (got, exp, len(ups)))
+        # Pure lateral motion cancels a focal error out of the PATH, but not
+        # out of depth: z = f*b/disparity scaled by f_guess/f_true (0.7 here).
+        # The far plane of the synthetic scene is at 25 m and carries most of
+        # the landmarks.
+        zs = sorted(p[2] for p in eng.landmarks)
+        med = zs[len(zs) // 2] if zs else 0.0
+        check("landmark depth is metric: median within 3% of the 25 m plane "
+              "(the 350 px guess put it near 17 m)",
+              len(zs) > 100 and 0.97 * 25.0 < med < 1.03 * 25.0,
+              "median landmark z %.2f m over %d" % (med, len(zs)))
+        check("the status says the intrinsics came from the calibration",
+              "intrinsics from the saved calibration" in eng.calib_status,
+              eng.calib_status)
+
+        vslam.load_stereo_calibration = lambda *a, **k: _fake_cal(
+            image_size=[1280, 960], K1=[[1000.0, 0, 640], [0, 1000.0, 480],
+                                         [0, 0, 1]])
+        eng2 = vslam.VslamRunner(mode="stereo", engine_kw=kw).engine
+        check("a calibration at another image size is rescaled to the stream",
+              abs(eng2.intrinsics.focal_px - 500.0) < 1e-9,
+              "focal %s" % eng2.intrinsics.focal_px)
+
+        for label, bad in (("zero K1", dict(K1=[[0.0, 0, 320], [0, 0, 240],
+                                                 [0, 0, 1]])),
+                           ("no K1", dict(K1=None)),
+                           ("no image_size", dict(image_size=None)),
+                           ("non-finite focal", dict(
+                               K1=[[float("nan"), 0, 0], [0, 1, 0],
+                                   [0, 0, 1]]))):
+            vslam.load_stereo_calibration = lambda *a, _b=bad, **k: \
+                _fake_cal(**_b)
+            e3 = vslam.VslamRunner(mode="stereo", engine_kw=kw).engine
+            check("%s keeps the caller's intrinsics and still freezes R,T"
+                  % label, e3.intrinsics.focal_px == 350.0
+                  and e3._ext is not None, "focal %s" % e3.intrinsics.focal_px)
+        check("a guessed focal with a measured baseline is flagged",
+              "GUESSED" in e3.calib_status, e3.calib_status)
+    finally:
+        vslam.load_stereo_calibration = real
+
+
 def test_runner_auto(f1s, f2s, mono_frames):
     sect("VslamRunner auto mode")
     # (a) cam1+cam2 with matching instants -> stereo
@@ -594,6 +670,7 @@ def main():
         test_stereo_metric(f1s, f2s)
         test_stereo_planar()
         test_stereo_unpaired(f1s, f2s)
+        test_saved_calibration(f1s, f2s)
         test_runner_auto(f1s, f2s, frames)
     else:
         print("\n== synthetic tracking .. runner: SKIPPED (cv2/numpy not "

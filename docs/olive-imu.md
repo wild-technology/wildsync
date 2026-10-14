@@ -54,9 +54,11 @@ curl -s 192.168.1.20N:8081/health | python3 -c "import sys,json; print(json.load
 found, check its USB-C cable and `systemctl status olive-bridge` on the node. The
 IMU tab shows each Olive live, and the Calib tab's **Calibrate both** records the
 gyro bias, accelerometer norm and mounting attitude of each IMU from a ten-second
-still window (refused if anything moves; saved to `~/rig/imu_calibration.json`).
-The Olive's AHRS stream reports a zeroed gyro at rest, which is its own on-device
-bias correction.
+still window (refused if anything moves, which includes a steady tilt of more
+than 1 deg across the window and a steady rate above 4 dps mean; saved to
+`~/rig/imu_calibration.json`, where each camera's entry carries a
+`tilt_drift_deg` field). The Olive's AHRS stream reports a zeroed gyro at rest,
+which is its own on-device bias correction.
 
 **Physical check.** With the boat still, `|(ax,ay,az)|` should be about 1 g and
 roll and pitch near the mount's true attitude; rotate the housing by hand and

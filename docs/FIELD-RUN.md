@@ -17,7 +17,7 @@ text says so.
 | cam2 | Pi 4, 192.168.1.202, on the Ubiquiti 2.5G PoE switch |
 | IMUs | one Olive olixVision per camera, on that camera's Pi (USB-C, `olive0`); each camera's flight log carries its own IMU's attitude |
 | clocks | **Jetson host:** the Jetson is the chrony master; the Pis follow it and peer each other as a fallback. **Mac host:** not a master; the Pis peer each other (~0.6 ms apart with no upstream) and rigd corrects for the host's offset |
-| nav | Subsonus RTK antenna on the NMEA 2000 backbone → iKonvert → the host's USB (`/dev/serial/by-id/usb-FTDI_…` on a Jetson, `/dev/cu.usbserial-…` on a Mac); **iKonvert DIP switches all ON for RAW mode** or nav stays silent. Alternative, not yet used in the field: the Subsonus on the rig switch over Ethernet, `~/rig/nav.json` `{"source": "anpp://<address>"}` (`docs/INSTALL.md` §7.1) |
+| nav | Advanced Navigation **GNSS Compass** on the rig switch at **192.168.1.60/24** (static; gateway and DNS 192.168.1.1), read over Ethernet: `~/rig/nav.json` `{"source": "anpp://192.168.1.60"}` (`docs/INSTALL.md` §7.1; confirmed on the rig 2026-10-15, not yet used in a field run). Alternative: the unit on the NMEA 2000 backbone → iKonvert → the host's USB (`/dev/serial/by-id/usb-FTDI_…` on a Jetson, `/dev/cu.usbserial-…` on a Mac); **iKonvert DIP switches all ON for RAW mode** or nav stays silent |
 
 **Why cam1 is on an injector:** two nodes firing in sync drew more than the
 switch's PoE budget and it dropped a port every time (measured; not a Pi
@@ -63,11 +63,16 @@ the port power-cycle events.
    work, by design; that is the rule holding, not a fault. The only way to lift
    it is to restart ilxctl with `--allow-autofocus` (bench only) — a node in
    that state advertises `afAllowed:true` to the whole fleet.
-5. **Nav.** Subsonus powered with an RTK fix, iKonvert in RAW mode (all four
-   DIP switches ON, power-cycle it after changing them) — or, over Ethernet,
-   the Subsonus reachable at the address in `~/rig/nav.json` and `/api/diag`'s
-   `nav` block showing `packets` climbing with `fix: rtk_fixed`. The header
+5. **Nav.** The GNSS Compass powered and reachable at 192.168.1.60, the address
+   in `~/rig/nav.json`, with `/api/diag`'s `nav` block showing `packets`
+   climbing and `fix` at `3d` or better (`rtk_fixed` only when corrections
+   reach the unit) — or, on the iKonvert path, the iKonvert in RAW mode (all
+   four DIP switches ON, power-cycle it after changing them). The header
    reads `nav fix`, and `/api/diag`'s `time` block shows the GPS time source.
+   The unit's heading reads "Heading Unlocked" until its dual-antenna solution
+   locks, which takes a few minutes with sky view or movement; a 3D fix is what
+   it has without corrections, because RTK needs an NTRIP source reachable
+   from the unit and the isolated rig segment does not provide one.
    Without nav, the flight log uses the armed static fix in
    `~/rig/static_fix.json` — edit that to today's launch point. The preflight
    will say "STATIC fix in use"; that is a choice, hit Start anyway.
@@ -212,6 +217,11 @@ It is pulled off the card **between runs**:
   `python3 rig/ingest.py --write-sums <run_id>` records one, and that records
   the files as they are at that moment. Details: `docs/PROTOCOL.md`, "Run
   provenance".
+- **Exit status.** `drain.py` exits 1 on any per-shot error (2 for `--dest` or
+  `--limit` while rigd runs). `ingest.py` exits 1 on a refused or ambiguous
+  series, conflicts, a hash mismatch, or files on the card with nothing
+  matched, and 0 otherwise, so `drain.py … && ingest.py …` stops at a failure.
+  `--verify` keeps 0/1/2 (above).
 - **What recorded a run.** `run.json` carries a `software` object (version,
   commit, dirty flag, `git describe`) written at run start, and `events.log` a
   `software:` line. A run recorded against the test simulators is marked

@@ -32,6 +32,7 @@ import os
 import re
 import threading
 import time
+import weakref
 
 import rigcore
 from rigcore import http_json, http_bytes
@@ -113,6 +114,20 @@ def _exif_capture(jpeg_bytes):
         return base + frac, sub
     except Exception:  # noqa: BLE001
         return None, False
+
+
+def _want_bool(v, what):
+    """A REAL bool: JSON true/false, or the integers 0/1. Nothing else.
+
+    A truthy STRING is not consent: "false" and "no" are non-empty, so
+    {"auto_capture": "false"} started a firing grid for a run the client asked
+    to be manual, and {"enabled": "false"} armed the strobe. rigd.want_bool is
+    the same rule; this module is imported by rigd, so it cannot import it."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    raise ValueError("%s must be true or false (got %r)" % (what, v))
 
 
 def _exif_capture_epoch(jpeg_bytes):
@@ -260,6 +275,11 @@ class PullWorker(threading.Thread):
         # exists to prevent, on the last frame of the transect. One transect,
         # one clock (audit 2026-08-23).
         self._timebase = provider.time_base()
+        # ...and the run it belongs to. stop() waits for a worker at most 8 s
+        # (a download is allowed 30), so a straggler can finish after the NEXT
+        # run has started; index_frame() and note_orphan() judge only "is some
+        # run active", and its frame was indexed into the wrong transect.
+        self._run_id = (provider.active or {}).get("run_id")
         self._stopev = threading.Event()
         # Set once the first poll has been through: a camera adopted mid-run
         # must get to list (and claim) its backlog before anything starts firing
@@ -292,6 +312,19 @@ class PullWorker(threading.Thread):
         # can deliver two files (RAW+JPEG); they are ONE exposure and share one
         # command, one GPIO edge and one flight_log row.
         self._stem_cmd = {}
+        # Names an ADOPTED worker found already on the node and was never going
+        # to own a command for: they were exposed before this worker existed,
+        # so no command queued after adoption can be theirs (see _baseline).
+        # Barred from _claim until they are pulled or abandoned.
+        self._precmd = set()
+        # Names whose Pi spool copy this worker has CONFIRMED deleted. `seen`
+        # is "handled this run", but the body's numbering rolls over (ILX09999
+        # back to ILX00001), so a name that was pulled and deleted can come
+        # back as a different exposure. Such a name leaves `seen` once a
+        # listing has shown it ABSENT (see _poll_once): the delete is only
+        # believed when the node agrees, and a failed delete never enters the
+        # set at all - that file is still on the node and must not be re-pulled.
+        self._gone = set()
         # camera stem -> (CamN_<instant> base name already written for that
         # release, when it was written), so the second file lands beside the
         # first instead of being renamed to its own (later) pull instant.
@@ -389,6 +422,14 @@ class PullWorker(threading.Thread):
         with self._lock:
             if name in self.cmd_epoch:
                 return self.cmd_epoch[name]
+            if name in self._precmd:
+                # Taken before this worker existed (adoption backlog). The
+                # first command queued after adoption belongs to a LATER
+                # survey frame; popping it here shifted every later frame of
+                # the camera by one shot period for the rest of the run. Gated
+                # here, not at the poll's call site, because _capture_instant
+                # calls _claim again for any frame without a claim.
+                return None
             stem = _cam_stem(name)
             rec = self._stem_cmd.get(stem)
             if rec is None:
@@ -443,7 +484,8 @@ class PullWorker(threading.Thread):
             self.orphans += len(dropped)
             total = self.orphans
         if dropped:
-            self.provider.note_orphan(self.mon.name_, len(dropped))
+            self.provider.note_orphan(self.mon.name_, len(dropped),
+                                      run_id=self._run_id)
             # Every one is counted in run.json; the alert itself is rate-limited
             # so a camera that has stopped delivering does not bury the journal
             # under one warning every shot.
@@ -526,6 +568,18 @@ class PullWorker(threading.Thread):
             # have already accounted for stay accounted for.
             backlog = sorted(listing - set(known))
             self.seen |= (listing - set(backlog))
+            if self.adopted and not late:
+                # They were exposed before this worker existed, so no command
+                # queued here can be theirs: the first one belongs to a later
+                # survey frame, and letting the backlog claim it shifted every
+                # later frame of the camera by one period. A `late` worker is
+                # different - it existed from run start, so the frames shot
+                # during its listing outage DO own the commands queued then.
+                # Frames still in flight at adoption are not in `backlog` and
+                # remain exposed to this; only an EXIF or EXPOSURE-edge
+                # cross-check can see those.
+                with self._lock:
+                    self._precmd = set(backlog)
         else:
             # First sight of this camera in this session: its save dir is never
             # pruned, so everything in it predates us and is not survey data.
@@ -569,7 +623,10 @@ class PullWorker(threading.Thread):
         except OSError as e:
             self._flight_fh = None
             self._flight = None
-            self.events.emit(
+            # The worker has no event log of its own: this handler used to
+            # call self.events, raise AttributeError out of run() and kill the
+            # thread before its first pull - the opposite of what it says.
+            self.provider.events.emit(
                 "error", "pull",
                 "[%s] flight_log.csv cannot be written (%s) - frames will "
                 "still be pulled, but every position/attitude row for this "
@@ -600,10 +657,7 @@ class PullWorker(threading.Thread):
             # the full 8 s timeout for a worker that has not baselined.
             self.primed.set()
             if self._stopev.wait(self.BASELINE_RETRY_WAIT_S):
-                try:
-                    self._flight_fh.close()
-                except OSError:
-                    pass
+                self._close_flight()
                 return
         while True:
             try:
@@ -614,8 +668,49 @@ class PullWorker(threading.Thread):
             self.primed.set()
             if self._stopev.wait(0.4):
                 break
+        self._note_pending_at_stop()
+        self._close_flight()
+
+    def _note_pending_at_stop(self):
+        """Record the frames still waiting for a pull when the run stopped.
+
+        stop() gives the workers a 6 s grace, but a failing frame retries no
+        sooner than ~4.4 s apart and needs MAX_ATTEMPTS of them, and a node
+        that is offline burns no attempts at all - so a frame can be cut off
+        mid-retry. The JPEG stays on the Pi spool and the card, and the NEXT
+        run baselines the spool away, so without this line its identity (name,
+        claimed command) exists nowhere and ingest meets its card RAW as an
+        unexplained leftover. Only writes the sidecar: `seen`, `_pending` and
+        the counters are left as they were, and the grace is not extended."""
+        with self._lock:
+            names = sorted(self._pending, key=lambda n: (_cam_stem(n), n))
+            claims = {n: self.cmd_epoch.get(n) for n in names}
+        names = [n for n in names
+                 if not self.provider.is_calibration_frame(self.mon.name_, n)]
+        for name in names:
+            rec = claims.get(name)
+            self._note_unpulled(
+                name, "run stopped with frame still pending after %d attempts"
+                % self._pending.get(name, {}).get("attempts", 0),
+                epoch=rec.get("epoch") if isinstance(rec, dict) else None)
+        if names:
+            self.provider.events.emit(
+                "warn", "pull_fail",
+                "run stopped with %d frame(s) still to pull from %s (%s%s) - "
+                "NOT in the survey; they are still on the node and on the "
+                "card, and unpulled.jsonl keeps their identity for ingest"
+                % (len(names), self.mon.name_, ", ".join(names[:3]),
+                   ", ..." if len(names) > 3 else ""),
+                node=self.mon.name_, frames=names[:20])
+
+    def _close_flight(self):
+        # None once the flight_log has failed (open, header or a row write):
+        # that degraded state is legitimate and must not raise on the way out.
+        fh = self._flight_fh
+        if fh is None:
+            return
         try:
-            self._flight_fh.close()
+            fh.close()
         except OSError:
             pass
 
@@ -634,6 +729,19 @@ class PullWorker(threading.Thread):
             return
         self.provider.remember_frames(self.mon.name_,
                                       [s["name"] for s in shots])
+        # A name this worker pulled and deleted, and that the node no longer
+        # lists, is free again: if it comes back it is a NEW exposure (the
+        # body's numbering rolls over). Left in `seen` it was skipped for the
+        # rest of the run - never pulled, never deleted, the spool filling,
+        # and only a rate-limited frames_missing to show for it. Only names
+        # whose delete was confirmed are considered, so a listing that fails
+        # open (an unreadable save dir reads as []) cannot release the
+        # run-start baseline.
+        if self._gone:
+            listed = {s["name"] for s in shots}
+            for n in [n for n in self._gone if n not in listed]:
+                self._gone.discard(n)
+                self.seen.discard(n)
         # A calibration exposure is landing on this node right now and has not
         # been named yet. Hold off listing anything new for the second or two it
         # takes the calibration to identify its own frame: the alternative is a
@@ -691,12 +799,14 @@ class PullWorker(threading.Thread):
                 self._note_recent(name)
                 self._pending.pop(name, None)
                 self._release_claim(name, requeue=False)
+                self._precmd.discard(name)
                 continue
             p["attempts"] += 1
             if p["attempts"] >= self.MAX_ATTEMPTS:
                 self.seen.add(name)
                 self._note_recent(name)
                 self._pending.pop(name, None)
+                self._precmd.discard(name)
                 self.failed += 1
                 # The frame is gone from the survey, so its command belongs to
                 # nobody: drop it rather than let the next frame inherit it.
@@ -704,7 +814,8 @@ class PullWorker(threading.Thread):
                 if lost is not None:
                     with self._lock:
                         self.orphans += 1
-                    self.provider.note_orphan(self.mon.name_, 1)
+                    self.provider.note_orphan(self.mon.name_, 1,
+                                              run_id=self._run_id)
                 self._note_unpulled(name, "abandoned after %d pull attempts"
                                     % p["attempts"],
                                     epoch=(lost or {}).get("epoch")
@@ -895,10 +1006,15 @@ class PullWorker(threading.Thread):
             except OSError:
                 pass
             return fail("error", "write %s failed: %s" % (fname, e))
-        self.pulled += 1
         # The first file of a release owns the row; siblings only get the name.
         row_frame = base is None
         if row_frame:
+            # `pulled` is compared with `fired` (stop()'s final-shot grace,
+            # the frames_missing alarm) and fired counts EXPOSURES, so a RAW
+            # sibling must not count: with RAW+JPEG it doubled the figure,
+            # ended the grace before the last shot was even listed and hid a
+            # camera that had stopped delivering.
+            self.pulled += 1
             self._stem_dest.pop(stem, None)          # keep insertion order
             self._stem_dest[stem] = (os.path.splitext(fname)[0], time.time())
             for k in list(self._stem_dest)[:-256]:
@@ -915,6 +1031,7 @@ class PullWorker(threading.Thread):
                            {"confirm": "delete", "name": name}, timeout=5)
             if dr.get("ok"):
                 self.dumped += 1
+                self._gone.add(name)
             else:
                 self.dump_fails += 1
         except Exception:  # noqa: BLE001
@@ -1242,7 +1359,7 @@ class PullWorker(threading.Thread):
         with self._lock:
             self.orphans += 1
             total = self.orphans
-        self.provider.note_orphan(self.mon.name_, 1)
+        self.provider.note_orphan(self.mon.name_, 1, run_id=self._run_id)
         if self.provider.warn_once("orphan:%s" % self.mon.name_, 20.0):
             self.provider.events.emit(
                 "warn", "orphan_fire",
@@ -1314,7 +1431,11 @@ class PullWorker(threading.Thread):
             except (OSError, ValueError) as e:
                 self._flight = None
                 self._flight_fh = None
-                self.events.emit(
+                # provider.events, not self.events (there is none): the
+                # AttributeError escaped after the JPEG was on host disk and
+                # its Pi spool copy deleted, left the frame pending, and the
+                # retries then abandoned it with no row and no index entry.
+                self.provider.events.emit(
                     "error", "pull",
                     "[%s] flight_log.csv stopped accepting rows (%s) - "
                     "frames continue, positions from here are LOST"
@@ -1354,7 +1475,7 @@ class PullWorker(threading.Thread):
                                   node=self.mon.name_,
                                   path=(claim or {}).get("path"),
                                   rise=rise, strobe=strobe,
-                                  clk_off=applied_off)
+                                  clk_off=applied_off, run_id=self._run_id)
 
     def stats(self):
         with self._lock:
@@ -1398,6 +1519,27 @@ def _r6(v, n=6):
     reads as "this node's clock agrees with the host exactly", which is a
     measurement nobody made (audit 2026-08-24)."""
     return None if v is None else round(v, n)
+
+
+def _census_loop(ref):
+    """RunManager's idle spool census. Holds only a weak reference, so a
+    RunManager that is dropped (a test harness, a reloaded daemon) takes its
+    census thread with it instead of listing dead monitors forever."""
+    while True:
+        rm = ref()
+        if rm is None:
+            return
+        period = rm.CENSUS_PERIOD_S
+        del rm
+        time.sleep(period)
+        rm = ref()
+        if rm is None:
+            return
+        try:
+            rm._census_once()
+        except Exception:  # noqa: BLE001 - housekeeping must never raise
+            pass
+        del rm
 
 
 class RunManager:
@@ -1456,6 +1598,7 @@ class RunManager:
         # node -> Lock. Only one calibration pass may hold a node at a time.
         self._cal_locks = {}
         self._known_frames = {}
+        self._census_pending = False
         # Sticky per-node GPIO capability and the rate limiters for the alerts
         # that would otherwise fire once per shot at 2 fps.
         self._gpio_ok = {}
@@ -1464,6 +1607,8 @@ class RunManager:
         # strobe node at T + delta, where T is the shot's shared target instant.
         # Persisted so a rigd restart mid-survey keeps the operator's choice.
         self.strobe = self._load_strobe()
+        threading.Thread(target=_census_loop, args=(weakref.ref(self),),
+                         daemon=True).start()
 
     # ---- strobe config ------------------------------------------------------
     STROBE_DEFAULT = {"enabled": False, "node": "cam1",
@@ -1500,7 +1645,10 @@ class RunManager:
         with self._lock:
             cfg = dict(self.strobe)
         if "enabled" in changes:
-            rep["enabled"] = bool(changes["enabled"])
+            try:
+                rep["enabled"] = _want_bool(changes["enabled"], "enabled")
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
         if "node" in changes:
             names = [m.name_ for m in self.monitors]
             if changes["node"] not in names:
@@ -1523,7 +1671,7 @@ class RunManager:
         if "pulse_ms" in changes:
             try:
                 pm = int(changes["pulse_ms"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return {"ok": False, "error": "pulse_ms is not a number"}
             if not (1 <= pm <= 50):
                 return {"ok": False,
@@ -1793,8 +1941,63 @@ class RunManager:
             d = self._known_frames.get(node)
             return dict(d) if d is not None else None
 
-    def remember_frames(self, node, names):
+    # ---- idle spool census ---------------------------------------------------
+    # known_frames used to be filled by pull workers only, i.e. only while a
+    # run was open. A frame shot BETWEEN runs - a bench Capture, a bare
+    # calibrate - was therefore never known, and when a camera joined the next
+    # run late its adopted worker classed that frame as "taken during the run
+    # while the camera was away" and pulled it into the transect as survey
+    # data. Listing every connected node while NO run is open closes that: what
+    # is on a node when a run starts is, by construction, older than the run.
+    CENSUS_PERIOD_S = 10.0
+    # A shot lands in the spool ~0.5-1.5 s after the release, so the census
+    # that follows a bench shot waits for it.
+    CENSUS_AFTER_SHOT_S = 3.0
+
+    def _census_once(self):
+        """List each connected node and remember the names, if no run is open.
+
+        A run that begins while a listing is in flight discards it: that
+        listing may hold frames the run's own cameras took, which a late
+        worker must still pull. The check and the write are one critical
+        section for the same reason. A failed listing (None) is skipped,
+        never recorded as an empty spool."""
+        for m in list(self.monitors):
+            if self.active is not None or getattr(self, "draining", None):
+                return
+            if not m.is_connected():
+                continue
+            shots = m.shots()
+            if shots is None:
+                continue
+            if not self.remember_frames(m.name_, [s["name"] for s in shots],
+                                        only_idle=True):
+                return
+
+    def _census_soon(self):
+        """One census shortly after a bench shot, so it is known within
+        seconds rather than at the next tick. At most one pending."""
         with self._lock:
+            if self.active is not None or self._census_pending:
+                return
+            self._census_pending = True
+
+        def _go():
+            try:
+                time.sleep(self.CENSUS_AFTER_SHOT_S)
+                self._census_once()
+            except Exception:  # noqa: BLE001 - housekeeping must never raise
+                pass
+            finally:
+                self._census_pending = False
+        threading.Thread(target=_go, daemon=True).start()
+
+    def remember_frames(self, node, names, only_idle=False):
+        """Record frame names as seen on `node`. With `only_idle`, only if no
+        run is open (checked under the lock); returns whether it recorded."""
+        with self._lock:
+            if only_idle and self.active is not None:
+                return False
             d = self._known_frames.setdefault(node, {})
             for n in names:
                 d[n] = None
@@ -1802,6 +2005,7 @@ class RunManager:
             if over > 0:
                 for k in list(d)[:over]:
                     del d[k]
+        return True
 
     def shot_period(self):
         """Nominal seconds between scheduled shots, or 0 when not auto-capturing."""
@@ -1860,12 +2064,21 @@ class RunManager:
         warns = []
         try:
             frames = int(cfg.get("frames", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: json.loads accepts the literal Infinity.
             return None, "frames is not a number", warns
         if not (0 <= frames <= self.MAX_FRAMES):
             return None, ("frames %d is outside 0..%d (0 means 'until stopped')"
                           % (frames, self.MAX_FRAMES)), warns
         cfg["frames"] = frames
+        # Normalised to a real bool before anything reads it: shot_period()
+        # and the capture arm in _calibrate_and_arm test it by truthiness too.
+        if cfg.get("auto_capture") is not None:
+            try:
+                cfg["auto_capture"] = _want_bool(cfg["auto_capture"],
+                                                 "auto_capture")
+            except ValueError as e:
+                return None, str(e), warns
         if cfg.get("auto_capture"):
             try:
                 iv = float(cfg.get("interval_s", 2.0))
@@ -1915,6 +2128,17 @@ class RunManager:
             st = http_json("http://%s:8080/api/status" % m.host, timeout=5)
             if isinstance(st, dict) and st.get("controlMode") == "transfer":
                 stuck.append(m.name_)
+        # Begin this run's edge stream at "now" so no bench-test edge is
+        # inherited as a survey frame's capture instant. Outside the lock, and
+        # before the workers and the calibration thread exist: it does one
+        # blocking HTTP call per monitor (3 s each for an unplugged slot), and
+        # under the run lock that stalled known_frames/remember_frames, every
+        # status poll and the first pulls. Skipped when the run is going to be
+        # refused below, so a double-submitted Start cannot reset the edge
+        # cursors of a run that is already live.
+        if not stuck and not self.active \
+                and not getattr(self, "draining", None):
+            self.reset_edge_cursors()
         with self._lock:
             # Re-check under the lock: the probe released it, so a run or a
             # drain could have started in the gap.
@@ -1987,15 +2211,22 @@ class RunManager:
                    "clk_applied": [None, None, None, None]}
             self.active = run
             self.workers = {}
+            # The camera-clock offset is a per-body constant MEASURED at run
+            # start. Carried over from an earlier run it outlived a failed
+            # calibration here, while every "unmeasured, falls back to the
+            # command epoch" event said otherwise: frames were stamped from
+            # the old offset with the old few-ms bar, and a body clock set
+            # right since then made the cross-check disagree on every frame.
+            # All monitors, not only `live`, so a camera adopted late starts
+            # unmeasured too; mid-run adoption never clears (its offset, if
+            # any, is this run's).
+            self._forget_exif_offsets()
             for m in live:
                 cam_dir = os.path.join(root, m.name_)
                 w = PullWorker(m, cam_dir, self)
                 w.start()
                 self.workers[m.name_] = w
             self._write_run_json()
-            # Begin this run's edge stream at "now" so no bench-test edge is
-            # inherited as a survey frame's capture instant.
-            self.reset_edge_cursors()
             self.events.emit("info", "run", "run started: %d cameras" % len(live),
                              nodes=run["nodes"], run_id=rid,
                              time_source=time_src,
@@ -2042,6 +2273,13 @@ class RunManager:
                     "gps_offset_s": round(time_off, 3),
                     "warnings": warns,
                     "host_offset_s": round(self.fleet_clock_offset(live), 6)}
+
+    def _forget_exif_offsets(self):
+        for m in self.monitors:
+            self.exif_uncertainty.pop(m.name_, None)
+            # TimeSync has no deleter; its own lock guards the map.
+            with self.timesync._lock:
+                self.timesync.exif_offset.pop(m.name_, None)
 
     def _new_run_root(self, now, label):
         """A run_id whose directory does not already exist.
@@ -2319,6 +2557,13 @@ class RunManager:
     # node stopped throwing good stamps away, but the host still dressed a
     # software stamp as a hardware one (audit 2026-08-24, VERIFY).
     EDGE_EPOCH_UNMEASURED_S = 0.25
+    # What a camera clock is worth when the body wrote no SubSecTimeOriginal.
+    # The calibration sample and every later frame are then each quantised to a
+    # whole second, so the offset and the instant it corrects are both good to
+    # ~1 s and the EXIF tier is worth the same 1.5 s _claim_tolerance asserts
+    # for that case (PROTOCOL.md). The edge/command error bar recorded at
+    # calibration (a few ms) says nothing about that quantisation.
+    EXIF_WHOLE_SECOND_ERR_S = 1.5
     # A node reporting it fired further than this from its target is not merely
     # jittery: the whole point of handing every node one absolute instant is
     # that each busy-waits to it locally. Measured lateness is +0.1-0.3 ms mean.
@@ -2485,6 +2730,17 @@ class RunManager:
         else:
             target = target + host_offset
 
+        # The standalone strobe (a node with no camera in this shot - the
+        # Jetson's XR256) replies on its own thread, in either order with the
+        # camera fires. Its instant has to reach every GPIO camera's command
+        # record or the pair never gets a strobe acceptance verdict (rigcore
+        # builds it from the `strobe` on indexed rows, and only the in-fire
+        # path ever put one there). Both orderings meet under one lock: the
+        # later of the two sees the earlier one's contribution.
+        shot_lock = threading.Lock()
+        shot_recs = {}          # node -> (worker, command record), GPIO fires
+        standalone = {}         # {"epoch": ...} once the flash has answered
+
         def _fire(m):
             w = self.workers.get(m.name_)
             path = self._fire_path(m)
@@ -2504,6 +2760,12 @@ class RunManager:
                 rec = (w.note_command(target, path="gpio",
                                       host_offset=host_offset,
                                       clock_err=clock_err) if w else None)
+                if w and rec is not None:
+                    with shot_lock:
+                        shot_recs[m.name_] = (w, rec)
+                        early = standalone.get("epoch")
+                    if early:
+                        w.update_command(rec, strobe_epoch=early)
                 body = {"at_epoch": target - lead, "pulse_ms": 5,
                         "focus_lead_ms": self.FOCUS_LEAD_MS}
                 strobe = self.get_strobe()
@@ -2541,9 +2803,14 @@ class RunManager:
                     # piagent hands back the identity of this fire and the edge
                     # cursor it started from, so the frame can be paired with
                     # ITS OWN exposure edge instead of the nearest one.
-                    w.update_command(rec, fire_seq=r.get("fire_seq"),
-                                     edge_seq=r.get("edge_seq"),
-                                     strobe_epoch=r.get("strobe_epoch"))
+                    # strobe_epoch only when this fire carried the flash: a
+                    # None here would erase the one a standalone strobe may
+                    # already have attached to the same record.
+                    fields = {"fire_seq": r.get("fire_seq"),
+                              "edge_seq": r.get("edge_seq")}
+                    if r.get("strobe_epoch"):
+                        fields["strobe_epoch"] = r["strobe_epoch"]
+                    w.update_command(rec, **fields)
                 elif w and rec is not None:
                     # It exposed nothing, so no frame will ever claim this.
                     w.drop_command(rec)
@@ -2629,11 +2896,27 @@ class RunManager:
                         self.last_standalone_strobe = {
                             "node": sm.name_, "at": time.time(),
                             "strobe_epoch": r.get("strobe_epoch")}
+                        if (r.get("strobe_late_ms") or 0) > 5.0:
+                            self.events.emit(
+                                "warn", "strobe_late",
+                                "strobe on %s pulsed %.1f ms late - the flash "
+                                "may have missed the exposure window"
+                                % (sm.name_, r["strobe_late_ms"]),
+                                node=sm.name_, late_ms=r["strobe_late_ms"])
+                        ep = r.get("strobe_epoch")
+                        if ep and not r.get("strobe_error"):
+                            with shot_lock:
+                                standalone["epoch"] = ep
+                                targets = list(shot_recs.values())
+                            for sw, srec in targets:
+                                sw.update_command(srec, strobe_epoch=ep)
                 th = threading.Thread(target=_strobe_alone, daemon=True)
                 th.start(); threads.append(th)
         for th in threads:
             th.join(timeout=35)
         rep = self._judge_shot(target, results, roster=members)
+        if run is None:
+            self._census_soon()          # a bench shot: see the idle census
         # What was actually applied, so a transect can be re-based in post and
         # an operator can see the correction rather than guess at it.
         rep["host_offset_s"] = round(host_offset, 6)
@@ -2668,9 +2951,12 @@ class RunManager:
                 for n in fired:
                     run["fired"][n] = run["fired"].get(n, 0) + 1
                 if skew_ms is not None:
+                    # Every shot of the run, untrimmed: run.json's sync.shots,
+                    # skew_ms_max and skew_ms_p95 are RUN figures, and a
+                    # 1000-shot window silently dropped the worst skew of any
+                    # transect longer than that. Bounded by MAX_FRAMES, like
+                    # the frame index.
                     run["skews_ms"].append(skew_ms)
-                    if len(run["skews_ms"]) > 1000:
-                        del run["skews_ms"][:-1000]
                 if failed:
                     run["failed_fires"] += len(failed)
                 if fired and len(fired) < len(expected):
@@ -3048,8 +3334,16 @@ class RunManager:
             run = self.active
             if not run:
                 return None
-            return next((n for n, k in run["fail_streak"].items() if k >= 3),
-                        None)
+            # A camera the operator switched off is neither judged nor probed
+            # (capture_once drops it from the roster), so its streak is frozen
+            # at whatever it was and must not hold the grid paused: the pause
+            # branch only leaves through a probe of that very node, and the
+            # rig would stop itself for a camera it was told not to use. The
+            # streak itself is kept - switched back on, an unproven body
+            # re-pauses the grid until a probe fire delivers a frame.
+            capturing = {m.name_ for m in self.monitors if m.is_capturing()}
+            return next((n for n, k in run["fail_streak"].items()
+                         if k >= 3 and n in capturing), None)
 
     def _stop_capture_loop(self):
         if self._cap_stop:
@@ -3726,6 +4020,8 @@ class RunManager:
                    if all(n in self.trig_latency for n in missed)
                    else "it has never been measured"),
                 nodes=missed)
+        if run_at_entry is None:
+            self._census_soon()          # bare calibrate: its frames are old news
         return out
 
     def _calibrate_trigger_node(self, m, samples, hold_focus, stopev,
@@ -3945,7 +4241,7 @@ class RunManager:
                                      "EXIF calibration frame unreadable on %s: %s"
                                      % (m.name_, err), node=m.name_)
                     return
-                cam = _exif_capture(data)[0]
+                cam, subsec = _exif_capture(data)
                 if not cam:
                     self.events.emit("warn", "calibrate",
                                      "no EXIF timestamp in %s's calibration "
@@ -3953,6 +4249,13 @@ class RunManager:
                                      % m.name_, node=m.name_)
                     return
                 true_epoch, err_s = self._true_exposure(m, cur, t_cmd, t_done)
+                if not subsec:
+                    # The bar published on every exif row and compared with a
+                    # soft edge in _edge_result. Left at the few-ms figure of
+                    # the edge it was measured against, a whole-second EXIF
+                    # stamp was published as ~3 ms and beat a 250 ms soft edge
+                    # that was the better instant.
+                    err_s = max(err_s, self.EXIF_WHOLE_SECOND_ERR_S)
                 self.exif_uncertainty[m.name_] = err_s
                 self.timesync.set_exif_offset(m.name_, cam - true_epoch)
                 return
@@ -4010,9 +4313,15 @@ class RunManager:
             max(0.05, t_done - t_cmd) + self.fleet_clock_err()
 
     # ---- run.json / index -------------------------------------------------
-    def note_orphan(self, node, n=1):
+    def _is_current_run(self, run_id):
+        """Does a worker built for `run_id` belong to the run that is open?
+        None (a direct caller) means "whatever is open". Caller holds the lock."""
+        return bool(self.active) and (run_id is None
+                                      or self.active["run_id"] == run_id)
+
+    def note_orphan(self, node, n=1, run_id=None):
         with self._lock:
-            if self.active:
+            if self._is_current_run(run_id):
                 self.active["orphans"][node] = \
                     self.active["orphans"].get(node, 0) + n
 
@@ -4047,8 +4356,22 @@ class RunManager:
         self.events.emit("debug", "frame", "%s <- %s" % (fname, orig), node=node)
 
     def index_frame(self, cam_num, fname, orig, epoch, source, node=None,
-                    path=None, rise=None, strobe=None, clk_off=None):
+                    path=None, rise=None, strobe=None, clk_off=None,
+                    run_id=None):
         with self._lock:
+            if run_id is not None and not self._is_current_run(run_id):
+                # A pull that outlived its run's stop() (the join is 8 s, a
+                # download may take 30) and finished after another began. The
+                # old run is final and its index closed: the file is on disk
+                # and in that run's flight_log, and writing it into THIS run's
+                # index would list a file this run's directory does not have
+                # and skew its applied-offset span.
+                self.events.emit(
+                    "warn", "run",
+                    "late frame %s from run %s arrived after that run stopped "
+                    "- it is on disk and in that run's flight_log but in no "
+                    "index" % (fname, run_id), node=node, run_id=run_id)
+                return
             if self.active:
                 # Microseconds, not milliseconds: the capture instant is a
                 # kernel interrupt timestamp and the whole rig is judged on a

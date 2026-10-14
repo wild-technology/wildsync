@@ -210,6 +210,38 @@ def _rad2deg(v):
     return None if v is None else math.degrees(v)
 
 
+# iKonvert lines carry no checksum of their own and a talker can be wrong, so
+# a decoded value that no real instrument could report is dropped the same way
+# the NA sentinels are. _field only filters the sentinels: lat 150 deg or a
+# 372 deg heading used to come out as a measurement, turned the snapshot
+# valid=True (the UTM conversion then failed quietly, leaving xutm None), and
+# the `% 360` in _fill folded the heading into a plausible 12 deg.
+_ANGLE_TOL = 1e-3                      # rad of slack at the 2*pi / pi bounds
+
+
+def _in_range(v, lo, hi):
+    return v if v is not None and lo <= v <= hi else None
+
+
+def _heading_rad(v):
+    """An unsigned bearing: 0..2*pi."""
+    return _in_range(v, 0.0, 2 * math.pi + _ANGLE_TOL)
+
+
+def _signed_rad(v):
+    """A signed angle (deviation, variation): -pi..pi."""
+    return _in_range(v, -math.pi - _ANGLE_TOL, math.pi + _ANGLE_TOL)
+
+
+def _latlon(lat, lon):
+    """Position pair: if either half is impossible BOTH go, so a good latitude
+    is never paired with a corrupt longitude."""
+    if (lat is not None and not -90.0 <= lat <= 90.0) or \
+            (lon is not None and not -180.0 <= lon <= 180.0):
+        return None, None
+    return lat, lon
+
+
 # ---------------------------------------------------------------------------
 # Parser layer (pure, unit-testable)
 # ---------------------------------------------------------------------------
@@ -358,9 +390,10 @@ def looks_like_nmea0183(line):
 
 
 def _decode_129025(d):
+    lat, lon = _latlon(_s(d, 0, 4, 1e-7), _s(d, 4, 4, 1e-7))
     return {
-        "lat": _s(d, 0, 4, 1e-7),
-        "lon": _s(d, 4, 4, 1e-7),
+        "lat": lat,
+        "lon": lon,
     }
 
 
@@ -373,6 +406,14 @@ _GNSS_METHOD = {
 # 6 (dead-reckoning estimate), 7 (manual entry) and 8 (simulator).
 GNSS_METHODS_TRUSTED = frozenset({1, 2, 3, 4, 5})
 
+# Methods whose coordinates are not a GNSS position: no fix, dead-reckoning
+# estimate, operator-typed, simulator. A sender in one of these modes can keep
+# repeating its last coordinates with fresh timestamps, so neither the sample
+# age nor nav_no_fix (which only sees lat None) would ever notice the frozen
+# position. Deliberately NOT "not in GNSS_METHODS_TRUSTED": 15 (N/A) and any
+# nibble a device does not fill keep today's behaviour.
+GNSS_METHODS_NO_POSITION = frozenset({0, 6, 7, 8})
+
 # PGN 126992 "source" nibble: 0 GPS, 1 GLONASS, 2 radio station, 3 local
 # caesium, 4 local rubidium, 5 local crystal.  Only the satellite sources are
 # actually GPS time; a plotter with no fix happily transmits 126992 off its
@@ -384,12 +425,13 @@ SYSTIME_SOURCES_TRUSTED = frozenset({0, 1})
 def _decode_129029(d):
     date = _u(d, 1, 2)                 # days since 1970-01-01
     tod = _u(d, 3, 4, 1e-4)            # seconds since midnight UTC
+    lat, lon = _latlon(_s(d, 7, 8, 1e-16), _s(d, 15, 8, 1e-16))
     out = {
         "sid": _u(d, 0, 1),
         "date_days": date,
         "time_s": tod,
-        "lat": _s(d, 7, 8, 1e-16),
-        "lon": _s(d, 15, 8, 1e-16),
+        "lat": lat,
+        "lon": lon,
         "alt_m": _s(d, 23, 8, 1e-6),
         "sats": _u(d, 33, 1),
         "hdop": _s(d, 34, 2, 0.01),
@@ -423,9 +465,9 @@ def _decode_126992(d):
 
 
 def _decode_127250(d):
-    hdg = _u(d, 1, 2, 1e-4)
-    dev = _s(d, 3, 2, 1e-4)
-    var = _s(d, 5, 2, 1e-4)
+    hdg = _heading_rad(_u(d, 1, 2, 1e-4))
+    dev = _signed_rad(_s(d, 3, 2, 1e-4))
+    var = _signed_rad(_s(d, 5, 2, 1e-4))
     ref = (d[7] & 0x03) if len(d) > 7 else None
     return {
         "heading_rad": hdg,
@@ -454,7 +496,7 @@ def _decode_128267(d):
 
 def _decode_129026(d):
     ref = (d[1] & 0x03) if len(d) > 1 else None
-    cog = _u(d, 2, 2, 1e-4)
+    cog = _heading_rad(_u(d, 2, 2, 1e-4))
     return {
         "cog_ref": {0: "true", 1: "magnetic"}.get(ref, None),
         "cog_deg": _rad2deg(cog),
@@ -464,7 +506,7 @@ def _decode_129026(d):
 
 def _decode_130306(d):
     ref = (d[5] & 0x07) if len(d) > 5 else None
-    ang = _u(d, 3, 2, 1e-4)
+    ang = _heading_rad(_u(d, 3, 2, 1e-4))
     return {
         "wind_speed_mps": _u(d, 1, 2, 0.01),
         "wind_angle_deg": _rad2deg(ang),
@@ -1798,14 +1840,20 @@ class NavReader:
         t_pos, pos = take(129025)
         t_gnss, gnss = take(129029)
         pos_t = None
-        if pos is not None and pos.get("lat") is not None:
+        # The sender's own 129029 says this is not a GNSS position (see
+        # GNSS_METHODS_NO_POSITION): withhold lat/lon from BOTH PGNs and the
+        # altitude, but keep sats/hdop/fix_source so nav_no_fix can say why.
+        withhold = gnss is not None \
+            and gnss.get("method") in GNSS_METHODS_NO_POSITION
+        if not withhold and pos is not None and pos.get("lat") is not None:
             snap["lat"], snap["lon"] = pos.get("lat"), pos.get("lon")
             pos_t = t_pos
         if gnss is not None:
-            if snap["lat"] is None and gnss.get("lat") is not None:
+            if not withhold and snap["lat"] is None \
+                    and gnss.get("lat") is not None:
                 snap["lat"], snap["lon"] = gnss.get("lat"), gnss.get("lon")
                 pos_t = t_gnss
-            snap["alt_m"] = gnss.get("alt_m")
+            snap["alt_m"] = None if withhold else gnss.get("alt_m")
             snap["sats"] = gnss.get("sats")
             snap["hdop"] = gnss.get("hdop")
             snap["fix_source"] = gnss.get("method_str")
@@ -1831,10 +1879,17 @@ class NavReader:
             snap["depth_offset_m"] = depth.get("offset_m")
             if depth.get("depth_m") is not None \
                     and depth.get("offset_m") is not None:
-                # offset >0 transducer->waterline, <0 transducer->keel;
-                # adding it in both cases is the N2K convention
-                snap["depth_below_surface_m"] = \
-                    depth["depth_m"] + depth["offset_m"]
+                # The sign says which plane the offset reaches: >0 is
+                # transducer->waterline, so adding it gives the depth below
+                # the surface; <0 is transducer->keel, and depth + (negative
+                # offset) is the water under the KEEL, which needs the
+                # transducer's draft to turn into a surface depth. Reporting
+                # that as depth_below_surface_m mislabelled it, so a keel
+                # offset leaves the key None (depth_m and depth_offset_m are
+                # still published).
+                if depth["offset_m"] >= 0:
+                    snap["depth_below_surface_m"] = \
+                        depth["depth_m"] + depth["offset_m"]
 
         _, cs = take(129026)
         if cs is not None:
