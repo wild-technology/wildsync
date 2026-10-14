@@ -57,7 +57,11 @@ def main():
               str(n["convergence"]["diverged"]))
         check("%s MF" % n["name"], n.get("focus_mode") == 1)
         # format readback (new)
-        st = get("/api/status?node=" + n["name"]).get("status", {})
+        # /api/status?node= proxies ilxctl's status at the top level; the
+        # "status" wrapper this script first read never existed, so every
+        # format check below failed against a healthy body.
+        st = get("/api/status?node=" + n["name"])
+        st = st.get("status", st) if isinstance(st.get("status"), dict) else st
         for k in ("filetypeValue", "imagesizeValue", "transsizeValue", "rawtypeValue"):
             check("%s has %s" % (n["name"], k), k in st, str(st.get(k)))
         print("     format: %s %s %s %s pcsave=%s quality=%s remain=%s" % (
@@ -67,7 +71,10 @@ def main():
         warn("%s slot idle" % n["name"], st.get("slotWritingLabel") == "idle")
         warn("%s not overheating" % n["name"], st.get("overheatingLabel") == "ok")
     # format identical across bodies
-    sts = [get("/api/status?node=" + n["name"]).get("status", {}) for n in nodes]
+    sts = []
+    for n in nodes:
+        st = get("/api/status?node=" + n["name"])
+        sts.append(st.get("status", st) if isinstance(st.get("status"), dict) else st)
     for k in ("filetypeValue", "imagesizeValue", "transsizeValue", "rawtypeValue",
               "whiteBalance", "colorTemp", "isoValue", "shutterValue", "apertureValue"):
         vals = [s.get(k) for s in sts]
