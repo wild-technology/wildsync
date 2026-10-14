@@ -111,8 +111,12 @@ def main():
 
     if a.run:
         print("== transect %d frames" % a.run)
+        # auto_capture arms the firing grid; without it a run records only
+        # what is fired by hand, which is how this check recorded 0 frames
+        # on 2026-10-15.
         r = post("/api/run/start", {"label": "validate", "interval_s": 2.0,
-                                     "frames": a.run, "confirm_warnings": True,
+                                     "frames": a.run, "auto_capture": True,
+                                     "confirm_warnings": True,
                                      "drain": bool(a.drain)})
         if not check("run started", r.get("ok"), str(r.get("error"))):
             sys.exit(1)
