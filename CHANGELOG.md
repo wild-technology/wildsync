@@ -4,6 +4,25 @@ All notable changes to Wild Sync are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Dates are commit
 dates.
 
+## [Unreleased]
+
+### Added
+- `rig/nav_subsonus.py`: the Subsonus as the navigation source over Ethernet
+  (ANPP over TCP, System State packet), selected with `WILDSYNC_NAV` or
+  `~/rig/nav.json` `{"source": "anpp://<host>"}`; the iKonvert path is
+  unchanged and remains the default. Same `NavReader` contract, raw log and
+  replay. Not yet used in the field (`docs/INSTALL.md` §7.1,
+  `docs/PROTOCOL.md`, "Additions 2026-10-15").
+- `rig/tests/audit_subsonus.py`: framing, decode, consumer contract, loopback
+  transport, raw log replay and source selection; in the gate as
+  `audit-subsonus`.
+
+### Changed
+- `nav.NavReader._handle_line` records a message through a shared `_ingest`
+  and accepts `!ANPP,<id>,<hex>` lines (replay of a Subsonus run).
+- `rigd` reads the nav source from `WILDSYNC_NAV` / `~/rig/nav.json`; the
+  `nav_gateway_down` anomaly names the source in use.
+
 ## [1.1.0] - 2026-10-07
 
 ### Added

@@ -900,18 +900,34 @@ class Anomalies:
                     # said "no NMEA aboard, use this position" — that is a
                     # state to display, not an alarm to chase.
                     sf = snap.get("static_fix") if kind == "static" else None
+                    health = self.nav.health()
+                    if health.get("transport") == "anpp-tcp":
+                        # The Subsonus over Ethernet (rig/nav_subsonus.py):
+                        # a dark socket is power or cabling, a connected
+                        # socket with no packets is the unit's output config.
+                        silent = "Subsonus sending no data"
+                        fix = ("plug in or power the Subsonus for live nav"
+                               if sf else
+                               ("the Subsonus accepted the connection but "
+                                "sends nothing - enable packet 20 on its "
+                                "ANPP port in the unit's web UI"
+                                if health.get("packets", 0) == 0
+                                and health.get("last_error") is None
+                                else "check the Subsonus's power and "
+                                     "Ethernet link, then its address (%s)"
+                                     % health.get("port")))
+                    else:
+                        silent = "iKonvert sending no data"
+                        fix = ("plug in the iKonvert for live nav" if sf else
+                               "the iKonvert draws power from the N2K bus, "
+                               "not USB - check bus power and the gateway's "
+                               "POWER LED")
                     out.append(self._a("nav_gateway_down", None,
                                        ("no live NMEA — static fix in use: %s"
-                                        % sf) if sf
-                                       else "iKonvert sending no data",
-                                       {"health": self.nav.health(),
-                                        "fix_kind": kind},
-                                       "flight-log positions use the armed "
-                                       "static fix; plug in the iKonvert for "
-                                       "live nav" if sf else
-                                       "the iKonvert draws power from the N2K "
-                                       "bus, not USB - check bus power and the "
-                                       "gateway's POWER LED",
+                                        % sf) if sf else silent,
+                                       {"health": health, "fix_kind": kind},
+                                       ("flight-log positions use the armed "
+                                        "static fix; " + fix) if sf else fix,
                                        sev="warn" if sf else "bad"))
                 elif snap and snap.get("lat") is None:
                     out.append(self._a("nav_no_fix", None, "no GPS fix",
@@ -1230,23 +1246,60 @@ class Rig:
                                  "could not finalise %s: %s" % (rid, e),
                                  run_id=rid)
 
+    def _nav_spec(self):
+        """Which nav source to open: WILDSYNC_NAV, else "source" in
+        ~/rig/nav.json, else None (the iKonvert, found under
+        /dev/serial/by-id). A spec is `anpp://<host>[:<port>]` for the
+        Subsonus over Ethernet (rig/nav_subsonus.py) or a serial device path
+        for an iKonvert that by-id resolution does not find."""
+        spec = os.environ.get("WILDSYNC_NAV", "").strip()
+        if spec:
+            return spec
+        path = os.path.join(rigcore.RIG_HOME, "nav.json")
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            self.events.emit("warn", "nav", "%s unreadable (%s); using the "
+                             "iKonvert" % (path, e))
+            return None
+        src = d.get("source") if isinstance(d, dict) else None
+        return str(src).strip() if src else None
+
     def _start_nav(self):
         try:
             import nav as navmod
         except Exception as e:  # noqa: BLE001
             self.events.emit("info", "nav", "nav.py not available: %s" % e)
             return None
-        reader = navmod.NavReader()          # resolves /dev/serial/by-id itself
+        spec = self._nav_spec()
+        reader = None
+        if spec:
+            try:
+                if spec.lower().startswith(("anpp://", "subsonus://")):
+                    import nav_subsonus
+                    reader = nav_subsonus.SubsonusReader.from_spec(spec)
+                else:
+                    reader = navmod.NavReader(port=spec)
+            except Exception as e:  # noqa: BLE001
+                self.events.emit("warn", "nav", "nav source %r rejected: %s; "
+                                 "using the iKonvert" % (spec, e))
+        if reader is None:
+            reader = navmod.NavReader()      # resolves /dev/serial/by-id itself
+        where = reader.port_hint or "the iKonvert"
         try:
             reader.open()
-            self.events.emit("info", "nav", "nav reader opened on %s @ %d"
-                             % (reader.port, reader.baud))
+            self.events.emit("info", "nav", "nav reader opened on %s%s"
+                             % (reader.port, (" @ %d" % reader.baud)
+                                if reader.baud else ""))
         except Exception as e:  # noqa: BLE001
             # Not fatal. The reader thread retries with backoff, so a gateway
             # that is plugged in - or has its bus powered - after rigd starts is
             # picked up without a restart. Returning None here used to disable
             # nav for the whole lifetime of the process.
-            self.events.emit("warn", "nav", "iKonvert not open yet: %s" % e)
+            self.events.emit("warn", "nav", "%s not open yet: %s" % (where, e))
         reader.start()
         wrapped = StaticFixNav(reader, navmod, self.events,
                                run_active=self._recording_run_id)

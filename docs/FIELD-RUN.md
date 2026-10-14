@@ -17,7 +17,7 @@ text says so.
 | cam2 | Pi 4, 192.168.1.202, on the Ubiquiti 2.5G PoE switch |
 | IMUs | one Olive olixVision per camera, on that camera's Pi (USB-C, `olive0`); each camera's flight log carries its own IMU's attitude |
 | clocks | **Jetson host:** the Jetson is the chrony master; the Pis follow it and peer each other as a fallback. **Mac host:** not a master; the Pis peer each other (~0.6 ms apart with no upstream) and rigd corrects for the host's offset |
-| nav | Subsonus RTK antenna on the NMEA 2000 backbone → iKonvert → the host's USB (`/dev/serial/by-id/usb-FTDI_…` on a Jetson, `/dev/cu.usbserial-…` on a Mac); **iKonvert DIP switches all ON for RAW mode** or nav stays silent |
+| nav | Subsonus RTK antenna on the NMEA 2000 backbone → iKonvert → the host's USB (`/dev/serial/by-id/usb-FTDI_…` on a Jetson, `/dev/cu.usbserial-…` on a Mac); **iKonvert DIP switches all ON for RAW mode** or nav stays silent. Alternative, not yet used in the field: the Subsonus on the rig switch over Ethernet, `~/rig/nav.json` `{"source": "anpp://<address>"}` (`docs/INSTALL.md` §7.1) |
 
 **Why cam1 is on an injector:** two nodes firing in sync drew more than the
 switch's PoE budget and it dropped a port every time (measured; not a Pi
@@ -64,8 +64,10 @@ the port power-cycle events.
    it is to restart ilxctl with `--allow-autofocus` (bench only) — a node in
    that state advertises `afAllowed:true` to the whole fleet.
 5. **Nav.** Subsonus powered with an RTK fix, iKonvert in RAW mode (all four
-   DIP switches ON, power-cycle it after changing them). The header reads
-   `nav fix`, and `/api/diag`'s `time` block shows the GPS time source.
+   DIP switches ON, power-cycle it after changing them) — or, over Ethernet,
+   the Subsonus reachable at the address in `~/rig/nav.json` and `/api/diag`'s
+   `nav` block showing `packets` climbing with `fix: rtk_fixed`. The header
+   reads `nav fix`, and `/api/diag`'s `time` block shows the GPS time source.
    Without nav, the flight log uses the armed static fix in
    `~/rig/static_fix.json` — edit that to today's launch point. The preflight
    will say "STATIC fix in use"; that is a choice, hit Start anyway.

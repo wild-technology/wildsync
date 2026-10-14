@@ -12,8 +12,9 @@ it). The host schedules every camera to expose at one shared instant, pulls the
 frames, renames them, and writes a per-camera flight log binding each frame to
 position and orientation. Position, heading and GPS time come from a
 **Subsonus** RTK antenna over NMEA 2000, through an **iKonvert** gateway on the
-host's USB. On a Jetson host the **XR256** strobe can be fired into the shared
-instant as well.
+host's USB (or, not yet used in the field, from the Subsonus directly over
+Ethernet; `docs/INSTALL.md` §7.1). On a Jetson host the **XR256** strobe can be
+fired into the shared instant as well.
 
 ```
                      ┌──────────────────────────────────────────────┐
@@ -158,7 +159,7 @@ a process boundary.
 
 | Process | Host | Port | Language | Owns |
 |---|---|---|---|---|
-| `rigd` | rig host (Mac or Jetson) | 9090 | Python 3 | fleet state, desired settings, runs, web UI, nav (iKonvert) |
+| `rigd` | rig host (Mac or Jetson) | 9090 | Python 3 | fleet state, desired settings, runs, web UI, nav (iKonvert, or the Subsonus over Ethernet) |
 | `piagent` (strobe role) | Jetson host only | 8081 | Python 3, stdlib | the XR256 trigger line, nothing else (`PIAGENT_ROLE=strobe`) |
 | `ilxctl` | each Pi | 8080 | C++17 | the camera over USB via Sony's SDK — settings, live view, image transfer |
 | `piagent` | each Pi | 8081 | Python 3, stdlib | GPIO harness (FOCUS/TRIGGER/EXPOSURE), the node's IMU, node health |

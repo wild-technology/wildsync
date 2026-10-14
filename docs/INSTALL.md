@@ -45,7 +45,7 @@ was the one in use on 2026-08-20.
 | **Rig host** | a Mac (Apple Silicon) or a Jetson Orin NX, wired to the rig switch |
 | Rig switch and PoE | a PoE switch for the nodes. cam1 is on its own 802.3at injector, cam2 on the switch: two nodes firing in sync overran the switch's PoE budget and it dropped a port every time until cam1 was isolated (`docs/FIELD-RUN.md`, Topology; `docs/PI-SETUP.md` §8) |
 | 12 V supply for the camera bodies | 10–18 V DC at the camera connector, at least 40 W momentary (`docs/harness-and-strobe.md` §2) |
-| Navigation | a Subsonus RTK antenna on an NMEA 2000 backbone and a Digital Yacht **iKonvert** gateway to the host's USB ([product page](https://digitalyacht.co.uk/product/ikonvert-nmea-2000-to-usb/), [quick start guide](https://digitalyachtamerica.com/download/ikonvert-usb-quick-start-guide-v2_02/?wpdmdl=5667)) |
+| Navigation | a Subsonus RTK antenna, either on an NMEA 2000 backbone through a Digital Yacht **iKonvert** gateway to the host's USB ([product page](https://digitalyacht.co.uk/product/ikonvert-nmea-2000-to-usb/), [quick start guide](https://digitalyachtamerica.com/download/ikonvert-usb-quick-start-guide-v2_02/?wpdmdl=5667)), or on the rig switch over Ethernet (section 7, not yet used in the field) |
 | Strobe (optional) | an XR256, its trigger interface board and a regulated 24 V supply (`docs/xr256-jetson-trigger.md`) |
 
 ### Network
@@ -322,6 +322,48 @@ in `~/rig/static_fix.json` (`{lat, lon, label, ...}`). The header then reads
 carries that one position, with depth and heading empty. A mid-line loss of a
 live bus is not filled from it: those rows are empty and `nav_no_fix` is raised
 (`docs/FIELD-RUN.md`, anomalies).
+
+### 7.1 The Subsonus over Ethernet (no iKonvert)
+
+Supported, not yet used in the field. The Subsonus surface unit also speaks
+Advanced Navigation's packet protocol (ANPP) over TCP on ports 16718–16721 and
+streams its System State packet at 20 Hz on them out of the box. `rigd` can
+read that stream instead of the iKonvert (`rig/nav_subsonus.py`); position,
+heading, attitude, COG/SOG and GPS time then arrive without the NMEA 2000 bus.
+Depth and magnetic heading are not in that packet: `depth_from_xplore9` and
+`heading_mag_xplore` stay empty (the true heading is in `/api/nav`).
+
+1. Plug the Subsonus's Ethernet into the rig switch. **Out of the box it is a
+   DHCP client**, and the rig network has no DHCP server, so it has no address
+   until one is given. Either give it a static address in its web UI
+   (Configuration → Ethernet Settings; e.g. `192.168.1.60/24`, reached once
+   through a network that does have DHCP), or run a DHCP server on the rig
+   segment. With an address it also answers to its zeroconf name,
+   `an-subsonus-1.local` (or the name set on the unit).
+2. Tell `rigd` where it is — either, on the host:
+
+   ```sh
+   echo '{"source": "anpp://192.168.1.60"}' > ~/rig/nav.json
+   ```
+
+   or `WILDSYNC_NAV=anpp://an-subsonus-1.local` in the service environment —
+   and restart `rigd`. `WILDSYNC_NAV` wins over `nav.json`; with neither,
+   `rigd` looks for the iKonvert as before. The port defaults to 16718.
+3. Verify: `python3 rig/nav_subsonus.py anpp://<address>` prints a line a
+   second with the packet count, fix type (`rtk_fixed` is the goal), UTC
+   status, position and heading. `suspect` must stay 0: the packet layout was
+   taken from the published ANPP reference, whose field table is
+   inconsistent, and a non-zero count means this firmware's layout differs
+   (the reader then records no position rather than a wrong one). In the UI
+   the header reads `nav fix` and `/api/diag`'s `nav` block shows
+   `transport: anpp-tcp` with `packets` climbing.
+4. If the socket connects but `packets` stays 0, the unit is not streaming on
+   that port: enable the System State packet (ID 20) on the ANPP port in its
+   web UI.
+
+Every packet is written to the run's `nmea_raw.log` as an `!ANPP,<id>,<hex>`
+line, so `navlog.replay()` reproduces a Subsonus run as it does an iKonvert
+run. Nothing is ever written to the unit.
 
 ## 8. The strobe node
 

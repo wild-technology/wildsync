@@ -1398,3 +1398,42 @@ as they were recorded).
 
 Runs without any of this — no hash columns, no `SHA256SUMS` — load everywhere
 as before; ingest merges an older manifest's rows with empty hash cells.
+
+## Additions 2026-10-15 — the Subsonus over Ethernet
+
+A second nav source, `rig/nav_subsonus.py`, with the same consumer contract:
+the Subsonus's ANPP stream over TCP (port 16718 by default; System State
+packet, ID 20, 20 Hz as the unit ships) read into the same `NavReader` state
+as the iKonvert path, so `snapshot()`, `fix_at()`, `flight_row()`, the time
+authority, `/api/nav`, `/api/diag` and the flight log are unchanged.
+Not yet used in the field.
+
+- **Selection.** `WILDSYNC_NAV`, else `"source"` in `~/rig/nav.json`, else
+  the iKonvert. `anpp://<host>[:<port>]` (or `subsonus://`) selects the
+  Subsonus; any other value is a serial device path for the iKonvert.
+- **What each packet becomes.** The N2K-shaped samples nav.py already
+  decodes, emitted only when the unit says the value is real: 129025 and
+  129029 (lat/lon with a GNSS fix of 2D or better; `method_str` maps the
+  unit's fix — `no_fix`, `gnss`, `dgnss`, `precise`, `rtk_float`,
+  `rtk_fixed`; the 129029 time word only while the unit reports UTC Time
+  Initialised, so the time authority can never promote off an unset clock),
+  127250 (true heading, no variation — `heading_mag_xplore` stays empty),
+  127257 (attitude), 129026 (COG/SOG from the NED velocity). No depth. The
+  stand-in source address is 254.
+- **Layout guard.** The published System State field table is inconsistent;
+  the reader uses the only layout that sums to the stated 116 bytes
+  (statuses u32, unix time at 8, latitude at 16) and sanity-checks every
+  packet. A packet whose latitude/longitude is not finite or in range is
+  counted in `health()["suspect_layout"]` and yields no position. The
+  100-byte layout of the other Advanced Navigation units is decoded as well.
+- **Raw log.** One line per packet, `!ANPP,<id>,<hex data>`, through the
+  ordinary raw hook into `nmea_raw.log`; `NavReader.feed_line()` routes such
+  a line back through the packet decoder, so `navlog.replay()` reproduces a
+  Subsonus run.
+- **`health()`** adds `transport: "anpp-tcp"`, `host`, `tcp_port`,
+  `packets`, `bytes_skipped`, `packet_ids`, `suspect_layout`, `fix`,
+  `utc_init`, `heading_init`, `layout`. `port` is the `anpp://` URL and
+  `baud` is 0. The `nav_gateway_down` anomaly names the Subsonus and
+  distinguishes a dark socket from a connected-but-silent port.
+- Nothing is written to the unit. Regression: `audit_subsonus.py` (S1–S6)
+  in the gate.

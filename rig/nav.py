@@ -1627,6 +1627,18 @@ class NavReader:
         # real bytes arrived: the port is genuinely good, so clear the backoff
         self._backoff = self.REOPEN_MIN_S
         self._emit_raw(now, time.monotonic() if mono is None else mono, line)
+        if line.startswith("!ANPP,"):
+            # A Subsonus packet in its raw-log form (rig/nav_subsonus.py), so
+            # a recorded Ethernet run replays through exactly this path.
+            try:
+                import nav_subsonus
+            except ImportError:
+                self._bad_line_count += 1
+                return
+            self._seen_pdgy = True
+            if nav_subsonus.ingest_line(self, line, now) is False:
+                self._bad_line_count += 1
+            return
         full = parse_pdgy_full(line)
         if full is None:
             kind = classify_status(line)
@@ -1643,43 +1655,50 @@ class NavReader:
                 self._bad_line_count += 1
             return
         self._seen_pdgy = True
-        # Record EVERY data line into the bus table before deciding whether we
-        # know how to decode it: hidden traffic is only hidden until listed.
+        self._ingest(full["pgn"], full["data"],
+                     decode_pgn(full["pgn"], full["data"]), now, full["src"],
+                     dst=full["dst"], prio=full["prio"])
+
+    def _ingest(self, pgn, data, decoded, now, src, dst=255, prio=2):
+        """Record one message: the bus table always, the history ring and the
+        time authority when it decoded. Shared by the gateway line path and
+        the Subsonus packet path (rig/nav_subsonus.py). True if recorded."""
+        # Record EVERY data message into the bus table before deciding whether
+        # we know how to decode it: hidden traffic is only hidden until listed.
         with self._lock:
-            ent = self._bus.get(full["pgn"])
+            ent = self._bus.get(pgn)
             if ent is None:
                 if len(self._bus) < 512:      # a real bus holds a few dozen
-                    ent = self._bus[full["pgn"]] = {
+                    ent = self._bus[pgn] = {
                         "n": 0, "first": now,
-                        "src": set(), "dst": full["dst"],
-                        "prio": full["prio"], "raw": b"",
+                        "src": set(), "dst": dst,
+                        "prio": prio, "raw": b"",
                         "times": collections.deque(maxlen=12)}
             if ent is not None:
                 ent["n"] += 1
                 ent["last"] = now
                 if len(ent["src"]) < 8:
-                    ent["src"].add(full["src"])
-                ent["raw"] = full["data"]
+                    ent["src"].add(src)
+                ent["raw"] = data
                 ent["times"].append(now)
-        decoded = decode_pgn(full["pgn"], full["data"])
         if decoded is None:
-            return
+            return False
         self._data_count += 1
         with self._lock:
-            self._latest[full["pgn"]] = (now, decoded)
-            ring = self._hist.get(full["pgn"])
+            self._latest[pgn] = (now, decoded)
+            ring = self._hist.get(pgn)
             if ring is None:
-                ring = self._hist[full["pgn"]] = collections.deque(
+                ring = self._hist[pgn] = collections.deque(
                     maxlen=self.HISTORY_N)
             ring.append((now, decoded))
             while ring and now - ring[0][0] > self.HISTORY_S:
                 ring.popleft()
-        if full["pgn"] in (126992, 129029):
+        if pgn in (126992, 129029):
             # src identifies the SENDER: TimeAuthority keeps per-sender
             # candidates so two devices with disagreeing time words cannot
             # starve each other out of confirmation (see its docstring)
-            self.time_authority.feed(full["pgn"], decoded, now,
-                                     src=full["src"])
+            self.time_authority.feed(pgn, decoded, now, src=src)
+        return True
 
     def feed_line(self, line, epoch=None):
         """Inject one gateway line as if it had just arrived on the port.
