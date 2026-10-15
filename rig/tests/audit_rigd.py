@@ -82,6 +82,7 @@ Run standalone:  python3 rig/tests/audit_rigd.py
 """
 
 import json
+import re
 import os
 import shutil
 import sys
@@ -783,9 +784,14 @@ def t_clock_step(h):
                                       h.mon("cam1").clock_offset_info()["n"]))
         evs = [e for e in h.rig.events.since(seq)["events"]
                if e.get("kind") == "clock_step"]
+        # The amount is what the NODE measured at receipt, so it is the 5 s
+        # less the request's transit: "+4.999 s" is as right as "+5.000 s"
+        # (a literal "+5" here failed the first gate run on a merged main).
+        stepped = [float(m.group(1)) for m in
+                   (re.search(r"stepped by ([+-][0-9.]+) s", e.get("msg") or "")
+                    for e in evs) if m]
         check("the step is journalled: the request and the result",
-              len(evs) >= 2 and any("stepped by +5" in (e.get("msg") or "")
-                                    for e in evs),
+              len(evs) >= 2 and any(4.5 < v < 5.5 for v in stepped),
               json.dumps([e.get("msg") for e in evs])[:240])
         ok = _settled(h, lambda: abs(h.mon("cam1").clock_offset_s() or 1.0) < 0.2)
         check("cam1 reads on time again once fresh samples land", ok,
