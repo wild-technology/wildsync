@@ -153,6 +153,15 @@ venv is fixed. `deploy.sh mac` runs the same check under the plist's interpreter
 and refuses, leaving the running agent alone, rather than bootstrap one that
 would fail it.
 
+`deploy/deploy.sh launcher` puts a **Wild Sync** icon (the raven) on the Desktop:
+`~/Desktop/Wild Sync.app`. Opening it opens the UI. If rigd is down it first
+starts the agent (`launchctl kickstart` without `-k`, so it never restarts a
+running rigd, or `bootstrap` when the agent is not loaded) and waits for the port.
+If rigd still does not answer, an alert shows launchd's state, the last exit code
+and the last lines of `~/rig/rigd-launchd.log`. The bundle holds copies of
+`deploy/launch-wildsync-mac.sh` and `deploy/icons/wildsync.icns`; rerun the command
+after either changes.
+
 The agent is `org.wildtechnology.wildsync.rigd` (restart it with
 `launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd`, stop and
 remove it with `launchctl bootout gui/$(id -u)/org.wildtechnology.wildsync.rigd`),

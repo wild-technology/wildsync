@@ -37,6 +37,11 @@ dates.
   transport, raw log replay and source selection; in the gate as
   `audit-subsonus`.
 
+- `deploy.sh launcher`: the Mac host's Desktop icon, `~/Desktop/Wild Sync.app`
+  (raven icon, `deploy/launch-wildsync-mac.sh`). Opens the UI; starts the rigd
+  agent only if it is down (`kickstart` without `-k`, or `bootstrap`); otherwise
+  an alert with launchd's state, last exit code and the launchd log's tail.
+  `rig/tests/audit_launcher.py` (L1-L6) in the gate as `audit-launcher`.
 - `rig/pydeps.py`: rigd refuses an interpreter that cannot import every
   package in `requirements.txt`. `python3 rig/rigd.py` checks before it imports
   any rig module and exits 78 with one line naming the missing package, the

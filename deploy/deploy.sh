@@ -6,6 +6,8 @@
 #   ./deploy.sh clock cam1       only the node's chrony: GNSS Compass + peer mesh
 #   ./deploy.sh mac              this Mac as the host: its clock on the Compass,
 #                                the rigd launchd agent (docs/INSTALL.md 3a)
+#   ./deploy.sh launcher         this Mac's Desktop icon, "Wild Sync.app": starts
+#                                the rigd agent if it is down, opens the UI
 #   ./deploy.sh jetson           install rigd on this Jetson (also a chrony master)
 #   ./deploy.sh strobe           install the XR256 strobe agent on this Jetson
 #   ./deploy.sh trust cam1       push this host's ssh key to a node (once per node)
@@ -627,6 +629,69 @@ deploy_mac() {
   echo "  if the nodes are unreachable over ssh from this host, run '$0 trust <camN>' for each of: $NODES"
 }
 
+# The Mac host's Desktop icon: "Wild Sync.app" in ~/Desktop (or
+# WILDSYNC_LAUNCHER_DIR), the raven icon (deploy/icons/wildsync.icns) on a
+# bundle whose executable is deploy/launch-wildsync-mac.sh. LaunchServices
+# cannot read an architecture from a script executable and runs it as x86_64
+# under Rosetta, which a fresh Apple Silicon Mac does not have (and cannot
+# fetch on the rig segment): LSArchitecturePriority makes it run native, so
+# the icon works there. Opening it starts
+# the rigd agent only if it is down - kickstart without -k, never a restart of
+# a running rigd - waits for the port and opens http://localhost:9090, or
+# shows why rigd is not answering. The bundle carries copies, not links, so it
+# keeps working if this checkout moves; rerun this to pick up a new script or
+# icon. Built aside and swapped in, so a failed build never leaves half a
+# bundle where the icon was.
+deploy_launcher() {
+  echo "=== launcher (local) ==="
+  [ "$(uname -s)" = Darwin ] || {
+    echo "  Wild Sync.app is macOS only; a Linux host uses deploy/wildsync.desktop" >&2
+    return 1
+  }
+  local dir="${WILDSYNC_LAUNCHER_DIR:-$HOME/Desktop}"
+  local app="$dir/Wild Sync.app"
+  local tmp="$dir/.Wild Sync.app.new"
+  local version
+  version="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$REPO"/rig/buildinfo.py 2>/dev/null)"
+  [ -n "$version" ] || version="0"
+  rm -rf "$tmp"
+  if ! { mkdir -p "$tmp/Contents/MacOS" "$tmp/Contents/Resources" &&
+         cp "$REPO"/deploy/launch-wildsync-mac.sh "$tmp/Contents/MacOS/wildsync-launcher" &&
+         chmod 755 "$tmp/Contents/MacOS/wildsync-launcher" &&
+         cp "$REPO"/deploy/icons/wildsync.icns "$tmp/Contents/Resources/AppIcon.icns"; }; then
+    rm -rf "$tmp"
+    echo "  FAILED: could not assemble the bundle in $dir" >&2
+    return 1
+  fi
+  cat > "$tmp/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>                <string>Wild Sync</string>
+  <key>CFBundleDisplayName</key>         <string>Wild Sync</string>
+  <key>CFBundleIdentifier</key>          <string>org.wildtechnology.wildsync.launcher</string>
+  <key>CFBundleExecutable</key>          <string>wildsync-launcher</string>
+  <key>CFBundleIconFile</key>            <string>AppIcon</string>
+  <key>CFBundlePackageType</key>         <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key>  <string>$version</string>
+  <key>CFBundleVersion</key>             <string>$version</string>
+  <key>LSUIElement</key>                 <true/>
+  <key>LSArchitecturePriority</key>      <array><string>arm64</string><string>x86_64</string></array>
+</dict>
+</plist>
+PLIST
+  if ! plutil -lint "$tmp/Contents/Info.plist" >/dev/null; then
+    rm -rf "$tmp"
+    echo "  FAILED: the generated Info.plist does not lint" >&2
+    return 1
+  fi
+  rm -rf "$app" && mv "$tmp" "$app" || { echo "  FAILED: could not replace $app" >&2; return 1; }
+  touch "$app"        # Finder re-reads the bundle, and with it the icon
+  echo "  $app -> http://localhost:9090 (starts the rigd agent if it is down)"
+}
+
 # The XR256 strobe agent on THIS host (the Jetson): piagent in its strobe
 # role, claiming one GPIO line and nothing else, registered with rigd as the
 # camera-less node "jetson". Required: which line drives the trigger board.
@@ -708,6 +773,7 @@ case "${1:-}" in
   node)      deploy_node "${2:?usage: deploy.sh node <camN>}";;
   clock)     clock_node "${2:?usage: deploy.sh clock <camN>}";;
   mac)       deploy_mac;;
+  launcher)  deploy_launcher;;
   jetson)    deploy_jetson;;
   strobe)    deploy_strobe;;
   # The host goes FIRST - this Mac, or this Jetson, whichever is running the
@@ -727,5 +793,5 @@ case "${1:-}" in
              fi
              for n in $NODES; do deploy_node "$n" || fail="$fail $n"; done
              if [ -n "$fail" ]; then echo "FAILED:$fail" >&2; exit 1; fi;;
-  *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|clock <camN>|mac|jetson|strobe|all}"; exit 1;;
+  *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|clock <camN>|mac|launcher|jetson|strobe|all}"; exit 1;;
 esac
