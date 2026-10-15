@@ -286,6 +286,14 @@ class FakeNode:
         self.has_imu = has_imu
         self.has_gpio = has_gpio
         self.clock_skew_s = clock_skew_s      # camera clock - true clock
+        # The PI's clock minus true time: what /health time.epoch reports and
+        # what POST /clock/step measures itself against. 0 is a disciplined
+        # node; set it to -47*86400 to be cam1 after the 2026-10-15 power
+        # cycle. A successful step zeroes it (the fake has stepped to the
+        # host, which is true time here). Every /clock/step request lands in
+        # clock_steps as (epoch, host_epoch, reply).
+        self.pi_clock_offset_s = 0.0
+        self.clock_steps = []
 
         self._lock = threading.RLock()
         self.connected = bool(connected)
@@ -602,7 +610,8 @@ class FakeNode:
                 "disk_free_mb": self.disk_free_mb,
                 "cam_frames": len(self.shots),
                 "load1": 0.42,
-                "time": {"epoch": time.time(), "source": "local"},
+                "time": {"epoch": time.time() + self.pi_clock_offset_s,
+                         "source": "local"},
             }
 
     def pushed(self, *which):
@@ -984,6 +993,41 @@ class _Handler(BaseHTTPRequestHandler):
         elif method == "POST" and path == "/timeprobe":
             t = time.time()
             self._send_json({"t0": body.get("t0"), "t_rx": t, "t_tx": time.time()})
+        elif method == "POST" and path == "/clock/step":
+            # piagent's contract (PROTOCOL.md, /clock/step): step to the
+            # host's epoch when at least 1 s apart, refuse a smaller request
+            # as chrony's business (409), 400 for a bad epoch. offset_s is
+            # host minus node at receipt.
+            try:
+                target = float(body.get("host_epoch"))
+            except (TypeError, ValueError):
+                target = float("nan")
+            with node._lock:
+                now = time.time() + node.pi_clock_offset_s
+                if not (target == target) or target <= 0:
+                    rep = {"ok": False, "stepped": False, "node_epoch": now,
+                           "error": "host_epoch must be a positive epoch "
+                                    "(seconds)"}
+                    code = 400
+                else:
+                    off = target - now
+                    if abs(off) < 1.0:
+                        rep = {"ok": False, "stepped": False,
+                               "offset_s": round(off, 3), "node_epoch": now,
+                               "error": "this node is %+.3f s from the host, "
+                                        "under the 1 s step threshold - that "
+                                        "residual is chrony's to slew, not a "
+                                        "step" % off}
+                        code = 409
+                    else:
+                        node.pi_clock_offset_s = 0.0
+                        rep = {"ok": True, "stepped": True,
+                               "offset_s": round(off, 3),
+                               "node_epoch": time.time()}
+                        code = 200
+                node.clock_steps.append((time.time(), body.get("host_epoch"),
+                                         dict(rep)))
+            self._send_json(rep, code)
         else:
             self._send_json({"ok": False, "error": "not found"}, 404)
 

@@ -815,6 +815,16 @@ class NodeMonitor(threading.Thread):
     # the fire scheduler and nav lookups need it. A single raw sample rides
     # whatever the network did during that poll, so the published figure is the
     # median of the recent window with high-RTT samples gated out.
+    def reset_clock(self):
+        """Forget every clock sample. Called after this node's clock was
+        stepped (/api/node/clock/step): the window still holds up to eight
+        samples of the old, wrong clock, and the median would keep reporting
+        a node days off - and keep its anomaly firing - for up to a minute
+        after the fix. The next poll starts a fresh window."""
+        with self._lock:
+            self._clock_hist.clear()
+            self.clock = None
+
     def clock_offset_s(self):
         """Filtered node-minus-host clock offset in seconds, or None.
 

@@ -3,10 +3,14 @@
 #
 #   ./deploy.sh provision cam2   first-time setup of a bare node (SDK + build)
 #   ./deploy.sh node cam1        update sources, rebuild ilxctl, restart services
-#   ./deploy.sh jetson           install rigd on this Jetson (the rig's clock master)
+#   ./deploy.sh clock cam1       only the node's chrony: GNSS Compass + peer mesh
+#   ./deploy.sh mac              this Mac as the host: its clock on the Compass,
+#                                the rigd launchd agent (docs/INSTALL.md 3a)
+#   ./deploy.sh jetson           install rigd on this Jetson (also a chrony master)
 #   ./deploy.sh strobe           install the XR256 strobe agent on this Jetson
 #   ./deploy.sh trust cam1       push this host's ssh key to a node (once per node)
-#   ./deploy.sh all              the Jetson, then every reachable camera node
+#   ./deploy.sh all              this host (mac or jetson), then every reachable
+#                                camera node
 #
 # ilxctl is ALWAYS built on the target. Nodes and the Jetson are all aarch64 but
 # different microarchitectures, and the Makefile probes -mcpu=native, so a binary
@@ -21,6 +25,20 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # _ip() - previously `all` carried its own literal "cam1 cam2" pair and adding
 # cam3 to _ip() alone would have left it silently out of every `all` run.
 NODES="cam1 cam2 cam3"
+
+# The rig's time reference: the Advanced Navigation GNSS Compass on the rig
+# switch, which is a stratum-1 NTP server on GPS time (refid "GPS", 0.5 ms
+# RTT from a node; measured 2026-10-15). Every node holds it directly as its
+# preferred chrony source (clock_node), the host holds it too (deploy_mac /
+# deploy_jetson), and the nodes' peer mesh is the fallback when it is off.
+# This is what makes a power-cycled Pi (no RTC battery: it boots where its
+# filesystem left it, 47 days behind on cam1 on 2026-10-15) come back onto
+# the right time by itself, with no internet on the rig segment and whatever
+# the host is. Override per run - WILDSYNC_NTP=192.168.1.61 ./deploy.sh ... -
+# or set it empty to deploy a rig that has no Compass (the nodes then keep
+# only the mesh). The same address is in docs/INSTALL.md 5 and the card
+# template (deploy/pi-resync/user-data.template, GNSS_NTP).
+NTP_SERVER="${WILDSYNC_NTP-192.168.1.60}"
 
 # Sony's USB bulk-transfer buffer. The Linux default of 16 MB drops the session
 # mid-frame on large transfers; Sony's own guidance is 150 MB.
@@ -230,6 +248,109 @@ REMOTE
   echo "  provisioned $name — now run: $0 node $name"
 }
 
+# A node's clock topology, and nothing else: no build, no service restart
+# except chrony's. Called by deploy_node and as `deploy.sh clock camN` on its
+# own, which is the recovery for a node found days off. Three layers, in the
+# order chrony prefers them:
+#   20-wildsync-gnss.conf  the GNSS Compass (NTP_SERVER), stratum 1 on GPS,
+#                          `prefer` - the reference under EITHER host
+#   20-wildsync-host.conf  the rigd host, only where it is a chrony master
+#                          (deploy.sh jetson wrote wildsync-host.conf there;
+#                          a Mac never is one, see deploy_mac)
+#   10-wildsync.conf       the peer mesh + orphan local reference, so the
+#                          nodes stay ~0.6 ms apart with the Compass off
+# plus `makestep 1 -1` in chrony.conf: ALWAYS step a clock more than 1 s out.
+# Ubuntu ships `makestep 1 3`, which chrony parses AFTER the conf.d drop-ins
+# (confdir comes first in chrony.conf), so a drop-in cannot override it - and
+# after three clock updates the node may never step again. A node that peered
+# a neighbour's wrong clock for three updates before the Compass answered
+# would then be stuck days off, slewing at most 83 s per day. A step over 1 s
+# is never inside the 10 ms stereo budget anyway: it is a clock that was
+# wrong, and every scheduled fire on it was being refused.
+clock_node() {
+  local name="$1" ip master="" peers="" n
+  ip="$(_ip "$name")" || return 1
+  ping -c1 -W2 "$ip" >/dev/null 2>&1 || { echo "  $name unreachable, skip clock"; return 0; }
+  # The rigd host as a server, only where it is a chrony master. The strobe
+  # fires on THIS host's clock and the cameras on the nodes' clocks, so on a
+  # Jetson rig one reference keeps delta honest. Left alone (not removed) when
+  # this host is not one, so a node deployed from a Jetson keeps that line
+  # across a redeploy from a laptop.
+  if [ -f /etc/chrony/conf.d/wildsync-host.conf ] && command -v ip >/dev/null 2>&1; then
+    master="$(ip route get "$ip" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  fi
+  for n in $NODES; do [ "$n" = "$name" ] || peers="$peers $(_ip "$n")"; done
+  peers="${peers# }"
+  echo "  clock: gnss=${NTP_SERVER:-none} host-master=${master:-none} peers=$peers"
+  ssh ubuntu@"$ip" "WILDSYNC_NTP='$NTP_SERVER' WILDSYNC_MASTER='$master' WILDSYNC_PEERS='$peers' bash -s" <<'REMOTE'
+set -uo pipefail
+CONFD=/etc/chrony/conf.d
+if ! command -v chronyd >/dev/null 2>&1; then
+  echo "  ERROR: chrony is not installed on this node - it keeps no rig clock. Run: deploy.sh provision <node>" >&2
+  exit 1
+fi
+sudo mkdir -p "$CONFD"
+# 1. The peer mesh is the card's job (deploy/pi-resync/user-data.template);
+#    written here only when the card never did it - cam1's card never ran that
+#    step and still carried the two-node star (10-jetson.conf) on 2026-10-15.
+#    Same content as the template, peers taken from this script's fleet table.
+if [ ! -f "$CONFD/10-wildsync.conf" ]; then
+  echo "  no 10-wildsync.conf on this node (its card never ran deploy/pi-resync) - writing the peer mesh"
+  { echo "# wildsync clock topology - generated $(date -Is) by deploy.sh clock on $(hostname -s)"
+    echo "# the card step (deploy/pi-resync/user-data.template) writes the same - do not hand-edit"
+    for p in $WILDSYNC_PEERS; do printf 'peer %s iburst minpoll 4 maxpoll 6\n' "$p"; done
+    echo 'local stratum 10 orphan'
+    echo 'allow 192.168.1.0/24'
+    echo 'makestep 1 -1'
+  } | sudo tee "$CONFD/10-wildsync.conf" >/dev/null
+fi
+# 2. Supersede every drop-in that named ONE master: 10-jetson.conf (the
+#    two-node star) and wildsync.conf (an old provision's `server <ssh client>
+#    prefer` - the Mac, preferred). The template removes the same two.
+sudo rm -f "$CONFD/10-jetson.conf" "$CONFD/wildsync.conf"
+# 3. The GNSS Compass, preferred. Removed (not left stale) when deploying
+#    with WILDSYNC_NTP empty, so a rig without one does not wait on it.
+if [ -n "$WILDSYNC_NTP" ]; then
+  { echo "# wildsync: the rig's GNSS Compass - a stratum-1 GPS NTP server on the rig switch."
+    echo "# generated $(date -Is) by deploy.sh clock; the card step writes the same - do not hand-edit"
+    printf 'server %s iburst minpoll 4 maxpoll 6 prefer\n' "$WILDSYNC_NTP"
+  } | sudo tee "$CONFD/20-wildsync-gnss.conf" >/dev/null
+else
+  sudo rm -f "$CONFD/20-wildsync-gnss.conf"
+fi
+# 4. The rigd host, where it is a chrony master (see the caller).
+if [ -n "$WILDSYNC_MASTER" ]; then
+  printf 'server %s iburst minpoll 4 maxpoll 6 prefer\n' "$WILDSYNC_MASTER" | \
+    sudo tee "$CONFD/20-wildsync-host.conf" >/dev/null
+fi
+# 5. Always step a clock more than 1 s out (see the caller's comment).
+if grep -q '^[[:space:]]*makestep[[:space:]]' /etc/chrony/chrony.conf; then
+  sudo sed -i 's/^[[:space:]]*makestep[[:space:]].*/makestep 1 -1/' /etc/chrony/chrony.conf
+else
+  echo 'makestep 1 -1' | sudo tee -a /etc/chrony/chrony.conf >/dev/null
+fi
+# 6. Restart, and prove what it selected. iburst gets the first four samples
+#    inside ~2 s; a node that was days off is stepped on the first of them.
+sudo systemctl restart chrony
+if [ "$(systemctl is-active chrony)" != active ]; then
+  echo "  ERROR: chrony did not start after the topology change:" >&2
+  systemctl status chrony --no-pager 2>&1 | tail -5 >&2
+  exit 1
+fi
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break
+  sleep 1
+done
+echo "  chrony: $(chronyc -n tracking 2>/dev/null | sed -n 's/^Reference ID *: *\([^ ]*\).*/refid \1/p') stratum $(chronyc -n tracking 2>/dev/null | sed -n 's/^Stratum *: *//p') makestep=$(sudo chronyd -p 2>/dev/null | grep '^makestep' | tail -1 | cut -d' ' -f2- | tr ' ' '/') date=$(date -Is)"
+chronyc -n sources 2>/dev/null | sed -n '/^[\^=#]/p' | sed 's/^/    /'
+if [ -n "$WILDSYNC_NTP" ] && ! chronyc -n sources 2>/dev/null | grep -q "^\^\* $WILDSYNC_NTP"; then
+  echo "  WARNING: $WILDSYNC_NTP is not the selected source (unreachable, or still converging) - this node is on its peer mesh" >&2
+fi
+REMOTE
+  local rc=$?
+  [ "$rc" -eq 0 ] || { echo "  FAILED clock $name (remote exit $rc)" >&2; return 1; }
+}
+
 deploy_node() {
   local name="$1" ip rc
   ip="$(_ip "$name")" || return 1
@@ -276,15 +397,11 @@ deploy_node() {
   rc=$?
   rm -f /tmp/wildsync-piagent.env
   [ "$rc" -eq 0 ] || return 1
-  # When this host is the rig's clock master (deploy.sh jetson has run here),
-  # point the node at it. The strobe fires on THIS host's clock and the
-  # cameras on the nodes' clocks, so one reference keeps delta honest; the
-  # node's peer mesh (10-wildsync.conf) stays as the fallback.
-  local master=""
-  if [ -f /etc/chrony/conf.d/wildsync-host.conf ] && command -v ip >/dev/null 2>&1; then
-    master="$(ip route get "$ip" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
-  fi
-  ssh ubuntu@"$ip" "WILDSYNC_MASTER='$master' bash -s" <<'REMOTE'
+  # The node's clock topology, BEFORE anything is built or restarted: a node
+  # whose clock is days off (the power-cycled Pi) gets it stepped by chrony
+  # here, so the build and the services below start on the right time.
+  clock_node "$name" || return 1
+  ssh ubuntu@"$ip" bash -s <<'REMOTE'
 set -uo pipefail
 cd ~/wildsync
 if [ ! -f lib/libCr_Core.so ]; then
@@ -346,12 +463,8 @@ if ! sudo cmp -s /tmp/60-wildsync-olive.yaml "$OLIVE_NP"; then
   sudo install -m 600 /tmp/60-wildsync-olive.yaml "$OLIVE_NP"
   sudo netplan generate && sudo netplan apply && echo "  olive0 link configured (192.168.7.2/24)"
 fi
-# Clock master: the rigd host, when it is one (see the caller).
-if [ -n "$WILDSYNC_MASTER" ]; then
-  printf 'server %s iburst minpoll 4 maxpoll 6 prefer\n' "$WILDSYNC_MASTER" | \
-    sudo tee /etc/chrony/conf.d/20-wildsync-host.conf >/dev/null
-  sudo systemctl restart chrony 2>/dev/null || true
-fi
+# The clock topology (GNSS Compass, host master, peer mesh) was applied by
+# clock_node before this script ran - nothing about chrony is touched here.
 sudo systemctl daemon-reload
 sudo systemctl enable olive-bridge >/dev/null 2>&1
 sudo systemctl restart olive-bridge
@@ -372,6 +485,21 @@ REMOTE
   echo "  done $name"
 }
 
+# The software stamp every run records (run.json "software"). rigd asks git
+# first; BUILD_INFO.json is what it falls back to when git cannot answer (no
+# .git beside the code, git missing, or git refusing the checkout). One step
+# for both host flavours (deploy_mac, deploy_jetson); the node copy is written
+# by deploy_node.
+_stamp_host() {
+  local sw
+  if sw="$(python3 "$REPO"/rig/buildinfo.py --write "$REPO"/BUILD_INFO.json 2>/dev/null)"; then
+    echo "  software: $sw"
+  else
+    echo "  WARNING: $REPO is not a git checkout, so BUILD_INFO.json was not written;" >&2
+    echo "  runs record an existing $REPO/BUILD_INFO.json, or the software as unknown" >&2
+  fi
+}
+
 deploy_jetson() {
   echo "=== jetson (local) ==="
   # Host dependencies. A fresh JetPack image has none of these, and the old
@@ -383,25 +511,19 @@ deploy_jetson() {
     python3-serial python3-pil python3-numpy python3-opencv chrony rsync \
     >/dev/null 2>&1 || echo "  WARNING: apt install failed - check network"
   # The host is the rig's clock master: serve the LAN, keep a local stratum
-  # so the rig stays coherent with no upstream at sea, and let GPS-derived
-  # corrections come from rigd's own timesync layer.
-  printf 'allow 192.168.1.0/24\nlocal stratum 10\n' | \
-    sudo tee /etc/chrony/conf.d/wildsync-host.conf >/dev/null
+  # so the rig stays coherent with no upstream at sea, and hold the GNSS
+  # Compass itself (NTP_SERVER) so the host and the nodes - which prefer the
+  # Compass directly, clock_node - trace to the same GPS second.
+  { printf 'allow 192.168.1.0/24\nlocal stratum 10\n'
+    [ -z "$NTP_SERVER" ] || printf 'server %s iburst minpoll 4 maxpoll 6 prefer\n' "$NTP_SERVER"
+  } | sudo tee /etc/chrony/conf.d/wildsync-host.conf >/dev/null
   sudo systemctl enable --now chrony >/dev/null 2>&1 || true
   sudo systemctl restart chrony >/dev/null 2>&1 || true
   # Render the unit for THIS checkout and user - the template carries
   # placeholders, never a hardcoded machine.
   sed "s|__REPO__|$REPO|g; s|__USER__|$(id -un)|g" \
     "$REPO"/deploy/rigd.service | sudo tee /etc/systemd/system/rigd.service >/dev/null
-  # The software stamp every run records (run.json "software"). rigd asks git
-  # first; BUILD_INFO.json is what it falls back to when git cannot answer
-  # (no .git beside the code, git missing, or git refusing the checkout).
-  if sw="$(python3 "$REPO"/rig/buildinfo.py --write "$REPO"/BUILD_INFO.json 2>/dev/null)"; then
-    echo "  software: $sw"
-  else
-    echo "  WARNING: $REPO is not a git checkout, so BUILD_INFO.json was not written;" >&2
-    echo "  runs record an existing $REPO/BUILD_INFO.json, or the software as unknown" >&2
-  fi
+  _stamp_host
   sudo systemctl daemon-reload
   sudo systemctl enable rigd >/dev/null 2>&1
   # enable --now is a NO-OP on an already-running unit: redeploys silently
@@ -409,6 +531,63 @@ deploy_jetson() {
   sudo systemctl restart rigd
   sleep 3
   echo "  rigd: $(systemctl is-active rigd)  -> http://$(hostname -I | awk '{print $1}'):9090"
+  echo "  if the nodes are unreachable over ssh from this host, run '$0 trust <camN>' for each of: $NODES"
+}
+
+# This Mac as the rig host. It is NOT a chrony master and never was: the rig's
+# time reference is the GNSS Compass (NTP_SERVER), which every node holds
+# directly (clock_node). What the Mac must do is hold the SAME reference, so
+# that the host offset rigd measures - and corrects every fire target and every
+# capture instant for - is tens of milliseconds with a small uncertainty, not
+# the 100-190 ms of an undisciplined Mac (2026-08-23: 187 ms behind, ~60 ppm;
+# 2026-10-15: 100 ms behind GPS and Apple alike, with time.apple.com beyond the
+# rig segment anyway). macOS's own time service takes one server; this points
+# it at the Compass (System Settings > General > Date & Time shows it), which
+# needs an administrator password. Then the launchd agent of docs/INSTALL.md
+# 3a, rendered for this checkout and (re)started, and the software stamp -
+# deploy_jetson is the twin.
+deploy_mac() {
+  echo "=== mac (local) ==="
+  [ "$(uname -s)" = Darwin ] || { echo "  this is not a Mac - use: $0 jetson" >&2; return 1; }
+  if [ -n "$NTP_SERVER" ]; then
+    echo "  pointing this Mac's clock at $NTP_SERVER (systemsetup asks for an administrator password)"
+    if sudo systemsetup -setnetworktimeserver "$NTP_SERVER" >/dev/null 2>&1 && \
+       sudo systemsetup -setusingnetworktime on >/dev/null 2>&1; then
+      echo "  network time on, server $NTP_SERVER"
+    else
+      echo "  WARNING: systemsetup failed - set the server to $NTP_SERVER by hand:" >&2
+      echo "  System Settings > General > Date & Time > Source, then confirm with: sntp $NTP_SERVER" >&2
+    fi
+    # This Mac against the Compass right now: sntp prints the correction this
+    # clock needs (+ = this Mac is behind) and the Compass's own error bar.
+    # Expect it to shrink over the next minutes as macOS slews.
+    sntp -t 3 "$NTP_SERVER" 2>/dev/null | head -1 | sed 's/^/  sntp vs compass: /'
+  else
+    echo "  WILDSYNC_NTP is empty - this Mac's time server is left alone"
+  fi
+  local venv="$HOME/rig/venv/bin/python3"
+  local plist="$HOME/Library/LaunchAgents/org.wildtechnology.wildsync.rigd.plist"
+  local label="org.wildtechnology.wildsync.rigd"
+  if [ ! -x "$venv" ]; then
+    echo "  no $venv - create it first (docs/INSTALL.md 3a):" >&2
+    echo "    /opt/homebrew/bin/python3 -m venv ~/rig/venv && ~/rig/venv/bin/python3 -m pip install -r $REPO/requirements.txt" >&2
+    return 1
+  fi
+  mkdir -p "$HOME/rig" "$HOME/Library/LaunchAgents"
+  # Rendered for THIS checkout and home - the template carries placeholders.
+  sed "s|__REPO__|$REPO|g; s|__HOME__|$HOME|g" "$REPO"/deploy/rigd.launchd.plist > "$plist"
+  _stamp_host
+  # bootout then bootstrap, not kickstart: launchd reads a plist only at
+  # bootstrap, so a regenerated one (new venv, moved checkout) needs the
+  # round trip. Restart is the deploy; rigd finalises an active run on SIGTERM.
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$(id -u)" "$plist"; then
+    sleep 3
+    echo "  rigd: $(launchctl print "gui/$(id -u)/$label" 2>/dev/null | sed -n 's/^[[:space:]]*state = //p' | head -1) -> http://localhost:9090  (log ~/rig/rigd-launchd.log)"
+  else
+    echo "  FAILED: launchctl bootstrap $plist" >&2
+    return 1
+  fi
   echo "  if the nodes are unreachable over ssh from this host, run '$0 trust <camN>' for each of: $NODES"
 }
 
@@ -489,18 +668,26 @@ case "${1:-}" in
   provision) provision_node "${2:?usage: deploy.sh provision <camN>}";;
   trust)     trust_node "${2:?usage: deploy.sh trust <camN>}";;
   node)      deploy_node "${2:?usage: deploy.sh node <camN>}";;
+  clock)     clock_node "${2:?usage: deploy.sh clock <camN>}";;
+  mac)       deploy_mac;;
   jetson)    deploy_jetson;;
   strobe)    deploy_strobe;;
-  # The Jetson goes FIRST: deploy_node points a node at the host's chrony only
-  # if /etc/chrony/conf.d/wildsync-host.conf already exists, and only
+  # The host goes FIRST - this Mac, or this Jetson, whichever is running the
+  # script: clock_node points a node at the host's chrony only if
+  # /etc/chrony/conf.d/wildsync-host.conf already exists, and only
   # deploy_jetson writes it. Nodes first left that file absent on a first
   # install, so every node silently skipped the host master and the strobe (host
-  # clock) and the cameras (mesh clock) were on different references. One bad
-  # node must not stop the others, so failures are collected and `all` exits
-  # nonzero at the end.
+  # clock) and the cameras (mesh clock) were on different references. (Before
+  # deploy_mac existed, `all` on a Mac ran the Jetson steps - apt-get and
+  # systemd - and failed its way through them.) One bad node must not stop the
+  # others, so failures are collected and `all` exits nonzero at the end.
   all)       fail=""
-             deploy_jetson || fail="$fail jetson"
+             if [ "$(uname -s)" = Darwin ]; then
+               deploy_mac || fail="$fail mac"
+             else
+               deploy_jetson || fail="$fail jetson"
+             fi
              for n in $NODES; do deploy_node "$n" || fail="$fail $n"; done
              if [ -n "$fail" ]; then echo "FAILED:$fail" >&2; exit 1; fi;;
-  *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|jetson|strobe|all}"; exit 1;;
+  *) echo "usage: $0 {provision <camN>|trust <camN>|node <camN>|clock <camN>|mac|jetson|strobe|all}"; exit 1;;
 esac

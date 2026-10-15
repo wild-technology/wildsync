@@ -1,22 +1,28 @@
 #cloud-config
 # Wild Sync node re-provision: re-applies the ssh user and the rig's chrony
-# peer mesh to a node whose card has already booted. The mesh is the clock
-# topology under a Mac host (deliberately not a chrony master) and the fallback
-# under a Jetson host (`deploy.sh node`, run from a Jetson, adds that Jetson as
-# the preferred master). Written for the 2026-08-23 Mac host; the chrony step
-# was generalized from two nodes to N on 2026-08-27.
+# topology to a node whose card has already booted. The clock reference is the
+# GNSS Compass on the rig switch (GNSS_NTP below: a stratum-1 NTP server on GPS
+# time), under either host; the peer mesh is the fallback when it is off, and
+# `deploy.sh node`, run from a Jetson host, adds that Jetson as a further
+# server. Written for the 2026-08-23 Mac host; the chrony step was generalized
+# from two nodes to N on 2026-08-27 and given the Compass on 2026-10-15.
+# `deploy.sh clock camN` applies the same topology to a node whose card never
+# ran this step.
 #
 # Drop this on a node's system-boot partition as `user-data` together with a
 # NEW instance-id in `meta-data` (see install.sh). cloud-init re-runs its
 # per-instance modules on the next boot and:
 #   * adds this host's SSH key alongside the one already on the card (password
 #     unchanged);
-#   * writes the rig clock topology. With no chrony master on the rig
-#     (docs/PROTOCOL.md) the nodes are their own time domain. Every node gets
-#     the SAME config — a full mesh of chrony peers plus an orphan local
-#     reference — and chrony elects one master by comparing NTP reference IDs.
-#     The Ubuntu pool in /etc/chrony/chrony.conf is untouched and still wins
-#     whenever the boat has internet.
+#   * writes the rig clock topology (docs/INSTALL.md 5). Every node gets the
+#     SAME config: the GNSS Compass as its preferred server, plus a full mesh
+#     of chrony peers and an orphan local reference, so that with the Compass
+#     off chrony elects one master by comparing NTP reference IDs. chrony.conf
+#     is made to step ANY error over 1 s (`makestep 1 -1`): a Pi has no RTC
+#     battery, so after a power cycle it boots days in the past and must step
+#     the moment a reference answers, however many updates it has already
+#     made. The Ubuntu pool in /etc/chrony/chrony.conf is untouched and still
+#     wins whenever the boat has internet.
 # The hostname is kept (a named card is written back as hostname:, an unnamed
 # one keeps the image default) and no packages are touched or upgraded.
 #
@@ -58,18 +64,21 @@ ssh_pwauth: true
 chpasswd:
   expire: false
 runcmd:
-  # Clock topology for N nodes with no upstream at sea. Every node gets the
-  # SAME config — a full mesh of chrony peers plus an orphan local reference —
-  # and chrony elects one master by comparing NTP reference IDs (which are the
-  # nodes' own IPv4 addresses), so .201 holds it while it is up and the group
-  # re-elects the next-lowest address on its own if it is not. Nothing below
-  # names a camera: adding cam4 is one entry in SLOTS, no logic change.
+  # Clock topology for N nodes with no internet at sea. Every node gets the
+  # SAME config: the GNSS Compass (GNSS_NTP, stratum 1 on GPS, preferred),
+  # and behind it a full mesh of chrony peers plus an orphan local reference,
+  # so that with the Compass off chrony elects one master by comparing NTP
+  # reference IDs (which are the nodes' own IPv4 addresses) - .201 holds it
+  # while it is up and the group re-elects the next-lowest address on its own
+  # if it is not. Nothing below names a camera: adding cam4 is one entry in
+  # SLOTS, no logic change.
   #
   # Replaces the two-node if/else ("peer = the other one"), which has no
-  # meaning with a third camera. With a Mac host (deliberately not a master,
-  # docs/PROTOCOL.md) the nodes are their own time domain: free-running they
-  # measured 16.8 ms apart against a 10 ms pair budget; peered in orphan mode,
-  # 0.6 ms. Under a Jetson host the mesh stays as the fallback behind it.
+  # meaning with a third camera. Free-running, the nodes measured 16.8 ms
+  # apart against a 10 ms pair budget; peered in orphan mode, 0.6 ms; on the
+  # Compass they share GPS time with the host (deploy.sh mac / jetson point
+  # the host at the same server), which is what removes the host offset rigd
+  # otherwise has to measure and correct for.
   #
   # The full mesh is what survives node loss. A star pointed at .201 leaves the
   # survivors free-running when .201 drops — that is the 16.8 ms failure.
@@ -81,7 +90,9 @@ runcmd:
     ( set -eu
       SUBNET=192.168.1
       SLOTS="1 2 3"        # pi-camN <-> $SUBNET.$((200+N)).  cam4: add "4".
+      GNSS_NTP=192.168.1.60   # the GNSS Compass; deploy.sh's NTP_SERVER - keep them equal
       CONF=/etc/chrony/conf.d/10-wildsync.conf
+      GNSS_CONF=/etc/chrony/conf.d/20-wildsync-gnss.conf
 
       n="$(hostname -s)"; n="${n#pi-cam}"
       case "$n" in ''|*[!0-9]*)
@@ -104,8 +115,22 @@ runcmd:
         done
         echo 'local stratum 10 orphan'
         echo "allow $SUBNET.0/24"
-        echo 'makestep 1.0 3'
+        echo 'makestep 1 -1'
       } > "$CONF"
+      # The reference. Same file, same content as `deploy.sh clock` writes.
+      { echo "# wildsync: the rig's GNSS Compass - a stratum-1 GPS NTP server on the rig switch."
+        echo "# generated $(date -Is) by the card step; deploy.sh clock writes the same - do not hand-edit"
+        echo "server $GNSS_NTP iburst minpoll 4 maxpoll 6 prefer"
+      } > "$GNSS_CONF"
+      # Ubuntu's chrony.conf says `makestep 1 3` AFTER `confdir`, so it wins
+      # over the drop-in above and after three updates the node may never step
+      # again - a node that peered a wrong neighbour before the Compass
+      # answered would then be stuck days off. Always step a >1 s error.
+      if grep -q '^[[:space:]]*makestep[[:space:]]' /etc/chrony/chrony.conf; then
+        sed -i 's/^[[:space:]]*makestep[[:space:]].*/makestep 1 -1/' /etc/chrony/chrony.conf
+      else
+        echo 'makestep 1 -1' >> /etc/chrony/chrony.conf
+      fi
 
       # Real time whenever the boat has internet: the Ubuntu pool lines live in
       # /etc/chrony/chrony.conf (confdir pulls this drop-in in alongside them)
@@ -142,7 +167,11 @@ runcmd:
 
 # Verify per node — all three must print the SAME Reference ID, which is the
 # one-line proof the group has exactly one master (two distinct refids is a
-# split; rigd's node_clock_skew, not chronyc, is the detector for that):
+# split; rigd's node_clock_skew, not chronyc, is the detector for that). With
+# the Compass up that is its address, at stratum 2:
+#   ssh ubuntu@192.168.1.201 chronyc tracking   # Ref ID C0A8013C (192.168.1.60)  Stratum 2
+#   ssh ubuntu@192.168.1.202 chronyc tracking   # Ref ID C0A8013C (192.168.1.60)  Stratum 2
+# and with it off, the orphan master's:
 #   ssh ubuntu@192.168.1.201 chronyc tracking   # Ref ID C0A801C9 (.201)  Stratum 10
 #   ssh ubuntu@192.168.1.202 chronyc tracking   # Ref ID C0A801C9 (.201)  Stratum 11
 #   ssh ubuntu@192.168.1.203 chronyc tracking   # Ref ID C0A801C9 (.201)  Stratum 11

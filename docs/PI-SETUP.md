@@ -436,31 +436,44 @@ still carries the older Yahboom IMU, deploy it with
 
 ### Chrony, after provisioning
 
-The node's clock topology has two layers, and which of them apply depends on
-the host:
+The node's clock topology has three layers (`docs/INSTALL.md` §5), applied by
+the card step and re-applied by `deploy.sh clock camN` (which `deploy.sh node`
+runs first):
 
-1. **The peer mesh — every node, either host.** The card's own step
+1. **The GNSS Compass — every node, either host.** `192.168.1.60` is a
+   stratum-1 NTP server on GPS time; `/etc/chrony/conf.d/20-wildsync-gnss.conf`
+   names it with `prefer`. A Pi has no RTC battery and boots where its
+   filesystem left it, so `chrony.conf` is set to `makestep 1 -1`: any error
+   over a second is stepped the moment a reference answers, however many
+   updates the node has already made (Ubuntu's `makestep 1 3` gives up after
+   three, and is parsed after the drop-ins, so a drop-in cannot override it).
+2. **The peer mesh — every node, either host.** The card's own step
    (`deploy/pi-resync/user-data.template`) writes a full mesh of peers across
-   `192.168.1.201/.202/.203` plus an orphan local reference, so the nodes stay
-   within about a millisecond of each other with no upstream at all.
-2. **The Jetson as master — Jetson host only.** `deploy.sh jetson` makes the
-   Jetson a chrony server for 192.168.1.0/24, and `deploy.sh node`, run **from
-   that Jetson**, adds `/etc/chrony/conf.d/20-wildsync-host.conf` pointing the
-   node at it with `prefer`. The Jetson fires the XR256 on its own clock and the
-   nodes fire the cameras on theirs, so one reference keeps the strobe timing
-   honest.
+   `192.168.1.201/.202/.203` plus an orphan local reference
+   (`10-wildsync.conf`), so the nodes stay within about a millisecond of each
+   other with the Compass off. `deploy.sh clock` writes the same file on a node
+   whose card never ran that step (cam1's had not, 2026-10-15: it still carried
+   the two-node `10-jetson.conf` star).
+3. **The Jetson as a server — Jetson host only.** `deploy.sh jetson` makes the
+   Jetson a chrony server for 192.168.1.0/24 (itself on the Compass), and
+   `deploy.sh node`, run **from that Jetson**, adds
+   `/etc/chrony/conf.d/20-wildsync-host.conf` pointing the node at it. The
+   Jetson fires the XR256 on its own clock and the nodes fire the cameras on
+   theirs, so one reference keeps the strobe timing honest.
 
-A **Mac host is deliberately not a chrony master**: nothing on it answers NTP,
-`deploy.sh node` writes no host line when run from it, and the nodes keep only
-the peer mesh. rigd then measures the host's offset from the nodes itself and
-corrects the fire schedule and every capture instant for it
-(`host_clock_offset`; `docs/PROTOCOL.md`, "CLOCK DOMAINS"). Keeping the Mac's
-own clock on network time removes that correction's uncertainty.
+A **Mac host is not a chrony master** and need not be: the nodes hold GPS time
+directly. `deploy.sh mac` points the Mac's own clock at the Compass so the host
+offset rigd measures and corrects every fire and capture instant for
+(`host_clock_offset`; `docs/PROTOCOL.md`, "CLOCK DOMAINS") is small; nothing on
+the Mac answers NTP and `deploy.sh clock` writes no host line when run from it.
+A node that is still wrong because the Compass was off while it booted gets
+rigd's `node_clock_wrong` anomaly and its **set camN clock from host** button
+(`POST /api/node/clock/step`), which steps the node to the host's clock.
 
 `provision` writes no chrony configuration of its own, and removes the
-`wildsync.conf` that earlier versions wrote. Verify per §9: `chronyc sources`
-on a node should show its peers and, with a Jetson host, the Jetson selected
-(`*`).
+`wildsync.conf` that earlier versions wrote. Verify per §9: `chronyc -n
+sources` on a node should show the Compass selected (`*`) and its peers behind
+it.
 
 ---
 
@@ -633,14 +646,16 @@ for ip in 192.168.1.201 192.168.1.202 192.168.1.203; do
 done
 ```
 
-All three must print the **same Reference ID** — the Jetson's address when the
-nodes were deployed from a Jetson host (§6, Chrony), otherwise one node's (the
-mesh elects the lowest address) — which is the one-line proof the group has
-exactly one master. Two distinct refids is a split. After a master
-handover the followers slew rather than step, so give it a minute before
-trusting the budget. rigd's `node_clock_skew` (not `chronyc`) is the detector
-that runs during a survey, and it needs three consecutive scans to raise or
-clear.
+All three must print the **same Reference ID** — `C0A8013C (192.168.1.60)`,
+the GNSS Compass, at Stratum 2 whenever it is up (§6, Chrony); with it off,
+the Jetson's address on a Jetson rig, otherwise one node's (the mesh elects the
+lowest address) — which is the one-line proof the group has exactly one master.
+Two distinct refids is a split. After a master handover the followers slew
+rather than step, so give it a minute before trusting the budget; a clock more
+than a second out steps at once (`makestep 1 -1`). rigd's `node_clock_skew`
+(not `chronyc`) is the detector that runs during a survey, and it needs three
+consecutive scans to raise or clear; a node seconds off raises
+`node_clock_wrong` on the first scan instead.
 
 **Then fire it once.** A node that answers every endpoint and has never pulsed
 TRIGGER has proved nothing about the harness. Do a bench fire with the body
@@ -656,7 +671,8 @@ pre-dive).
 | Camera connects, answers property reads, writes to its own card — but PC image transfer dies mid-frame | `usbfs_memory_mb` is back at the 16 MB default. It **must** be set on the **kernel command line** (`usbcore.usbfs_memory_mb=150` in `/boot/firmware/cmdline.txt`), not in `modprobe.d` — `usbcore` is built into the Pi kernel, so `/etc/modprobe.d/usbfs.conf` is never read and the runtime `echo` silently reverted on every reboot. Check `/proc/cmdline`; re-run `deploy.sh provision cam3` and **reboot**. Presents as a broken camera. |
 | Body reports every property read-only, hands control priority back, ignores the shutter on **both** USB and GPIO | A Low `FOCUS` line — a permanent half-press. **A released GPIO is not high-Z**: the pad keeps the last requester's bias. `piagent` holds the lines open-drain-idle for exactly this reason; check `harness_safe` in `/gpio/state`. Anything that drove the line by hand (a stray `gpioset`, a crashed test) can leave it there. |
 | `ilxctl` "active" at 0% CPU, camera unusable; `systemctl restart` hangs | Stuck PTP session from an unclean shutdown. **Recovery recipe: §10.1** — `pkill -9 -x ilxctl`, USB unbind, USB bind, `systemctl start ilxctl`. `ilxctl` binds `:8080` *before* its startup connect (`src/main.cpp`), so the symptom is `/api/status` answering with `connected:false` rather than a dead port — but the PTP session still needs the unbind/bind to clear. `deploy/ilxctl.service` sets `RestartPreventExitStatus=SIGKILL` so a deliberate `-9` stays down long enough for the recipe to work. |
-| `node_clock_skew` anomaly | Two nodes disagree beyond the noise floor (warn >5 ms, bad >8 ms), off the RTT-gated median, after 3 consecutive scans. Usually one node lost the peer group — check that all three `chronyc tracking` refids match (§9) and that no leftover `/etc/chrony/conf.d/wildsync.conf` (written by earlier versions of `provision`, which now removes it) points a node at one host with `prefer`. A *common-mode* host-vs-node offset is invisible to this check by construction; that one is `host_clock_offset` (turn on network time on the host). |
+| `node_clock_skew` anomaly | Two nodes disagree beyond the noise floor (warn >5 ms, bad >8 ms), off the RTT-gated median, after 3 consecutive scans. Usually one node lost the Compass or the peer group — check that all three `chronyc tracking` refids match (§9) and that no leftover `/etc/chrony/conf.d/wildsync.conf` or `10-jetson.conf` (written by earlier versions; `deploy.sh clock` removes both) points a node at one host with `prefer`. A *common-mode* host-vs-node offset is invisible to this check by construction; that one is `host_clock_offset` (put the host on the Compass: `deploy.sh mac` / `jetson`). |
+| `node_clock_wrong` anomaly | That node's clock is more than 2 s from the host's — a Pi power-cycled while the Compass was unreachable boots where its filesystem left it (47 days behind, cam1, 2026-10-15) — and every scheduled fire on it is refused. Click **set camN clock from host** on the anomaly (`POST /api/node/clock/step`; refused during a run), or `deploy.sh clock camN` once the Compass is back, then confirm `chronyc -n sources` shows `192.168.1.60` selected. |
 | `node_clock_unmeasurable` | That node's best `/health` RTT is ≥20 ms, so the 10 ms budget cannot be verified at all. Check the PoE/switch path, not the clock. |
 | Unit is `active`, but "no camera found" / `EnumCameraObjects` fails | USB permissions or the SDK adapter path. `deploy.sh node` installs the udev rule for the Sony body (`/etc/udev/rules.d/99-wildsync-sony.rules`, vendor `054c`, group `plugdev`) and adds `ubuntu` to `plugdev`; check both (`ls -l /dev/bus/usb/*/*`, `id ubuntu`) and that the body is in PC Remote mode. The adapter path is the `WorkingDirectory=` of `deploy/ilxctl.service` (`CrError_Adaptor_Create`, 0x8703, reads as "no camera found"). |
 | Header stays `2/3` | The node is in the fleet but not connected — a node fault, not a config one. Work §9 from the top. |

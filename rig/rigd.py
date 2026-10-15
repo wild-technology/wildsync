@@ -208,6 +208,19 @@ STATIC_FIX_PATH = os.path.expanduser("~/rig/static_fix.json")
 # by ~33 ms on both nodes and the pair skew degraded 0.59 -> 1.78 ms.
 HOST_CLOCK_WARN_S = 0.1
 HOST_CLOCK_BAD_S = 0.5
+# A node this far from the host has a WRONG clock, not an offset: a Pi has no
+# RTC battery, so a node power-cycled with no reachable chrony source boots
+# where its filesystem left it (cam1, 2026-10-15: 47 days behind). The fire
+# scheduler compensates a node-minus-host offset only within -1.0..+5.0 s, and
+# piagent refuses any at_epoch outside -2.0..+5.5 s on its own clock, so past
+# a couple of seconds every scheduled fire is refused and no survey is
+# possible. Chrony's own makestep threshold is 1 s: a node a few seconds out
+# that chrony could fix would have been fixed, so what remains is a node with
+# no reference, and the remedy is a step from the host (/api/node/clock/step),
+# not a host setting. Such a node is also dropped from the host_clock_offset
+# median and the node_clock_skew pairs: it would otherwise brand the HOST as
+# days off and the other node as skewed by weeks.
+NODE_CLOCK_WRONG_S = 2.0
 # An offset measured over a link this slow is not a clock reading, it is the
 # network. Say so instead of dropping the node out of the comparison silently.
 CLOCK_RTT_LIMIT_MS = 20.0
@@ -1022,6 +1035,46 @@ class Anomalies:
                 unmeasurable.append((m.name_, info))
                 continue
             clocked.append((m.name_, info))
+        # A node whose clock is seconds off is a different fault from either
+        # detector below, with its own fix; see NODE_CLOCK_WRONG_S. Judged
+        # before the pairwise and host comparisons, which it must not enter.
+        wrong = [(n, i) for n, i in clocked
+                 if abs(i["offset_s"]) > NODE_CLOCK_WRONG_S]
+        clocked = [(n, i) for n, i in clocked
+                   if abs(i["offset_s"]) <= NODE_CLOCK_WRONG_S]
+        for name, info in wrong:
+            off = info["offset_s"]
+            mag = abs(off)
+            if mag >= 86400:
+                human = "%.1f days" % (mag / 86400.0)
+            elif mag >= 3600:
+                human = "%.1f hours" % (mag / 3600.0)
+            elif mag >= 60:
+                human = "%.1f minutes" % (mag / 60.0)
+            else:
+                human = "%.1f s" % mag
+            out.append(self._a(
+                "node_clock_wrong", name,
+                "%s clock is %s %s the host" % (
+                    name, human, "ahead of" if off > 0 else "behind"),
+                {"offset_s": round(off, 3), "n": info["n"],
+                 "rtt_ms_best": info["rtt_ms_best"],
+                 "action": {"method": "POST", "path": "/api/node/clock/step",
+                            "body": {"node": name}}},
+                "every scheduled fire on %s is being refused (piagent accepts "
+                "an at_epoch only within -2/+5.5 s of its own clock), so the "
+                "run cannot shoot. Its chrony has no reference it can step "
+                "to - a Pi has no RTC battery, so a power cycle with the GNSS "
+                "Compass (the rig's NTP server) unreachable boots it where it "
+                "was. Click 'set %s clock from host' (POST "
+                "/api/node/clock/step {\"node\": \"%s\"}): the node steps to "
+                "this host's clock and chrony slews the residual once a source "
+                "answers. Then check `chronyc sources` on the node shows the "
+                "Compass selected. If EVERY node shows the same offset and "
+                "their chronyc tracking says GPS, it is this host that is "
+                "wrong - fix the host instead (deploy.sh mac / jetson)"
+                % (name, name, name),
+                sev="bad"))
         for name, info in unmeasurable:
             out.append(self._a(
                 "node_clock_unmeasurable", name,
@@ -1062,8 +1115,10 @@ class Anomalies:
                      "samples": {na: ia["n"], nb: ib["n"]}},
                     "the whole stereo sync budget is 10 ms: scheduled fires "
                     "land this far apart and the strobe walks out of the "
-                    "exposure window. Re-point both nodes' chrony at ONE "
-                    "reachable master (peer cam2 to cam1) and confirm with "
+                    "exposure window. Both nodes must hold ONE reference: "
+                    "the GNSS Compass (chronyc sources shows it selected, "
+                    "'*') or, with it unreachable, the same peer. Re-run "
+                    "deploy.sh clock <node> on the odd one and confirm with "
                     "chronyc tracking",
                     sev="bad" if skew > 8.0 else "warn"))
         for pair in [p for p in self._skew_streak if p not in seen_pairs]:
@@ -1091,9 +1146,12 @@ class Anomalies:
                     "on the node clock, so this offset comes straight out of "
                     "the 10 ms stereo sync budget - and nav fixes are looked "
                     "up at a node epoch against a host-keyed ring, putting "
-                    "every frame's position out by this much. Enable network "
-                    "time on the host (System Settings > General > Date & "
-                    "Time), then confirm the nodes' chronyc tracking",
+                    "every frame's position out by this much. The nodes hold "
+                    "the GNSS Compass's GPS time; put this host on the same "
+                    "network time (deploy.sh mac on a Mac - it sets the "
+                    "Compass as the server under System Settings > General > "
+                    "Date & Time; deploy.sh jetson on a Jetson), then confirm "
+                    "the nodes' chronyc tracking",
                     sev="bad" if abs(med) > HOST_CLOCK_BAD_S else "warn"))
         free = self._runs_free_mb()
         if isinstance(free, (int, float)) and free < RUNS_DISK_LOW_MB:
@@ -1470,6 +1528,64 @@ class Rig:
         return {"ok": ok, "node": node_name,
                 "error": None if ok else (rep or {}).get("error")
                 if isinstance(rep, dict) else "no answer from node"}
+
+    def node_clock_step(self, node_name):
+        """Step a node's system clock to this host's, via piagent
+        /clock/step - the `sudo date -s` of 2026-10-15 as a button. Refused
+        while a run is active: a step moves every fire instant the run has
+        scheduled on that node, and a run whose node is seconds off is paused
+        (capture_paused) rather than shooting, so stop it, step, restart.
+        The node's clock window is reset on a successful step so the
+        node_clock_wrong anomaly clears on the next poll instead of a minute
+        later (see NodeMonitor.reset_clock). Not gated on the measured
+        offset: piagent judges the request against its own clock at receipt
+        and refuses anything under its 1 s threshold, which is the one
+        measurement that cannot be stale."""
+        m = None
+        for mm in self.monitors:
+            if mm.name_ == node_name:
+                m = mm
+        if m is None:
+            raise BadRequest("unknown node %r" % node_name)
+        if self.runmgr.status().get("active"):
+            raise BadRequest("a run is active - stop it before stepping a "
+                             "node's clock (the step would move every fire "
+                             "instant scheduled on %s)" % node_name)
+        if m.snapshot()["state"] == NodeMonitor.OFFLINE:
+            raise BadRequest("%s is offline - nothing to step" % node_name)
+        before = m.clock_offset_info()
+        self.events.emit("warn", "clock_step",
+                         "clock step requested on %s (measured node-host "
+                         "offset %s)" % (node_name,
+                                         "%.3f s" % before["offset_s"]
+                                         if before.get("offset_s") is not None
+                                         else "unmeasured"),
+                         node=node_name)
+        # piagent may wait out a fire's busy-wait (<= 6 s) before it steps.
+        rep = rigcore.http_json(m.pia + "/clock/step",
+                                {"host_epoch": time.time()}, timeout=10)
+        if not isinstance(rep, dict) or rep.get("_unreachable"):
+            self.events.emit("error", "clock_step",
+                             "%s did not answer /clock/step" % node_name,
+                             node=node_name)
+            return {"ok": False, "node": node_name, "stepped": False,
+                    "error": "no answer from %s's piagent" % node_name}
+        ok = bool(rep.get("ok")) and bool(rep.get("stepped"))
+        if ok:
+            m.reset_clock()
+            self.events.emit("info", "clock_step",
+                             "%s clock stepped by %+.3f s to this host's"
+                             % (node_name, rep.get("offset_s") or 0.0),
+                             node=node_name, offset_s=rep.get("offset_s"))
+        else:
+            self.events.emit("warn", "clock_step",
+                             "%s clock NOT stepped: %s"
+                             % (node_name, rep.get("error") or "refused"),
+                             node=node_name)
+        out = dict(rep)
+        out.pop("code", None)
+        out.update(ok=ok, node=node_name, stepped=bool(rep.get("stepped")))
+        return out
 
     def project_change(self, op, body):
         """create/open/update the project layer, guarded against the two
@@ -2883,6 +2999,9 @@ class Handler(BaseHTTPRequestHandler):
                 # client meant a full one.
                 quick = want_bool(b.get("quick", 1), '"quick"')
                 self._json(RIG.node_format(node, quick=quick))
+            elif p == "/api/node/clock/step":
+                node = self._node(b.get("node"), '"node"').name_
+                self._json(RIG.node_clock_step(node))
             elif p in ("/api/settings/discard", "/api/settings/revert"):
                 self._json(RIG.settings.discard())
             elif p == "/api/settings/auto":

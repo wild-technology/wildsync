@@ -40,6 +40,11 @@ Covers, and FAILS on the pre-fix code for:
       connection closed, never {} on defaults
   P16 a stopped interval's exit block does not clobber a restarted
       interval's state and lease
+  P18 POST /clock/step - the node steps its system clock to the host's epoch
+      (`sudo -n date -s @<epoch>`, the 2026-10-15 hand fix as an API) when at
+      least 1 s apart, and refuses less (chrony's job), a bad epoch, a running
+      interval capture, a fire in progress, and reports a failed `date`.
+      Nothing here ever runs the real command: _run is replaced.
   P17 a failed strobe-line claim is retried after a cooldown; the permanent
       refusals (disabled, no gpio) stay cached
 
@@ -574,6 +579,156 @@ def _p17_strobe_claim_retry(cleanup):
 # ---------------------------------------------------------------------------
 # The suite
 # ---------------------------------------------------------------------------
+def _p18_clock_step(cleanup):
+    """POST /clock/step: the node's own clock stepped from the host."""
+    sect("audit piagent: /clock/step - node clock stepped from the host (P18)")
+    g = _mk_gpio()
+    cleanup.append(g)
+    calls = []
+    real_run = piagent._run
+
+    def fake_run(cmd, timeout=5):
+        calls.append(list(cmd))
+        return 0, "", ""
+    # The whole section runs with _run replaced: a real `sudo date -s` on the
+    # machine running this suite would be the one unforgivable side effect.
+    piagent._run = fake_run
+    try:
+        now = time.time()
+        r = g.clock_step(now + 5.0)
+        check("a 5 s disagreement is stepped", r.get("ok") is True
+              and r.get("stepped") is True, json.dumps(r))
+        check("offset_s is host minus node (+5 = this node was behind)",
+              4.9 < (r.get("offset_s") or 0) < 5.1, json.dumps(r))
+        check("node_epoch is reported after the step",
+              isinstance(r.get("node_epoch"), float), json.dumps(r))
+        check("the step is `sudo -n date -s @<epoch>`",
+              bool(calls) and calls[-1][:4] == ["sudo", "-n", "date", "-s"]
+              and len(calls[-1]) == 5 and calls[-1][4].startswith("@"),
+              repr(calls[-1:]))
+        if calls:
+            try:
+                ep = float(calls[-1][4][1:])
+            except ValueError:
+                ep = 0.0
+            check("the epoch handed to date is the host's NOW, not the host's "
+                  "then (transit added back)", abs(ep - (now + 5.0)) < 0.5
+                  and ep >= now + 5.0, "%.6f vs %.6f" % (ep, now + 5.0))
+        calls.clear()
+
+        r = g.clock_step(time.time() + 0.4)
+        check("under 1 s is refused - that residual is chrony's to slew",
+              r.get("ok") is False and r.get("code") == 409
+              and r.get("stepped") is False and "chrony" in r.get("error", ""),
+              json.dumps(r))
+        check("a refused step runs nothing", not calls, repr(calls))
+        check("the refusal still reports the measured offset",
+              0.3 < (r.get("offset_s") or 0) < 0.5, json.dumps(r))
+        r = g.clock_step(time.time() - 0.9)
+        check("the threshold is symmetric (-0.9 s is also refused)",
+              r.get("code") == 409 and not calls, json.dumps(r))
+        r = g.clock_step(time.time() - 3.0)
+        check("a node AHEAD of the host is stepped back",
+              r.get("ok") is True and -3.1 < (r.get("offset_s") or 0) < -2.9
+              and bool(calls), json.dumps(r))
+        calls.clear()
+
+        for junk in ("junk", None, 0, -5, float("nan"), float("inf"), ""):
+            r = g.clock_step(junk)
+            check("host_epoch %r is a 400 and runs nothing" % (junk,),
+                  r.get("code") == 400 and r.get("stepped") is False
+                  and not calls, json.dumps(r))
+
+        # An interval capture is an absolute schedule at+k*period on THIS
+        # clock; a step would land every remaining frame in the past or the
+        # future wholesale.
+        g._interval_state["running"] = True
+        r = g.clock_step(time.time() + 5.0)
+        check("refused while an interval capture is running",
+              r.get("code") == 409 and "interval" in r.get("error", "")
+              and not calls, json.dumps(r))
+        g._interval_state["running"] = False
+
+        # A fire busy-waiting to its instant holds the fire lock; the clock
+        # must not move under it. The wait is bounded by FIRE_MAX_FUTURE_S,
+        # shortened here so the check does not take six seconds.
+        g._fire_lock.acquire()
+        g.FIRE_MAX_FUTURE_S = 0.2
+        try:
+            t0 = time.time()
+            r = g.clock_step(time.time() + 5.0)
+            held = time.time() - t0
+        finally:
+            del g.FIRE_MAX_FUTURE_S
+            g._fire_lock.release()
+        check("refused while a fire holds the lock (waited %.2f s)" % held,
+              r.get("code") == 409 and "fire" in r.get("error", "")
+              and not calls and held < 2.0, json.dumps(r))
+        r = g.clock_step(time.time() + 5.0)
+        check("the lock is released again afterwards: the next step succeeds",
+              r.get("ok") is True, json.dumps(r))
+        calls.clear()
+
+        # `date` itself failing (sudo wanting a password, a read-only clock)
+        # is a 500 that quotes stderr - never a silent ok.
+        piagent._run = lambda cmd, timeout=5: (
+            1, "", "date: cannot set date: Operation not permitted\n")
+        r = g.clock_step(time.time() + 5.0)
+        check("a failed date -s is reported with its stderr",
+              r.get("ok") is False and r.get("code") == 500
+              and r.get("stepped") is False
+              and "Operation not permitted" in r.get("error", ""),
+              json.dumps(r))
+        piagent._run = fake_run
+
+        # Over HTTP, through the real Handler.
+        old_gpio = piagent.GPIO
+        piagent.GPIO = g
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), piagent.Handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % srv.server_address[1]
+        try:
+            r = _post(base + "/clock/step", {"host_epoch": time.time() + 5.0})
+            check("POST /clock/step steps and answers 200",
+                  r.get("ok") is True and r.get("stepped") is True
+                  and 4.9 < r.get("offset_s", 0) < 5.1, json.dumps(r))
+            code, r = _post_status(base + "/clock/step",
+                                   {"host_epoch": time.time() + 0.2})
+            check("a sub-threshold request answers 409 with stepped:false",
+                  code == 409 and r.get("stepped") is False, json.dumps(r))
+            code, r = _post_status(base + "/clock/step", {})
+            check("a body without host_epoch answers 400",
+                  code == 400 and "host_epoch" in r.get("error", ""),
+                  json.dumps(r))
+            check("every HTTP answer carries node_epoch",
+                  isinstance(r.get("node_epoch"), float), json.dumps(r))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            piagent.GPIO = old_gpio
+        try:
+            with open(piagent.LOG_PATH) as fh:
+                logged = "clock_step" in fh.read()
+        except OSError:
+            logged = False
+        check("a step is journalled as clock_step", logged)
+    finally:
+        piagent._run = real_run
+
+
+def _post_status(url, body):
+    """(status, json) - _post raises on a non-2xx, this reads it."""
+    import urllib.error
+    req = _rq.Request(url, data=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json"})
+    try:
+        with _rq.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
 def suite(opts):
     cleanup = []
 
@@ -1354,6 +1509,7 @@ def suite(opts):
     _p15_body_framing(cleanup)
     _p16_interval_restart(cleanup)
     _p17_strobe_claim_retry(cleanup)
+    _p18_clock_step(cleanup)
 
     # ---- teardown ---------------------------------------------------------
     for g in cleanup:

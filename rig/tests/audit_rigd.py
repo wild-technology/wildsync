@@ -11,6 +11,10 @@ D2  Unvalidated inputs: {"on":"maybe"} armed the auto-exposure servo,
     until the node flapped, ?since=abc / t0=abc / steps="x" came back 500 with
     a Python exception string, /api/calibrate took samples<1, and the lens
     fanout answered ok:true with empty results for a camera it had skipped.
+D3b node_clock_wrong and POST /api/node/clock/step did not exist: a node
+    seconds (or 47 days) off branded the HOST as off, read as weeks of skew
+    against its partner, and the only fix was `sudo date -s` typed on the
+    node.
 D3  host_clock_offset did not exist (a common-mode node-vs-host offset is
     invisible to the node-to-node skew check); node_clock_skew fired on ONE
     sample and silently dropped a node whose link was slow.
@@ -509,11 +513,16 @@ def t_inputs(h):
 # ===========================================================================
 # D3 — clock domains
 # ===========================================================================
-def _drifted_http_json(offsets):
+def _drifted_http_json(offsets, base=None):
     """Wrap rigcore.http_json so a fake's /health reports a clock `offset`
-    seconds off the host's. The fakes have no clock knob and are not under
-    test here, so the drift is injected on the wire instead."""
-    orig = rigcore.http_json
+    seconds off the host's. The drift is injected on the wire (the fakes'
+    own knob, FakeNode.pi_clock_offset_s, arrived with D3b; this predates
+    it). `base` is the function to wrap - pass the pristine http_json. It
+    used to wrap whatever rigcore.http_json WAS at the call, so each phase
+    stacked on the previous one's wrapper and the empty-offsets wrapper in a
+    finally restored nothing: +0.8 s of leftover drift rode into every later
+    section, where D3b was the first to look at a clock and see it."""
+    orig = base or rigcore.http_json
 
     def w(url, *a, **kw):
         r = orig(url, *a, **kw)
@@ -567,13 +576,16 @@ def t_clock(h):
     h.wait_connected("cam1")
     h.wait_connected("cam2")
     an = h.rig.anomalies
+    # Every wrapper below is built on THIS function and every finally puts
+    # THIS function back (see _drifted_http_json).
+    base = rigcore.http_json
 
     # -- both nodes agree with each other and disagree with the HOST -------
     # This is today's live fault: the Pis are chrony-locked to each other
     # (0.6 ms) while the Mac is 187 ms out and drifting. The node-to-node
     # check sees skew 0 and says nothing.
     rigcore.http_json = _drifted_http_json({"127.0.0.2": 0.2,
-                                            "127.0.0.3": 0.2})
+                                            "127.0.0.3": 0.2}, base)
     _flush_clock(h)
     try:
         ok = _settled(h, lambda: all(
@@ -608,7 +620,7 @@ def t_clock(h):
                           for v in h.rig.fleet()["nodes"]]))
         # A 0.6 s offset is the bad tier.
         rigcore.http_json = _drifted_http_json({"127.0.0.2": 0.6,
-                                                "127.0.0.3": 0.6})
+                                                "127.0.0.3": 0.6}, base)
         _flush_clock(h)
         _settled(h, lambda: all((m.clock_offset_s() or 0) > 0.5
                                 for m in h.rig.monitors))
@@ -617,11 +629,11 @@ def t_clock(h):
               hco and hco[0]["sev"] == "bad",
               json.dumps([x["sev"] for x in hco]))
     finally:
-        rigcore.http_json = _drifted_http_json({})
+        rigcore.http_json = base
 
     # -- node-to-node skew has to PERSIST ---------------------------------
     _clear_streak(an)
-    rigcore.http_json = _drifted_http_json({"127.0.0.3": 0.05})
+    rigcore.http_json = _drifted_http_json({"127.0.0.3": 0.05}, base)
     _flush_clock(h)
     try:
         ok = _settled(h, lambda: 0.03 < abs(
@@ -647,13 +659,13 @@ def t_clock(h):
         # Back in agreement: the streak resets, so the next disagreement has
         # to earn its alarm again. Scan while waiting - the streak only clears
         # on a scan that finds the clocks inside budget.
-        rigcore.http_json = _drifted_http_json({})
+        rigcore.http_json = base
         _flush_clock(h)
         check("the skew streak resets when the clocks agree again",
               wait_for(lambda: (an.scan(), not _streak(an))[1], 12.0),
               json.dumps({str(k): v for k, v in _streak(an).items()}))
     finally:
-        rigcore.http_json = _drifted_http_json({})
+        rigcore.http_json = base
 
     # -- a link too slow to measure is REPORTED, not dropped ---------------
     _clear_streak(an)
@@ -675,6 +687,141 @@ def t_clock(h):
                   unm[0]["suggested_action"][:100])
     finally:
         h.node("cam2").set_fault(surface="pia", hang_s=0.0)
+
+
+def t_clock_step(h):
+    sect("D3b rigd: node_clock_wrong, and the one-click clock step")
+    h.wait_connected("cam1")
+    h.wait_connected("cam2")
+    an = h.rig.anomalies
+    _clear_streak(an)
+    n1 = h.node("cam1")
+    # cam1 comes back from a power cycle with its clock 5 s behind true time
+    # (47 days on the live rig, 2026-10-15; the arithmetic is the same and the
+    # fake's /health time.epoch is where rigd measures it).
+    n1.pi_clock_offset_s = -5.0
+    _flush_clock(h)
+    try:
+        ok = _settled(h, lambda: (h.mon("cam1").clock_offset_s() or 0) < -4.5
+                      and abs(h.mon("cam2").clock_offset_s() or 1.0) < 0.2)
+        check("cam1 now reads ~5 s behind the host while cam2 is on time", ok,
+              str([m.clock_offset_s() for m in h.rig.monitors]))
+        a = an.scan()
+        a = an.scan()
+        a = an.scan()          # skew needs three scans; it must still not fire
+        ncw = _kinds(a, "node_clock_wrong")
+        check("node_clock_wrong fires, for the one node that is seconds off",
+              len(ncw) == 1 and ncw[0]["node"] == "cam1",
+              json.dumps([(x["kind"], x["node"]) for x in a]))
+        if ncw:
+            x = ncw[0]
+            check("it is bad, says 'behind', and carries the measured offset",
+                  x["sev"] == "bad" and "behind" in x["msg"]
+                  and -5.5 < x["evidence"].get("offset_s", 0) < -4.5,
+                  json.dumps({"msg": x["msg"], "sev": x["sev"],
+                              "evidence": x["evidence"]})[:200])
+            act = x["evidence"].get("action") or {}
+            check("its evidence names the step action the UI turns into a "
+                  "button", act.get("method") == "POST"
+                  and act.get("path") == "/api/node/clock/step"
+                  and (act.get("body") or {}).get("node") == "cam1",
+                  json.dumps(act))
+            sa = x["suggested_action"]
+            check("the suggested action points at the button and the endpoint",
+                  "set cam1 clock from host" in sa
+                  and "/api/node/clock/step" in sa, sa[:160])
+            check("it says the fires are being refused and names the Compass",
+                  "refused" in sa and "GNSS Compass" in sa, sa[:200])
+        check("a node seconds off does NOT brand the HOST as off",
+              not _kinds(a, "host_clock_offset"),
+              json.dumps([x["msg"] for x in _kinds(a, "host_clock_offset")]))
+        check("...and is not read as skew against its partner",
+              not _kinds(a, "node_clock_skew"),
+              json.dumps([x["msg"] for x in _kinds(a, "node_clock_skew")]))
+
+        # -- the request side ----------------------------------------------
+        code, doc = h.post("/api/node/clock/step", {})
+        check("POST /api/node/clock/step without a node is a 400",
+              is400(code, doc), "%s %s" % (code, json.dumps(doc)[:120]))
+        code, doc = h.post("/api/node/clock/step", {"node": "nope"})
+        check("an unknown node is a 400 that lists the known ones",
+              is400(code, doc) and "cam1" in json.dumps(doc),
+              "%s %s" % (code, json.dumps(doc)[:160]))
+        saved_status = h.rig.runmgr.status
+        h.rig.runmgr.status = lambda: {"active": True, "run_id": "r-clock"}
+        try:
+            code, doc = h.post("/api/node/clock/step", {"node": "cam1"})
+            check("refused while a run is active (a step moves every fire "
+                  "instant scheduled on the node)",
+                  is400(code, doc) and "run is active" in doc.get("error", ""),
+                  "%s %s" % (code, json.dumps(doc)[:160]))
+        finally:
+            h.rig.runmgr.status = saved_status
+        check("none of the refused requests reached the node",
+              not n1.clock_steps, repr(n1.clock_steps))
+
+        # -- the step ------------------------------------------------------
+        seq = h.rig.events._seq
+        before_n = h.mon("cam1").clock_offset_info()["n"]
+        code, doc = h.post("/api/node/clock/step", {"node": "cam1"})
+        check("the step succeeds: 200, ok, stepped, node named",
+              code == 200 and doc.get("ok") is True
+              and doc.get("stepped") is True and doc.get("node") == "cam1",
+              "%s %s" % (code, json.dumps(doc)[:200]))
+        check("rigd relays the offset the node measured (+5: it was behind)",
+              4.5 < (doc.get("offset_s") or 0) < 5.5, json.dumps(doc)[:160])
+        check("the node received exactly one /clock/step carrying the host's "
+              "epoch", len(n1.clock_steps) == 1
+              and abs(float(n1.clock_steps[0][1] or 0) - time.time()) < 5.0,
+              repr(n1.clock_steps)[:200])
+        check("the node's clock is the host's afterwards",
+              n1.pi_clock_offset_s == 0.0, repr(n1.pi_clock_offset_s))
+        check("the stale clock window was dropped on success (so the alarm "
+              "clears on the next poll, not a minute later)",
+              before_n >= 3 and h.mon("cam1").clock_offset_info()["n"] <= 1,
+              "before %s after %s" % (before_n,
+                                      h.mon("cam1").clock_offset_info()["n"]))
+        evs = [e for e in h.rig.events.since(seq)["events"]
+               if e.get("kind") == "clock_step"]
+        check("the step is journalled: the request and the result",
+              len(evs) >= 2 and any("stepped by +5" in (e.get("msg") or "")
+                                    for e in evs),
+              json.dumps([e.get("msg") for e in evs])[:240])
+        ok = _settled(h, lambda: abs(h.mon("cam1").clock_offset_s() or 1.0) < 0.2)
+        check("cam1 reads on time again once fresh samples land", ok,
+              str(h.mon("cam1").clock_offset_info()))
+        a = an.scan()
+        check("node_clock_wrong clears", not _kinds(a, "node_clock_wrong"),
+              json.dumps([x["kind"] for x in a]))
+
+        # -- the node refuses: already on time ---------------------------
+        n1.clock_steps.clear()
+        n_before = h.mon("cam1").clock_offset_info()["n"]
+        code, doc = h.post("/api/node/clock/step", {"node": "cam1"})
+        check("a node already on time refuses: ok:false, stepped:false, "
+              "chrony named as the owner of the residual",
+              code == 200 and doc.get("ok") is False
+              and doc.get("stepped") is False
+              and "chrony" in (doc.get("error") or ""),
+              "%s %s" % (code, json.dumps(doc)[:200]))
+        check("a refused step keeps the clock window (nothing changed)",
+              h.mon("cam1").clock_offset_info()["n"] >= min(n_before, 3),
+              "before %s after %s" % (n_before,
+                                      h.mon("cam1").clock_offset_info()["n"]))
+        # -- the node's piagent does not answer -------------------------
+        n1.set_fault(surface="pia", http500=True)
+        try:
+            code, doc = h.post("/api/node/clock/step", {"node": "cam1"})
+            check("a piagent that errors: ok:false, stepped:false, an error",
+                  code == 200 and doc.get("ok") is False
+                  and doc.get("stepped") is False and doc.get("error"),
+                  "%s %s" % (code, json.dumps(doc)[:200]))
+        finally:
+            n1.set_fault(surface="pia", http500=False)
+    finally:
+        n1.pi_clock_offset_s = 0.0
+        _flush_clock(h)
+        _clear_streak(an)
 
 
 # ===========================================================================
@@ -2345,7 +2492,8 @@ def suite(opts=None):
                          ("zip", t_zip), ("overflow", t_overflow),
                          ("framing", t_framing),
                          ("bodies", t_bodies), ("inputs", t_inputs),
-                         ("clock", t_clock), ("drain", t_drain),
+                         ("clock", t_clock), ("clockstep", t_clock_step),
+                         ("drain", t_drain),
                          ("ingest", t_ingest_report),
                          ("nonfinite", t_nonfinite), ("busy", t_busy),
                          ("static", t_static), ("latch", t_latch),

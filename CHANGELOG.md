@@ -7,6 +7,26 @@ dates.
 ## [Unreleased]
 
 ### Added
+- Node time under either host: the GNSS Compass at 192.168.1.60 is the rig's
+  NTP server (stratum 1, GPS). Every node holds it as its preferred chrony
+  source (`/etc/chrony/conf.d/20-wildsync-gnss.conf`, written by the card step
+  and by the new `deploy.sh clock camN`, which `deploy.sh node` runs first),
+  with the peer mesh behind it and `chrony.conf` set to `makestep 1 -1` so a
+  Pi that boots days off (no RTC battery) steps the moment a reference
+  answers. `deploy.sh mac` (new) points the Mac's clock at the Compass and
+  installs the launchd agent; `deploy.sh jetson` adds the Compass to the
+  Jetson's chrony; `deploy.sh all` picks the host flavour by `uname`
+  (`docs/INSTALL.md` §5).
+- `node_clock_wrong` anomaly (per node, bad, >2 s from the host) with a
+  **set camN clock from host** button, `POST /api/node/clock/step {node}` →
+  piagent `POST /clock/step {host_epoch}` (`sudo date -s` on the node, the
+  2026-10-15 hand fix as an API; refused under 1 s, during a run, during an
+  interval capture). A node in that state no longer brands the host as days
+  off (`host_clock_offset`) or its partner as weeks skewed (`node_clock_skew`).
+  `NodeMonitor.reset_clock()`.
+- `rig/tests`: `audit_rigd` D3b (detector, exclusion, the step end to end
+  against a fake with a wrong clock, every refusal), `audit_piagent` P18
+  (`/clock/step` with `date` stubbed), `audit_ui` U19 (the button).
 - `rig/nav_subsonus.py`: the Advanced Navigation GNSS Compass (or Subsonus) as the navigation source over Ethernet
   (ANPP over TCP, System State packet), selected with `WILDSYNC_NAV` or
   `~/rig/nav.json` `{"source": "anpp://<host>"}`; the iKonvert path is
@@ -18,6 +38,15 @@ dates.
   `audit-subsonus`.
 
 ### Changed
+- `host_clock_offset`, `node_clock_skew` and the per-run `host_clock` warning
+  name the GNSS Compass and `deploy.sh mac` / `jetson` as the fix instead of
+  "enable network time" (time.apple.com is not reachable from the rig segment).
+- `deploy.sh clock` / `node` remove the two-node `10-jetson.conf` star and the
+  old `wildsync.conf` from a node (the card step already did), and write the
+  peer mesh on a node whose card never ran `deploy/pi-resync` (cam1's had not).
+- `rig/tests/audit_rigd.py` D3: the on-the-wire clock drift wrappers stacked
+  on each other, so +0.8 s of leftover drift rode into every later section;
+  each phase now wraps and restores the pristine `http_json`.
 - `nav.NavReader._handle_line` records a message through a shared `_ingest`
   and accepts `!ANPP,<id>,<hex>` lines (replay of a GNSS Compass / Subsonus run).
 - `rigd` reads the nav source from `WILDSYNC_NAV` / `~/rig/nav.json`; the

@@ -16,7 +16,7 @@ text says so.
 | cam1 | Pi 5, 192.168.1.201, **on its own 802.3at Mode-A PoE injector** (NOT the switch) |
 | cam2 | Pi 4, 192.168.1.202, on the Ubiquiti 2.5G PoE switch |
 | IMUs | one Olive olixVision per camera, on that camera's Pi (USB-C, `olive0`); each camera's flight log carries its own IMU's attitude |
-| clocks | **Jetson host:** the Jetson is the chrony master; the Pis follow it and peer each other as a fallback. **Mac host:** not a master; the Pis peer each other (~0.6 ms apart with no upstream) and rigd corrects for the host's offset |
+| clocks | **Both hosts:** the GNSS Compass at 192.168.1.60 is the rig's NTP server (stratum 1, GPS time); every Pi holds it with `prefer` and peers the other Pis as the fallback (~0.6 ms apart with no upstream). A Pi that boots days off (no RTC battery) steps to the Compass by itself. **Mac host:** not a chrony master; `deploy.sh mac` puts the Mac on the Compass too, and rigd corrects for whatever host offset remains. **Jetson host:** also a chrony server for the Pis, itself on the Compass. Compass off and a Pi still wrong: the `node_clock_wrong` anomaly's **set camN clock from host** button steps it from the host (`docs/INSTALL.md` §5) |
 | nav | Advanced Navigation **GNSS Compass** on the rig switch at **192.168.1.60/24** (static; gateway and DNS 192.168.1.1), read over Ethernet: `~/rig/nav.json` `{"source": "anpp://192.168.1.60"}` (`docs/INSTALL.md` §7.1; confirmed on the rig 2026-10-15, not yet used in a field run). Alternative: the unit on the NMEA 2000 backbone → iKonvert → the host's USB (`/dev/serial/by-id/usb-FTDI_…` on a Jetson, `/dev/cu.usbserial-…` on a Mac); **iKonvert DIP switches all ON for RAW mode** or nav stays silent |
 
 **Why cam1 is on an injector:** two nodes firing in sync drew more than the
@@ -85,20 +85,31 @@ the port power-cycle events.
    under 5 GB. The Diag tab's cameras/cards table converts each body's
    remaining shots into GB: cam1's card is ~64 GB class and cam2's ~512 GB, so
    swap cam1 to a matching V60 512 GB for long lines.
-7. **Host clock.** On a Jetson host, `chronyc tracking` should show it
-   synchronised and `chronyc clients` should list both Pis; on a Mac host,
-   network time must be on (System Settings → General → Date & Time). The
-   host's clock is the reference every shot **and the strobe** are scheduled
-   against. An undisciplined Mac host measured 187 ms behind NTP and drifting
-   ~60 ppm; the rig corrects the fire schedule and every frame timestamp for a
-   host offset and says so once per run ("host clock is X ms off the nodes"),
-   but the correction carries its own RTT/2 uncertainty into `time_err_ms`. A
-   host >100 ms out raises `host_clock_offset`; the header shows an amber
-   `clk ±N ms vs host` chip on any camera more than 50 ms from the host. That
-   chip reads the **RTT-filtered median**, not the last raw `/health` sample;
-   the raw sample is in the chip's tooltip, so the two differing by tens of ms
-   on a busy link is expected. A link too slow to measure a clock over (best
-   RTT ≥20 ms) reads `clk unmeasurable — link N ms` instead.
+7. **Clocks.** On each Pi, `chronyc -n sources` must mark `192.168.1.60`
+   (the GNSS Compass, the rig's NTP server) with `*`, and `chronyc tracking`
+   must read Stratum 2 with Reference ID `C0A8013C`; with the Compass off the
+   Pis must at least show the **same** refid (one elected orphan master). A
+   Pi that was power-cycled with the Compass off boots days behind (no RTC
+   battery) and every scheduled fire on it is refused: rigd raises
+   `node_clock_wrong` on it (bad) and the anomaly carries a **set camN clock
+   from host** button — click it (not during a run), then confirm `chronyc
+   sources` on the node. On a Jetson host, `chronyc tracking` should show it
+   synchronised to the Compass and `chronyc clients` should list both Pis; on
+   a Mac host, `sntp 192.168.1.60` should print a correction of tens of
+   milliseconds or less (`deploy.sh mac` points the Mac at the Compass; System
+   Settings → General → Date & Time shows the server). The host's clock is the
+   reference every shot **and the strobe** are scheduled against. An
+   undisciplined Mac host measured 187 ms behind NTP and drifting ~60 ppm, and
+   100 ms behind GPS on 2026-10-15; the rig corrects the fire schedule and
+   every frame timestamp for a host offset and says so once per run ("host
+   clock is X ms off the nodes"), but the correction carries its own RTT/2
+   uncertainty into `time_err_ms`. A host >100 ms out raises
+   `host_clock_offset`; the header shows an amber `clk ±N ms vs host` chip on
+   any camera more than 50 ms from the host. That chip reads the
+   **RTT-filtered median**, not the last raw `/health` sample; the raw sample
+   is in the chip's tooltip, so the two differing by tens of ms on a busy link
+   is expected. A link too slow to measure a clock over (best RTT ≥20 ms)
+   reads `clk unmeasurable — link N ms` instead.
 8. **Strobe (XR256).** Before its housing is sealed: dial on the working step
    (start at 250 µs; **never Auto**, which free-runs), and write it down — the
    dial is unreachable once sealed. 24 V rail regulated and inside 22.8–25.2 V,
@@ -254,7 +265,8 @@ convenient or when a card is filling.
 | `camera_clock_wrong` | the body clock is days off (expected; ingest corrects the archive). |
 | `nav_gateway_down` | no live NMEA. If a static fix is armed it is a note, not a fault. |
 | `nav_no_fix` | **recording with no position.** The static fix is armed at run *start* only, so a bus that drops mid-line leaves those rows' lat/long EMPTY — they cannot be placed afterwards. Fix the bus and restart the line. |
-| `host_clock_offset` | the host's clock is off the nodes (checklist §7). Check `chronyc tracking` on a Jetson host; turn network time on for a Mac host. |
+| `host_clock_offset` | the host's clock is off the nodes, which hold the GNSS Compass's GPS time (checklist §7). Put the host on the Compass too: `deploy.sh mac` on a Mac, `deploy.sh jetson` on a Jetson; then `sntp 192.168.1.60` / `chronyc tracking`. |
+| `node_clock_wrong` | that node's clock is more than 2 s from the host's — a power-cycled Pi that booted with the Compass unreachable — and every scheduled fire on it is being refused. Click **set camN clock from host** on the anomaly (refused during a run: stop, step, restart), then check `chronyc sources` on the node. If every node shows the same offset and their `chronyc tracking` says GPS, the host is the wrong one. |
 | `imu_stall` | no IMU sample near a capture instant; that camera's attitude columns are left empty. Check its Olive (checklist §5). |
 | `node_clock_unmeasurable` | that node's link is too slow (RTT ≥20 ms) to verify the 10 ms stereo budget. Check the PoE/switch path. |
 

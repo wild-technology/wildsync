@@ -2749,14 +2749,49 @@ function renderAnomPill(){
 }
 $('#hAnom').onclick=()=>{ showTab('review');
   const c=$('#anoms'); if(c) c.scrollIntoView({block:'center'}); };
+// A detector whose evidence carries an `action` {method,path,body} gets a
+// button that performs it. Today that is node_clock_wrong -> POST
+// /api/node/clock/step {node}: the `sudo date -s` typed on cam1 on
+// 2026-10-15 (47 days behind after a power cycle, every scheduled fire
+// refused) as one click. Only the one path the UI knows is wired; an unknown
+// action renders no button rather than POSTing somewhere the operator did
+// not read. The last verdict is kept per node so a refusal survives the next
+// re-render (the list is rebuilt on every anomaly poll).
+const CLOCKSTEP_LAST={};
+function anomActionHtml(a){
+  const act=a&&a.evidence&&a.evidence.action;
+  if(!act||act.path!=='/api/node/clock/step'||!a.node) return '';
+  const last=CLOCKSTEP_LAST[a.node], fresh=last&&(Date.now()-last.at)<60000;
+  return `<div class="small" style="margin-top:6px"><button class="act" data-clockstep="${
+    escapeHtml(a.node)}">set ${escapeHtml(a.node)} clock from host</button>`+
+    (fresh?` <span style="color:var(--${last.ok?'ok':'bad'})">${escapeHtml(last.msg)}</span>`:'')+
+    `</div>`;
+}
+function wireAnomActions(root){
+  if(!root||!root.querySelectorAll) return;
+  root.querySelectorAll('button[data-clockstep]').forEach(b=>{
+    b.onclick=()=>clockStepNode(b.dataset.clockstep, b); });
+}
+async function clockStepNode(node, btn){
+  if(btn) btn.disabled=true;
+  // piagent may wait out a fire's busy-wait (<=6 s) before it steps.
+  const r=await api('/api/node/clock/step',{node},15000);
+  const ok=!!(r&&r.ok&&r.stepped);
+  CLOCKSTEP_LAST[node]={at:Date.now(), ok,
+    msg: ok ? `${node} stepped by ${(r.offset_s>=0?'+':'')+Number(r.offset_s||0).toFixed(3)} s — chrony slews the rest; check chronyc sources on it`
+            : 'not stepped: '+((r&&r.error)||'no answer')};
+  if(btn) btn.disabled=false;
+  pollAnoms();
+}
 function renderAnoms(){
   const el=$('#anoms'); if(!el) return;
   el.innerHTML = ANOMS.length ? ANOMS.map(x=>
     `<div class="anom ${anomSev(x)==='bad'?'bad':''}"><b>${escapeHtml(x.kind||'?')}</b> `+
     `${x.node?('· '+escapeHtml(x.node)):''}${x.msg?(' — '+escapeHtml(x.msg)):''}`+
     `${x.suggested_action?('<br><span class="muted small">→ '+
-      escapeHtml(x.suggested_action)+'</span>'):''}</div>`).join('')
+      escapeHtml(x.suggested_action)+'</span>'):''}${anomActionHtml(x)}</div>`).join('')
     : '<span class="muted small">none</span>';
+  wireAnomActions(el);
 }
 
 // ---- transects --------------------------------------------------------------
@@ -3058,8 +3093,9 @@ async function pollAlerts(){
   const [an,ev]=await Promise.all([api('/api/anomalies'),api('/api/events?since=0&sev=warn')]);
   const act=(an&&an.anomalies)||[];
   $('#alActive').innerHTML = act.length? act.map(a=>
-      `<div class="alertline${a.sev==='bad'?'':' warnline'}"><span class="t">${escapeHtml(a.node||'rig')}</span>${escapeHtml(a.msg)}${a.hint?`<div class="small" style="font-weight:400;margin-top:4px;color:var(--muted)">${escapeHtml(a.hint)}</div>`:''}</div>`
+      `<div class="alertline${a.sev==='bad'?'':' warnline'}"><span class="t">${escapeHtml(a.node||'rig')}</span>${escapeHtml(a.msg)}${a.hint?`<div class="small" style="font-weight:400;margin-top:4px;color:var(--muted)">${escapeHtml(a.hint)}</div>`:''}${anomActionHtml(a)}</div>`
     ).join('') : '<span class="muted small">none — all clear</span>';
+  wireAnomActions($('#alActive'));
   const evs=((ev&&ev.events)||[]).slice(-80).reverse();
   $('#alHist').innerHTML = evs.length? evs.map(e=>{
       const d=new Date(e.ts*1000).toISOString().replace('T',' ').slice(5,19);

@@ -26,9 +26,11 @@ a recorded field run.
 | **Jetson Orin NX host** (JetPack 6, systemd, `deploy.sh jetson`) | Supported by the current software. A Jetson was the host for the earlier bench work and the 2026-08-16 measurements in the README; the Mac replaced it on 2026-08-23 and the Jetson install was added back on 2026-09-21. No recorded field run used a Jetson host |
 | **Per-camera Olive IMUs** (`olive-bridge`, `deploy.sh node` default) | Supported. First run on the rig on 2026-08-27, after the field transects; no recorded field run |
 | **XR256 strobe** (`piagent` in its strobe role, `deploy.sh strobe`) | Software added on 2026-09-21 and covered by the offline tests. **No strobe has been connected or fired in any field run, and the XR256 has not yet been fired with the camera array** |
+| **GNSS Compass as the rig's NTP server** (section 5: `deploy.sh clock`, `deploy.sh mac`, `node_clock_wrong` + the clock step) | Added 2026-10-15, after cam1 came back from a power cycle 47 days behind. Exercised on the rig that day with the Mac host: `deploy.sh clock cam1` put cam1 on the Compass (stratum 2, refid `C0A8013C`); a `date -s` a day back was stepped back by chrony within ~42 s; with chrony paused, `POST /clock/step` from the host stepped the same fault in one request and a second request was refused as under threshold. **Not yet exercised:** `deploy.sh mac` on the host (it needs an administrator password; until it runs the Mac sits ~100 ms behind GPS and rigd shows exactly that as the host offset), the step button from the rig UI against a live node (the nodes' `piagent` gains `/clock/step` at their next `deploy.sh node`), and cam2, which was off the wire. No field run yet |
 
-The two chrony topologies (below) follow the same split: the Mac-host topology
-was the one in use on 2026-08-20.
+The chrony topology (section 5) follows the same split: the mesh-only Mac-host
+topology was the one in use on 2026-08-20; the Compass reference has not yet
+been under a recorded field run.
 
 ## 1. Hardware and how it is connected
 
@@ -148,10 +150,13 @@ remove it with `launchctl bootout gui/$(id -u)/org.wildtechnology.wildsync.rigd`
 it restarts if `rigd` dies, and its log is `~/rig/rigd-launchd.log`. The UI is at
 `http://localhost:9090`.
 
-Keep the Mac's own clock on network time (System Settings → General → Date &
-Time): rigd corrects for a host offset but the correction carries its own
-uncertainty (section 5). Stage the Linux SDK (section 2) so the Mac can
-provision the nodes.
+`deploy/deploy.sh mac` does the `sed` and `launchctl` steps above for you
+(once the venv exists) and also points the Mac's own clock at the rig's GNSS
+Compass, the rig's NTP server (section 5; it asks for an administrator
+password). rigd corrects for a host offset, but the correction carries its own
+uncertainty, and `time.apple.com` is not reachable from the rig segment, so a
+Mac left on Apple's server free-runs on the boat. Stage the Linux SDK (section
+2) so the Mac can provision the nodes.
 
 ### 3b. Jetson host (systemd)
 
@@ -247,38 +252,78 @@ anomalies and the UI header (`2/2 cameras`) are described in the field manual.
 
 The stereo budget is 10 ms between the two exposures, and every scheduled fire
 and every hardware exposure timestamp lives on the **node's** clock, so clock
-disagreement between the nodes lands one for one in the exposure skew. The
-topology depends on the host (`docs/PI-SETUP.md`, "Chrony, after provisioning"):
+disagreement between the nodes lands one for one in the exposure skew. A Pi has
+no RTC battery, so a node that is power-cycled boots where its filesystem left
+it (cam1 came back 47 days behind on 2026-10-15), and until something steps it
+every scheduled fire is refused: `piagent` accepts an `at_epoch` only within
+−2/+5.5 s of its own clock. The rig segment has no internet, so the reference
+has to live on the switch:
 
-- **Every node:** a full peer mesh across `192.168.1.201/.202/.203` plus an orphan
-  local reference, written by the card's cloud-init step
-  (`deploy/pi-resync/user-data.template`). With no upstream the nodes stay about
-  a millisecond apart (0.6 ms measured with two nodes). Free-running they
-  measured 16.8 ms apart.
-- **Jetson host:** `deploy.sh jetson` makes the Jetson a chrony server, and
-  `deploy.sh node`, run from that Jetson, adds
-  `/etc/chrony/conf.d/20-wildsync-host.conf` pointing each node at it with
-  `prefer`. The mesh stays as the fallback. One reference also keeps the strobe,
-  which fires on the host's clock, honest.
-- **Mac host:** not a chrony master. The nodes keep only the mesh, and rigd
-  measures the host's offset from the nodes and corrects every fire target and
-  every capture instant for it (`host_clock_offset`; `docs/PROTOCOL.md`,
-  "CLOCK DOMAINS"). An undisciplined Mac measured 187 ms off, so turn network
-  time on.
+- **The GNSS Compass is the rig's time server, under either host.** The
+  Advanced Navigation GNSS Compass at `192.168.1.60` (§7.1) is a stratum-1 NTP
+  server on GPS time (reference ID `GPS`; 0.5 ms round trip from a node). Every
+  node holds it as its preferred chrony source,
+  `/etc/chrony/conf.d/20-wildsync-gnss.conf`, written by the card step
+  (`deploy/pi-resync/user-data.template`) and by `deploy.sh clock camN` (which
+  `deploy.sh node camN` runs first) — same file, same content. The same step
+  sets `chrony.conf` to `makestep 1 -1`: a clock more than a second out is
+  stepped whenever a reference answers, however long the node has been up.
+  Ubuntu's `makestep 1 3` stops stepping after three updates, which chrony
+  parses *after* the drop-ins, so a node that had peered a wrong neighbour
+  before the Compass appeared could never follow it. A step over a second is
+  never inside the stereo budget; it is a clock that was wrong.
+- **Every node, as the fallback:** a full peer mesh across
+  `192.168.1.201/.202/.203` plus an orphan local reference (`10-wildsync.conf`,
+  written by the card step; `deploy.sh clock` writes it too on a node whose
+  card never ran that step, as cam1's had not). With the Compass off the nodes
+  stay about a millisecond apart (0.6 ms measured with two nodes); free-running
+  they measured 16.8 ms apart. A rig with no Compass deploys with
+  `WILDSYNC_NTP=` (empty) and keeps only the mesh.
+- **Mac host:** `deploy.sh mac` points macOS's own time service at the Compass
+  (`systemsetup -setnetworktimeserver 192.168.1.60`, which asks for an
+  administrator password; System Settings → General → Date & Time shows it)
+  and installs the launchd agent (§3a). The Mac is not a chrony master and
+  need not be: the nodes already hold GPS time. What this buys is a host on
+  the same second as the nodes, so the host offset that rigd measures and
+  corrects every fire target and every capture instant for
+  (`host_clock_offset`; `docs/PROTOCOL.md`, "CLOCK DOMAINS") is tens of
+  milliseconds with a small uncertainty, instead of the 100–190 ms an
+  undisciplined Mac measured (187 ms on 2026-08-23; 100 ms behind GPS on
+  2026-10-15, with `time.apple.com` out of reach from the rig segment anyway).
+- **Jetson host:** `deploy.sh jetson` makes the Jetson a chrony server for the
+  LAN *and* a client of the Compass, and `deploy.sh node`, run from that
+  Jetson, adds `20-wildsync-host.conf` pointing each node at it as a second
+  server. The strobe fires on the host's clock, so one reference keeps it
+  honest.
+- **When a node is still wrong** (the Compass was off while it booted, and is
+  still off): rigd raises `node_clock_wrong` on that node, bad, once its clock
+  is more than 2 s from the host's, and the anomaly carries a **set camN clock
+  from host** button (`POST /api/node/clock/step {"node": "camN"}`). The node
+  steps its clock to the host's (`sudo date -s` on the node — the hand fix of
+  2026-10-15) and chrony slews the residual once a source answers. rigd refuses
+  it while a run is active; a node under 1 s off refuses it itself, since that
+  residual is chrony's. If *every* node shows the same offset and their
+  `chronyc tracking` says GPS, it is the host that is wrong: run `deploy.sh
+  mac` / `deploy.sh jetson` instead.
 
 Check on a node (`docs/PI-SETUP.md` §9):
 
 ```sh
 for ip in 192.168.1.201 192.168.1.202 192.168.1.203; do
-  echo "== $ip"; ssh ubuntu@$ip 'chronyc tracking | head -3; chronyc sources'
+  echo "== $ip"; ssh ubuntu@$ip 'chronyc tracking | head -3; chronyc -n sources'
 done
 ```
 
-All nodes must print the **same Reference ID**, the proof that the group has
-exactly one master; two different refids mean a split. On a Jetson host,
-`chronyc tracking` should show it synchronised and `chronyc clients` should list
-the nodes. While running, rigd's `node_clock_skew` and `host_clock_offset` alerts
-are the detectors.
+With the Compass up every node prints Reference ID `C0A8013C (192.168.1.60)`,
+Stratum 2, and `sources` marks `192.168.1.60` with `*`. With it off, all nodes
+must still print the **same** Reference ID — the elected orphan's address — the
+proof that the group has exactly one master; two different refids mean a split.
+On a Mac, `sntp 192.168.1.60` prints the correction the Mac's clock still needs
+(tens of milliseconds or less once `deploy.sh mac` has run and macOS has
+slewed); on a Jetson host, `chronyc tracking` should show it synchronised and
+`chronyc clients` should list the nodes. While running, rigd's
+`node_clock_wrong`, `node_clock_skew` and `host_clock_offset` alerts are the
+detectors.
 
 Time in the data: when the NMEA 2000 bus is live, GPS time (PGN 126992/129029)
 disciplines the log and `time_source` reads `gps`; otherwise it reads `host`, the
@@ -379,7 +424,8 @@ in `/api/nav`).
    expects (it then records no position rather than a wrong one). The GNSS
    Compass's 100-byte layout was confirmed on the rig; the Subsonus's 116-byte
    layout was taken from the published ANPP reference, whose field table is
-   inconsistent, and has not been confirmed on a unit. In the UI the header
+   inconsistent, and has not been confirmed on a unit. The same unit is the
+   rig's NTP server (stratum 1 on GPS time; section 5). In the UI the header
    reads `nav fix` and `/api/diag`'s `nav` block shows `transport: anpp-tcp`
    with `packets` climbing and `layout: common-100` on a GNSS Compass
    (`subsonus-116` on a Subsonus).

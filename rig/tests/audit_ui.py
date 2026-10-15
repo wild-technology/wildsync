@@ -503,6 +503,51 @@ try{
   THAS('U11 anomaly text is escaped, not dropped', ah3, '&lt;script&gt;');
 }catch(e){ T('U11 anomalies', false, 'threw ' + e); }
 
+// ---- U19 node_clock_wrong carries its one-click step ------------------------
+// cam1 came back from a power cycle 47 days behind (2026-10-15) and every
+// scheduled fire was refused until someone typed `sudo date -s` on the node.
+// rigd now raises node_clock_wrong with an `action` in its evidence, and the
+// anomaly list turns that into a button - only for the one path the UI knows.
+try{
+  ANOMS = [{kind:'node_clock_wrong', node:'cam1', sev:'bad',
+            msg:'cam1 clock is 47.0 days behind the host',
+            suggested_action:"click 'set cam1 clock from host'",
+            evidence:{offset_s:-4060800, n:8, action:{method:'POST',
+              path:'/api/node/clock/step', body:{node:'cam1'}}}}];
+  renderAnoms();
+  var ah4 = document.querySelector('#anoms').innerHTML;
+  THAS('U19 node_clock_wrong renders its step button', ah4, 'data-clockstep="cam1"');
+  THAS('U19 the button says what it does and to which node', ah4, 'set cam1 clock from host');
+  THAS('U19 the anomaly itself still renders', ah4, '47.0 days behind');
+  ANOMS = [{kind:'node_clock_wrong', node:'cam1', msg:'x',
+            evidence:{action:{method:'POST', path:'/api/node/format', body:{node:'cam1'}}}}];
+  renderAnoms();
+  TNOT('U19 an action path the UI does not know gets no button',
+       document.querySelector('#anoms').innerHTML, 'data-clockstep');
+  ANOMS = [{kind:'node_clock_wrong', msg:'no node named',
+            evidence:{action:{method:'POST', path:'/api/node/clock/step'}}}];
+  renderAnoms();
+  TNOT('U19 an action with no node to send gets no button',
+       document.querySelector('#anoms').innerHTML, 'data-clockstep');
+  ANOMS = [{kind:'host_clock_offset', sev:'warn', msg:'host is 187 ms behind'}];
+  renderAnoms();
+  TNOT('U19 an anomaly without an action gets no button',
+       document.querySelector('#anoms').innerHTML, 'data-clockstep');
+  ANOMS = [{kind:'node_clock_wrong', node:'<img src=x>', msg:'x',
+            evidence:{action:{method:'POST', path:'/api/node/clock/step'}}}];
+  renderAnoms();
+  TNOT('U19 the node name is escaped inside the button markup',
+       document.querySelector('#anoms').innerHTML, '<img src=x>');
+  // The last verdict survives a re-render, so a refusal is not wiped by the
+  // next anomaly poll before the operator has read it.
+  CLOCKSTEP_LAST['cam1'] = {at:Date.now(), ok:false, msg:'not stepped: a run is active'};
+  ANOMS = [{kind:'node_clock_wrong', node:'cam1', msg:'x',
+            evidence:{action:{method:'POST', path:'/api/node/clock/step', body:{node:'cam1'}}}}];
+  renderAnoms();
+  THAS('U19 the last step verdict is shown beside the button', document.querySelector('#anoms').innerHTML, 'a run is active');
+  delete CLOCKSTEP_LAST['cam1'];
+}catch(e){ T('U19 clock step button', false, 'threw ' + e); }
+
 // ---- U10 per-camera format readback panel --------------------------------
 try{
   FLEET = {nodes:[node({name:'cam1'}), node({name:'cam2'})], run:{}};

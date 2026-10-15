@@ -1922,8 +1922,9 @@ class RunManager:
         self.events.emit(
             "warn", "host_clock",
             "host clock is %.0f ms off the nodes - the fire schedule is being "
-            "corrected for it, but enable network time on this host (the Pis "
-            "are chrony-locked to each other and nothing disciplines the Mac). "
+            "corrected for it, but put this host on the rig's network time "
+            "(the nodes hold the GNSS Compass's GPS time; deploy.sh mac points "
+            "a Mac at it, deploy.sh jetson a Jetson). "
             "Frame timestamps are converted to the host domain; nav and the "
             "GPS offset stay comparable" % (offset * 1000.0),
             offset_ms=round(offset * 1000.0, 1))

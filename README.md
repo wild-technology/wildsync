@@ -236,11 +236,12 @@ the navigation gateway, the strobe, and verification. The commands in short:
 ```sh
 git clone https://github.com/wild-technology/wildsync.git ~/wildsync && cd ~/wildsync
 make sdk-linux CRSDK_DIR=/path/to/RemoteCli   # Sony SDK for the nodes (Linux64ARMv8 package)
-deploy/deploy.sh jetson                       # Jetson host only: deps, chrony master, rigd service
-                                              # (Mac host: launchd agent, INSTALL.md section 3)
+deploy/deploy.sh mac                          # Mac host: clock on the GNSS Compass, rigd launchd agent
+deploy/deploy.sh jetson                       # Jetson host: deps, chrony server (on the Compass), rigd service
 deploy/deploy.sh trust     cam1               # per node: push this host's ssh key
 deploy/deploy.sh provision cam1               # per node: SDK, usbfs, chrony, build tools
-deploy/deploy.sh node      cam1               # per node: build ilxctl, units, start services
+deploy/deploy.sh node      cam1               # per node: clock (Compass + mesh), build ilxctl, units, services
+deploy/deploy.sh clock     cam1               # per node: only the clock topology (a node found days off)
 WILDSYNC_STROBE_LINE=<offset> deploy/deploy.sh strobe   # Jetson host with an XR256
 ```
 

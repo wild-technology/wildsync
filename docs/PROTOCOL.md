@@ -304,6 +304,20 @@ Never drive FOCUS/TRIGGER high: "off" is high-Z, not logic 1.
 - `GET  /imu/latest` → newest sample or `{present:false}`
 - `GET  /imu/window?t0=&t1=` → samples in epoch range (ring holds ≥60 s)
 - `POST /timeprobe` `{t0}` → `{t0,t_rx,t_tx}` NTP-lite offset check
+- `POST /clock/step` `{host_epoch:float}` → `{ok, stepped, offset_s,
+  node_epoch[, error]}` — **step this node's system clock to the host's**
+  (`sudo -n date -s @<epoch>`, the hand fix of 2026-10-15 as an API).
+  `offset_s` is host minus node at receipt (+ = this node was behind).
+  Honoured only when |offset| ≥ **1.0 s** (chrony's own makestep threshold:
+  below it the residual is chrony's to slew, and a step would fight it);
+  smaller is 409 `stepped:false`. Also 409 while an interval capture runs
+  (its absolute schedule would move wholesale) or while a fire holds the fire
+  lock (the step waits out a busy-wait, ≤6 s, then gives up); 400 for a
+  non-numeric, zero, negative or non-finite epoch; 500 quoting stderr when
+  `date` fails. Runs under the fire lock, so no fire is busy-waiting to an
+  instant on a clock that moves under it. Not under `/gpio/`, so a strobe-role
+  host answers it too (it asks itself: offset 0, refused). Journalled as
+  `clock_step`.
 
 IMU sample dict: `{epoch, pitch, roll, yaw, heading, ax, ay, az, gx, gy, gz,
 mx, my, mz, temp}` — degrees, g, deg/s; missing fields null.
@@ -519,7 +533,8 @@ Fleet/hardware alert kinds:
 | `camera_overheating` | `overheatingLabel` is `pre-overheat` (warn) or `OVERHEATING` (critical); the body shuts itself down mid-transect |
 | `pc_control_lost` | `priorityKeyLabel` reads `Camera position` — PC Remote priority was taken back by the body, so writes are refused and PC save stops delivering. Masquerades as an SDK bug |
 | `preview_pinned` | a settings preview is being held on one camera, so the pair is not matched |
-| `host_clock_offset` | the **host** disagrees with the nodes: the median of the live nodes' filtered offsets is >0.1 s (warn) / >0.5 s (bad). `node_clock_skew` compares the nodes to *each other* and reads 0 for a common-mode host error, which is what hid the measured 187 ms. Action: enable network time on a Mac host (System Settings → General → Date & Time); check `chronyc tracking` on a Jetson host |
+| `host_clock_offset` | the **host** disagrees with the nodes: the median of the live nodes' filtered offsets is >0.1 s (warn) / >0.5 s (bad), nodes with a wrong clock (below) excluded. `node_clock_skew` compares the nodes to *each other* and reads 0 for a common-mode host error, which is what hid the measured 187 ms. Action: the nodes hold the GNSS Compass's GPS time, so put the host on it too — `deploy.sh mac` (sets the Compass as macOS's time server) or `deploy.sh jetson` — then `sntp 192.168.1.60` / `chronyc tracking` |
+| `node_clock_wrong` | one node's filtered offset from the host is >**2 s** (`NODE_CLOCK_WRONG_S`), always bad, per node. That is a clock that never got a reference — a Pi has no RTC battery, so one power-cycled with the Compass unreachable boots where it was (47 days behind, cam1, 2026-10-15) — not an offset: the fire scheduler compensates only −1..+5 s and piagent refuses an `at_epoch` outside −2/+5.5 s of its own clock, so every scheduled fire on it is refused. The evidence carries `action: {method:"POST", path:"/api/node/clock/step", body:{node}}`, which the UI renders as the **set camN clock from host** button; the text names the Compass and says to fix the host instead when every node shows the same offset. A node in this state is **dropped** from the `host_clock_offset` median and the `node_clock_skew` pairs: before this detector existed it branded the host as days off and its partner as weeks skewed |
 | `node_clock_unmeasurable` | a node's best `/health` RTT is ≥20 ms, so the 10 ms stereo budget cannot be verified on that link. Previously such a node was silently dropped from the comparison and the operator saw an all-clear on a check that was never made |
 
 **Published but NOT yet detected.** These three faults are now *measurable* —
@@ -1048,6 +1063,16 @@ lookup ~190 ms out (19 cm at 1 m/s). There are now two named domains, and
   conversions applied to values received FROM the node, but on the outward leg
   it asserts node == host and centres the ±100 ms window a whole fleet offset
   (187 ms on this rig) into the node's past.
+- **The reference (2026-10-15).** The Advanced Navigation GNSS Compass on the
+  rig switch (192.168.1.60) is a stratum-1 NTP server on GPS time, and every
+  node holds it as its preferred chrony source with the peer mesh behind it;
+  `deploy.sh mac` / `deploy.sh jetson` put the host on the same server. So on
+  a healthy rig both domains sit on GPS time and the bridge above measures a
+  residual of tens of milliseconds or less — the arithmetic is unchanged, and
+  still load-bearing the moment the Compass is off or the host is not on it.
+  A node that boots with no reference (no RTC battery) is seconds or days off
+  rather than offset; that is `node_clock_wrong` and `/api/node/clock/step`,
+  not this bridge, which never compensates beyond −1..+5 s.
 - `run.json` records what was applied: `clock: {node_offsets_s:{node:seconds},
   host_offset_s, applied:true, applied_offset_s:{first,last,min,max,moved_ms}}`.
   A node with **no measurement** publishes `null`, not `0.000000` — the latter
@@ -1112,6 +1137,20 @@ a run or drain is active.
 - `GET  /api/run/zip?id=<run_id>` — builds (or reuses)
   `<project>/exports/<run_id>.zip` (ZIP_STORED) and serves it with a real
   Content-Length. The export is a durable artifact, not a stream.
+- `POST /api/node/clock/step {node}` → `{ok, stepped, node, offset_s,
+  node_epoch[, error]}` — the **set camN clock from host** button on a
+  `node_clock_wrong` anomaly: rigd sends its own `time.time()` to the node's
+  piagent `/clock/step` and relays the answer. 400 for an unknown or missing
+  node, for an OFFLINE node, and while a run is active (a step moves every fire
+  instant scheduled on that node; a run whose node is seconds off is paused,
+  not shooting, so stop, step, restart). `ok` is true only when the node
+  actually stepped; a node under 1 s off refuses on its own and the answer is
+  `ok:false, stepped:false` with its reason. On success rigd drops that node's
+  clock-offset window (`NodeMonitor.reset_clock`) so the anomaly clears on the
+  next poll instead of a minute later. Journalled as `clock_step` (request,
+  then result). rigd does not gate on its own measured offset: piagent judges
+  the request against its clock at receipt, the one measurement that cannot be
+  stale.
 - `POST /api/node/format {node, confirm:"format", quick?}` — proxies the
   node's card format with rigd's guards: refused during a run, during a
   drain, and for a disconnected camera; journalled warn/info/error. The node
@@ -1582,3 +1621,35 @@ are in `CHANGELOG.md`.
 Needs confirming on hardware: the node-side Origin and framing checks against
 the rig UI and rigd traffic, the idle census and deferred-exposure replay on a
 live pair, and the strobe line idle level at piagent restart with the XR256.
+
+## Additions 2026-10-15 — node time: the GNSS Compass as the rig's NTP server
+
+cam1 came back from a power cycle 47 days behind (a Pi has no RTC battery),
+rigd's compensation is capped at −1..+5 s, piagent refuses an `at_epoch`
+outside −2/+5.5 s of its own clock, so every scheduled fire was refused until
+`sudo date -s` was typed on the node. Under the Mac host the nodes had no
+reference at all (the mesh keeps them together, not right). Three changes:
+
+- **Reference.** The GNSS Compass at 192.168.1.60 is a stratum-1 NTP server
+  (refid `GPS`, 0.5 ms RTT from a node). Every node now holds it with `prefer`
+  (`/etc/chrony/conf.d/20-wildsync-gnss.conf`, written by the card step and
+  by `deploy.sh clock camN`), the peer mesh stays behind it, and `chrony.conf`
+  says `makestep 1 -1` so a clock more than a second out is stepped whenever a
+  reference answers, however long the node has been up (Ubuntu's `makestep 1
+  3` gave up after three updates and is parsed after the drop-ins). The host
+  joins the same server: `deploy.sh mac` (new) sets it as macOS's time server
+  and installs the launchd agent; `deploy.sh jetson` adds it to the Jetson's
+  chrony. `deploy.sh all` now picks `mac` or `jetson` by the host it runs on.
+  `WILDSYNC_NTP` overrides the address (empty: no Compass, mesh only).
+- **Detector.** `node_clock_wrong` (per node, bad, >2 s from the host), with
+  the node dropped from `host_clock_offset` and `node_clock_skew`; its
+  evidence carries the `action` the UI renders as a button. Text of
+  `host_clock_offset`, `node_clock_skew` and the per-run `host_clock` warning
+  now names the Compass and `deploy.sh mac` / `jetson`.
+- **Remedy.** piagent `POST /clock/step {host_epoch}` and rigd
+  `POST /api/node/clock/step {node}` (above; the **set camN clock from host**
+  button on the anomaly in both the Review tab and the Alerts panel).
+  `NodeMonitor.reset_clock()` drops the stale offset window after a step.
+
+What was and was not exercised on the rig on 2026-10-15 is in
+`docs/INSTALL.md` §0.

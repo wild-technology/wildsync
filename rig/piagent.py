@@ -450,6 +450,25 @@ class Gpio:
     # also the only way a node clock this wrong ever becomes visible.
     FIRE_MAX_FUTURE_S = 5.5
     FIRE_MAX_PAST_S = 2.0
+    # The remedy for the clock disagreement _epoch_fault reports. A Pi has no
+    # RTC battery, so a node power-cycled with no reachable chrony source
+    # boots days in the past and then refuses every at_epoch the host sends -
+    # correctly, and for ever (cam1, 2026-10-15: 47 days behind, every
+    # scheduled fire refused until someone typed `sudo date -s` on the node
+    # from a host timestamp). /clock/step is that hand step as an API: the
+    # host sends its own epoch and this node steps to it. Only a disagreement
+    # of at least CLOCK_STEP_MIN_S is honoured: that is chrony's own makestep
+    # threshold, below which chrony slews the clock itself whenever it has a
+    # source, and a step inside that band would only fight it while putting a
+    # discontinuity under the stereo budget for nothing. The host's own clock
+    # is the reference here, with whatever error it carries (tens of ms on an
+    # undisciplined Mac); chrony takes over the residual once a source answers.
+    CLOCK_STEP_MIN_S = 1.0
+    # `date -s @<epoch>` is what the hand step ran. piagent runs as ubuntu
+    # (deploy/piagent.service) with passwordless sudo, as the gpio fallbacks
+    # above already rely on; -n so a sudo that wants a password fails at once
+    # instead of hanging the handler.
+    CLOCK_STEP_CMD = ["sudo", "-n", "date", "-s"]
 
     def __init__(self):
         self.chip = GPIOCHIP
@@ -746,6 +765,67 @@ class Gpio:
                       "+%.0f/-%.0f s) - node clock or schedule is wrong"
                       % (skew, cls.FIRE_MAX_FUTURE_S, cls.FIRE_MAX_PAST_S)),
             "clock_skew_s": round(skew, 3), "node_epoch": time.time()}
+
+    def clock_step(self, host_epoch):
+        """Step this node's system clock to the host's `host_epoch`.
+
+        Answers {ok, stepped, offset_s, node_epoch[, error]}: `offset_s` is
+        host minus node as measured at receipt (positive = this node was
+        behind), `node_epoch` this node's clock after the step. Refused (409,
+        stepped:false) under CLOCK_STEP_MIN_S, while an interval capture is
+        running (its absolute schedule would land in the past or the future
+        wholesale), or while a fire holds the lock; 400 for a bad epoch. The
+        step itself runs under the fire lock so no fire is busy-waiting to an
+        instant on a clock that moves under it."""
+        try:
+            target = float(host_epoch)
+        except (TypeError, ValueError):
+            target = float("nan")
+        if not (target == target) or target in (float("inf"), float("-inf")) \
+                or target <= 0:
+            return {"ok": False, "code": 400, "stepped": False,
+                    "error": "host_epoch must be a positive epoch (seconds)",
+                    "node_epoch": time.time()}
+        if self.interval_status().get("running"):
+            return {"ok": False, "code": 409, "stepped": False,
+                    "error": "an interval capture is running - stop it before "
+                             "stepping this node's clock",
+                    "node_epoch": time.time()}
+        # A fire holds this lock for at most FIRE_MAX_FUTURE_S of busy-wait.
+        if not self._fire_lock.acquire(timeout=self.FIRE_MAX_FUTURE_S + 0.5):
+            return {"ok": False, "code": 409, "stepped": False,
+                    "error": "a fire is in progress", "node_epoch": time.time()}
+        try:
+            now = time.time()
+            offset = target - now
+            if abs(offset) < self.CLOCK_STEP_MIN_S:
+                return {"ok": False, "code": 409, "stepped": False,
+                        "offset_s": round(offset, 3), "node_epoch": now,
+                        "error": "this node is %+.3f s from the host, under "
+                                 "the %.0f s step threshold - that residual "
+                                 "is chrony's to slew, not a step"
+                                 % (offset, self.CLOCK_STEP_MIN_S)}
+            # The target is the host's epoch at the moment it sent it; the
+            # transit and the work above are added back so the step lands on
+            # the host's "now", not its "then".
+            rc, _out, err = _run(list(self.CLOCK_STEP_CMD)
+                                 + ["@%.6f" % (target + (time.time() - now))],
+                                 timeout=5)
+            after = time.time()
+            if rc != 0:
+                log("error", "clock_step", "clock step FAILED",
+                    offset_s=round(offset, 3), rc=rc, err=(err or "").strip())
+                return {"ok": False, "code": 500, "stepped": False,
+                        "offset_s": round(offset, 3), "node_epoch": after,
+                        "error": "date -s failed (rc %d): %s"
+                                 % (rc, (err or "").strip() or "no stderr")}
+            log("warn", "clock_step",
+                "system clock stepped to the host's",
+                offset_s=round(offset, 3), node_epoch=round(after, 3))
+            return {"ok": True, "stepped": True, "offset_s": round(offset, 3),
+                    "node_epoch": after}
+        finally:
+            self._fire_lock.release()
 
     def fire(self, at_epoch, pulse_ms, focus_lead_ms=0, strobe_at_epoch=0,
              strobe_pulse_ms=5):
@@ -2141,6 +2221,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/timeprobe":
                 t_rx = time.time()
                 self._send({"t0": b.get("t0"), "t_rx": t_rx, "t_tx": time.time()})
+            elif path == "/clock/step":
+                # Not under /gpio/, so a strobe-role host can be stepped too
+                # (it asks itself: offset 0, refused, harmless).
+                res = GPIO.clock_step(b.get("host_epoch"))
+                self._send(res, res.get("code", 200 if res.get("ok") else 400))
             else:
                 self._send({"ok": False, "error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001

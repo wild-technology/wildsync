@@ -390,6 +390,13 @@ def _p2_software_stamp(opts):
           "git ignores it",
           dsh.count("rig/buildinfo.py --write") == 2
           and "BUILD_INFO.json" in gi.split())
+    # Two host flavours since 2026-10-15 (deploy.sh mac, deploy.sh jetson);
+    # both stamp through the one _stamp_host step, so the count above stays
+    # "host + nodes" and a third copy of the block cannot drift.
+    check("both host flavours stamp through the same step (_stamp_host)",
+          dsh.count("_stamp_host") == 3 and "deploy_mac()" in dsh
+          and "deploy_jetson()" in dsh,
+          "_stamp_host x%d" % dsh.count("_stamp_host"))
 
 
 # ---------------------------------------------------------------------------
