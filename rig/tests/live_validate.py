@@ -131,7 +131,11 @@ def main():
         st = post("/api/run/stop", {})
         print("  stop:", {k: (v.get("pulled"), v.get("failed")) for k, v in (st.get("summary") or {}).items()})
         d = get("/api/run/detail?id=" + rid)
-        pc, pt = d.get("pairs_complete"), d.get("pairs_total")
+        # /api/run/detail reports pairing under "pairs": shots, complete,
+        # incomplete. The flat pairs_complete/pairs_total this read never
+        # existed, so the check always compared None with None.
+        pairs = d.get("pairs") or {}
+        pc, pt = pairs.get("complete"), pairs.get("shots")
         print("  pairs %s/%s skew_max %s" % (pc, pt, (d.get("sync") or {}).get("skew_ms_max")))
         check("all pairs complete", pc == pt and (pt or 0) >= a.run - 1, "%s/%s" % (pc, pt))
 
