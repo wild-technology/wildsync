@@ -16,7 +16,11 @@
 # Policy: docs/PROTOCOL.md ("Deliverables & boundaries") specifies the Python
 # standard library only for the services, with pyserial the one permitted
 # exception. Everything else below is imported guardedly or lazily, and each
-# entry says what stops working without it. The C++ daemon (ilxctl) has no
+# entry says what stops working without it. That is the code; the rigd SERVICE
+# is stricter: `python3 rig/rigd.py` exits 78 when its interpreter cannot
+# import every package in the host section and the calibration section below
+# (rig/pydeps.py reads this file), and deploy.sh mac / jetson refuse to
+# restart rigd under such an interpreter. The C++ daemon (ilxctl) has no
 # Python dependencies; its own third-party components are the Sony Camera
 # Remote SDK and third_party/httplib.h (see THIRD_PARTY_NOTICES.md).
 
@@ -29,13 +33,14 @@
 
 # pyserial - imported as `serial` by rig/nav.py, which reads the iKonvert
 # NMEA 2000 gateway on its serial port, and by the serial transports of
-# rig/imu_yb.py and rig/imu_olive.py. Without it rigd still runs and the
-# flight log carries empty nav columns.
+# rig/imu_yb.py and rig/imu_olive.py. Without it the code still runs and the
+# flight log carries empty nav columns, but the rigd service refuses to start.
 pyserial
 
 # Pillow - imported as `PIL` by rig/run.py for the EXIF fallback that supplies
-# a frame's capture instant when it has no GPIO edge. rigd starts without it
-# but warns at run start, and such a frame then takes the command time.
+# a frame's capture instant when it has no GPIO edge. Imported as a module,
+# rigd works without it (warns at run start, and such a frame then takes the
+# command time); the rigd service refuses to start without it.
 # Also used by rig/stereo_check.py, the icon generators in deploy/icons/, and
 # the test fixtures in rig/tests/fakenode.py.
 Pillow
@@ -48,8 +53,9 @@ Pillow
 #           (python3-numpy, python3-opencv).
 #   macOS / development host: pip, from this file.
 # rigcal and vslam import both lazily and report them unavailable when they are
-# missing; the rest of rigd is unaffected. stereo_check imports them at the top
-# and cannot run without them.
+# missing; the rest of the code is unaffected, but the rigd service refuses to
+# start without them (rig/pydeps.py). stereo_check imports them at the top and
+# cannot run without them.
 # ---------------------------------------------------------------------------
 numpy
 opencv-python-headless        # imported as cv2

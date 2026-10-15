@@ -37,6 +37,17 @@ dates.
   transport, raw log replay and source selection; in the gate as
   `audit-subsonus`.
 
+- `rig/pydeps.py`: rigd refuses an interpreter that cannot import every
+  package in `requirements.txt`. `python3 rig/rigd.py` checks before it imports
+  any rig module and exits 78 with one line naming the missing package, the
+  interpreter and the fix (`docs/INSTALL.md` 3a/3b); `WILDSYNC_SKIP_PYDEPS=1`
+  starts it degraded. `deploy.sh mac` checks the rendered plist's interpreter
+  before `launchctl bootout`/`bootstrap`, `deploy.sh jetson` (and `strobe`) the
+  unit's `ExecStart` interpreter before `systemctl restart rigd`; a refusal
+  leaves the running rigd and the installed plist alone. `rigd.service` has
+  `RestartPreventExitStatus=78`. In the gate as `audit-pydeps`
+  (`rig/tests/audit_pydeps.py`, Y1-Y4).
+
 ### Changed
 - `host_clock_offset`, `node_clock_skew` and the per-run `host_clock` warning
   name the GNSS Compass and `deploy.sh mac` / `jetson` as the fix instead of

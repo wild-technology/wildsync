@@ -15,6 +15,10 @@ WorkingDirectory=__REPO__/rig
 ExecStart=/usr/bin/python3 -u __REPO__/rig/rigd.py
 Restart=always
 RestartSec=3
+# 78 is rigd refusing an interpreter that cannot import requirements.txt
+# (rig/pydeps.py): restarting cannot fix that, so the unit stays "failed" and
+# `systemctl status rigd` shows the one line naming the package and the fix.
+RestartPreventExitStatus=78
 # nav needs the iKonvert serial port
 SupplementaryGroups=dialout
 # The capture scheduler needs prompt wakeups; the macOS twin runs as

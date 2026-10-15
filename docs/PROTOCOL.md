@@ -1108,9 +1108,14 @@ steps applied live (manual → ISO step; auto → servo target shift).
   systemd units and the launchd agent (core). Python standard library only in
   the services, with two guarded exceptions on the host: pyserial (apt
   `python3-serial`; the iKonvert and serial IMUs) and Pillow (the EXIF fallback
-  that supplies a capture instant when a frame has no GPIO edge). Both are
-  optional: rigd runs without them and says what is missing. The list of
-  packages is `requirements.txt`.
+  that supplies a capture instant when a frame has no GPIO edge). The code
+  imports both guardedly, but the rigd service refuses an interpreter that
+  cannot import every package in `requirements.txt` (pyserial, Pillow, numpy,
+  OpenCV): `python3 rig/rigd.py` exits 78 with one line naming what is missing
+  and the fix (`rig/pydeps.py`; `WILDSYNC_SKIP_PYDEPS=1` starts it degraded),
+  and `deploy.sh mac` / `jetson` run the same check under the unit's
+  interpreter before they restart it. The list of packages is
+  `requirements.txt`.
 
 ---
 

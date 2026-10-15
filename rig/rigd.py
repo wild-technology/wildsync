@@ -14,8 +14,11 @@ One rigd runs on the rig host. It:
     calib / diag / alerts / events) that needs nothing but a browser.
 
 Standard library, plus rig/nav.py (which itself needs pyserial) and Pillow for
-the EXIF fallback that stamps a frame with no GPIO edge. nav is optional:
-without it, runs still work and the flight log simply carries empty nav columns.
+the EXIF fallback that stamps a frame with no GPIO edge. The code degrades
+without them - runs still work and the flight log carries empty nav columns -
+but the service does not: `python3 rigd.py` exits 78 with one line on stderr
+when its interpreter cannot import every package in requirements.txt
+(rig/pydeps.py; WILDSYNC_SKIP_PYDEPS=1 starts it degraded anyway).
 """
 
 import json
@@ -26,6 +29,17 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
+
+if __name__ == "__main__":
+    # First, before any rig module is imported, any thread started or any file
+    # written: an interpreter without requirements.txt is refused with one line
+    # naming what is missing and the fix (rig/pydeps.py), exit 78. Without this
+    # a new Homebrew Python under the launchd agent (2026-10-16: 3.14 -> 3.15,
+    # empty site-packages) left a rigd that launchd called "running" with no
+    # nav, no EXIF fallback, no Calib, and no line anywhere saying why.
+    # Tests and devrig import this module, so they are not affected.
+    import pydeps
+    pydeps.require("rigd")
 
 import rigcore
 from rigcore import (NODES, EventLog, NodeMonitor, RunBrowser, RunsError,

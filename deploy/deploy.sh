@@ -500,6 +500,30 @@ _stamp_host() {
   fi
 }
 
+# The interpreter a host unit runs must import every package in
+# requirements.txt, checked under THAT interpreter before the unit is
+# (re)started. Without the check a Homebrew bump (2026-10-16: 3.14 -> 3.15
+# under the launchd agent, empty site-packages) was deployed as a rigd that
+# launchd called "running" and that said nothing anywhere. rig/pydeps.py is the
+# same check rigd.py makes at start-up and prints the same one line; on a
+# refusal nothing is restarted and the running rigd is left as it was.
+_require_pydeps() {  # <interpreter>
+  local py="$1"
+  if [ ! -x "$py" ]; then
+    echo "  REFUSED: $py (the interpreter the rigd unit runs) does not exist" >&2
+    return 1
+  fi
+  if ! "$py" "$REPO"/rig/pydeps.py; then
+    echo "  REFUSED: rigd not (re)started; fix the line above and deploy again" >&2
+    return 1
+  fi
+}
+
+# The interpreter deploy/rigd.service runs: the first word of its ExecStart.
+_unit_python() {
+  sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$REPO"/deploy/rigd.service | head -1
+}
+
 deploy_jetson() {
   echo "=== jetson (local) ==="
   # Host dependencies. A fresh JetPack image has none of these, and the old
@@ -510,6 +534,7 @@ deploy_jetson() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
     python3-serial python3-pil python3-numpy python3-opencv chrony rsync \
     >/dev/null 2>&1 || echo "  WARNING: apt install failed - check network"
+  _require_pydeps "$(_unit_python)" || return 1
   # The host is the rig's clock master: serve the LAN, keep a local stratum
   # so the rig stays coherent with no upstream at sea, and hold the GNSS
   # Compass itself (NTP_SERVER) so the host and the nodes - which prefer the
@@ -575,7 +600,18 @@ deploy_mac() {
   fi
   mkdir -p "$HOME/rig" "$HOME/Library/LaunchAgents"
   # Rendered for THIS checkout and home - the template carries placeholders.
-  sed "s|__REPO__|$REPO|g; s|__HOME__|$HOME|g" "$REPO"/deploy/rigd.launchd.plist > "$plist"
+  # Rendered aside first: the interpreter it names is checked before the plist
+  # in place, or the running agent, is touched.
+  local rendered="$plist.new"
+  sed "s|__REPO__|$REPO|g; s|__HOME__|$HOME|g" "$REPO"/deploy/rigd.launchd.plist > "$rendered"
+  local py
+  py="$(plutil -extract ProgramArguments.0 raw -o - "$rendered" 2>/dev/null)" || py=""
+  [ -n "$py" ] || py="$venv"
+  if ! _require_pydeps "$py"; then
+    rm -f "$rendered"
+    return 1
+  fi
+  mv -f "$rendered" "$plist"
   _stamp_host
   # bootout then bootstrap, not kickstart: launchd reads a plist only at
   # bootstrap, so a regenerated one (new venv, moved checkout) needs the
@@ -646,7 +682,9 @@ merge("nodes.json", {"jetson": {"host": "127.0.0.1", "cam_num": 9,
                                 "optional": True}})
 merge("camera_enabled.json", {"jetson": False})
 PY
-  systemctl is-active --quiet rigd && sudo systemctl restart rigd
+  if systemctl is-active --quiet rigd; then
+    _require_pydeps "$(_unit_python)" && sudo systemctl restart rigd
+  fi
   sleep 3
   echo "  piagent-strobe: $(systemctl is-active piagent-strobe)  ($chip line $line, active-$active)"
   echo "  in the UI: Controls > Strobe > Node = jetson"

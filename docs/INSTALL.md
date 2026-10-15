@@ -144,6 +144,15 @@ different Python, create the venv with that one. An agent installed before this
 needs its plist regenerated with the `sed` above and a `launchctl bootout`,
 then `bootstrap`, to pick the venv up.
 
+rigd checks its own interpreter before anything else: if that interpreter cannot
+import every package in `requirements.txt` (a Homebrew upgrade under a plist that
+named `/opt/homebrew/bin/python3` did exactly this on 2026-10-16), it exits 78
+and writes one line to `~/rig/rigd-launchd.log` naming the missing package and
+the fix. launchd restarts it every few seconds and the line repeats until the
+venv is fixed. `deploy.sh mac` runs the same check under the plist's interpreter
+and refuses, leaving the running agent alone, rather than bootstrap one that
+would fail it.
+
 The agent is `org.wildtechnology.wildsync.rigd` (restart it with
 `launchctl kickstart -k gui/$(id -u)/org.wildtechnology.wildsync.rigd`, stop and
 remove it with `launchctl bootout gui/$(id -u)/org.wildtechnology.wildsync.rigd`),
@@ -173,7 +182,11 @@ deploy/deploy.sh jetson        # deps, chrony master for the rig, rigd service
 `deploy.sh jetson` installs `python3-serial`, `python3-pil`, `python3-numpy`,
 `python3-opencv`, `chrony` and `rsync` with apt; makes the Jetson a chrony server
 for the rig's subnet; installs `rigd.service` for this checkout and user; writes
-`BUILD_INFO.json` (the software stamp, section 9); and restarts `rigd`. It prints
+`BUILD_INFO.json` (the software stamp, section 9); and restarts `rigd`, after
+checking that the unit's interpreter (`/usr/bin/python3`) imports every package in
+`requirements.txt`; if it does not, it refuses with one line naming the package
+and restarts nothing. rigd makes the same check at start-up and exits 78, which
+`rigd.service` does not restart on, so `systemctl status rigd` shows the line. It prints
 the UI address when `rigd` is up (`http://192.168.1.29:9090`, or
 `localhost:9090` on the Jetson). The optional desktop launcher
 `deploy/wildsync.desktop` carries the path of the checkout it was written for;

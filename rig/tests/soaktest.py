@@ -2304,7 +2304,7 @@ def soak(seconds, opts):
 # it. So an import failure becomes one FAILing check named after the suite and
 # every other suite still runs.
 AUDIT_SUITES = ["run", "rigcore", "rigd", "drain", "ui", "piagent", "ilxctl",
-                "nav", "subsonus", "verify", "provenance"]
+                "nav", "subsonus", "verify", "provenance", "pydeps"]
 
 
 def _audit_suite(name):
