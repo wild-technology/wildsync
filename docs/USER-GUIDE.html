@@ -242,8 +242,9 @@ footer{border-top:1px solid var(--line);margin-top:56px;padding-top:20px;
     <span class="tag">host <b>Jetson Orin NX</b></span>
     <span class="tag">strobe <b>XR256</b></span>
     <span class="tag">pair skew <b>&lt; 2 ms</b></span>
-    <span class="tag">build <b>main</b></span>
-    <span class="tag">revised <b>2026-09-21</b></span>
+    <span class="tag">edition <b>ONR / Sony / Jetson</b></span>
+    <span class="tag">code baseline <b>9ff73e4</b></span>
+    <span class="tag">revised <b>2026-10-26</b></span>
   </div>
 </header>
 
@@ -278,8 +279,14 @@ is what turns two piles of photographs into a 3D model of the seafloor.</p>
 
 <p>You drive all of it from one page served by the Jetson: <code>http://192.168.1.29:9090</code> from any
 laptop on the rig network, or <code>http://localhost:9090</code> on the Jetson itself.
-There is nothing else to run. If that page is up and the header says
-<strong>2/2 cameras</strong>, the rig is ready to shoot.</p>
+The services start with the host and camera nodes. The header's
+<strong>2/2 cameras</strong> confirms both cameras are present; complete the
+before-dive checklist and the Start pre-flight before shooting.</p>
+
+<p>This is the <strong>ONR Sony/Jetson edition</strong>, corresponding to code
+baseline <code>9ff73e4</code>. The subsequent Mac/Allied project has its own
+development version and operating procedures. September field trials used a
+separate ONR Jetson; the underwater scooter is a separate system.</p>
 
 <div class="kvs">
   <div class="kv"><div class="k">pair skew</div><div class="v">0.6 ms</div><div class="s">measured; budget is 10 ms</div></div>
@@ -387,8 +394,8 @@ drain is active.</p></div>
 </div></li>
 
 <li><b>The Jetson's clock</b><div class="d">
-  <p>On the Jetson, <code>chronyc tracking</code> should show it synchronised, and <code>chronyc clients</code> should list both Pis.</p>
-  <p>This matters more than it sounds. The Jetson's clock is the reference every shot <em>and the strobe</em> are scheduled against, and the Pis follow it. Left undisciplined the host clock drifts - an earlier host was found 187 ms out and stepping - and the cameras stop firing <em>on schedule</em> and start firing <em>whenever the message arrives</em>. The rig compensates for the offset and warns you about it (<code>host_clock_offset</code>), but the honest fix is a disciplined clock.</p>
+  <p>On the Jetson, <code>chronyc tracking</code> should show it synchronised. Check the Pis' clock status too: the current deployment gives each Pi the GNSS Compass at <code>192.168.1.60</code> as its preferred source, with the Pi peer mesh as fallback. The Jetson also follows the Compass and serves time on the rig network; <code>chronyc clients</code> lists nodes that actually query it.</p>
+  <p>The host schedules every shot <em>and the strobe</em> against its clock, translating to each node's clock with the measured offset. Left undisciplined the host clock drifts - an earlier host was found 187 ms out and stepping. Read <code>host_clock_offset</code>, <code>node_clock_skew</code> and <code>node_clock_wrong</code> before starting; a clock correction is not a substitute for checking the source and agreement.</p>
 </div></li>
 
 <li><b>The camera clocks</b><div class="d">
@@ -422,7 +429,7 @@ drain is active.</p></div>
 </div></li>
 
 <li><b>Calibrate</b><div class="d">
-  <p>Calib tab, <strong>in the water</strong> - the WACP-C changes the focal length, so an in-air calibration is wrong underwater. Enter the checkerboard's inner-corner counts and square size, start a session and follow the amber guidance until it turns green, then Compute and Save. Stereo VSLAM picks up the new calibration automatically.</p>
+  <p>Calib tab, <strong>in the water</strong> - the WACP-C changes the focal length, so an in-air calibration is wrong underwater. Enter the checkerboard's inner-corner counts and square size, start a session and follow the amber guidance until it turns green, then Compute and Save. This saves the stereo calibration. VSLAM is a separate processing tool in this baseline; automatic live integration with rigd is not implemented.</p>
   <p>For the Olive IMUs: set the rig still and level and press <b>Calibrate both</b>. It takes ten seconds and refuses if anything moves.</p>
 </div></li>
 </ol>
@@ -455,7 +462,7 @@ drain is active.</p></div>
 </figure>
 
 <ul>
-<li>The <strong>jitter chip</strong> between the two frames is the <em>measured</em> gap between those two exposures - not an estimate. Green is good; the budget is 10 ms.</li>
+<li>The <strong>jitter chip</strong> between the two frames is a measured exposure gap only when both capture sources are qualified <code>gpio_edge</code> timestamps. Coarse sources are labelled as estimates. Read the source and error bound; the budget is 10 ms.</li>
 <li>If one camera has no frame for a shot you get a <strong>MISSING</strong> panel in its place. You are never shown a single frame dressed up as a pair.</li>
 <li><strong>&lt; older / newer &gt;</strong> or the arrow keys step through pairs; <em>following newest</em> snaps back to live.</li>
 <li>The strip under each camera is that node's health: card state, battery, disk, exposure edges seen, and its clock offset if it drifts.</li>
@@ -580,6 +587,12 @@ cameras/cards table that converts each body's remaining shots into GB, so a mism
 card stands out. <strong>Format card</strong> lives there too: it shows the card's state
 first, then asks you to type the camera's name before it does anything.</p>
 
+<div class="note bad"><span class="lab">Before any format</span>
+<p>Formatting erases the card. First preserve and verify every image you need.
+The ONR baseline blocks formatting during a run or drain, but it does not prove
+that all existing card images have a verified copy. The confirmation is your
+erase decision.</p></div>
+
 <div class="note warn"><span class="lab">"Card index not ready"</span>
 <p>That body's transfer subsystem is wedged - it happens after many mode switches
 in a session. <strong>Power-cycle that camera</strong> and drain again. The card is
@@ -605,6 +618,7 @@ gyro, temperature, and three columns that tell you how much to trust the rest.</
 <thead><tr><th>value</th><th>meaning</th><th>trust</th></tr></thead>
 <tbody>
 <tr><td class="mono">gpio_edge</td><td>the camera's own EXPOSURE signal, timestamped by the Pi's kernel</td><td>best - this is what the harness is for</td></tr>
+<tr><td class="mono">gpio_edge_soft</td><td>an exposure edge whose conversion to wall-clock time has an unmeasured bound</td><td>coarse timing; not a qualified measurement of pair skew or strobe overlap</td></tr>
 <tr><td class="mono">exif</td><td>the camera's internal clock, corrected by a measured per-body offset</td><td>good to ~10 ms</td></tr>
 <tr><td class="mono">command</td><td>when the rig <em>asked</em> for the shot, not when it happened</td><td>treat with suspicion</td></tr>
 </tbody></table></div>
@@ -678,9 +692,11 @@ it was down are gone.</p>
 <p><code>body_locked</code>, <code>card_write_stuck</code>. This is the card stall, and it is the
 nastiest failure this rig has. One frame the card will not accept jams the whole
 body: settings lock up, delivery stops, format is refused - <em>and the shutter still
-fires</em>, so it looks exactly like a software bug. Power the body fully off, take the
-card out, full-format it in a computer, format it again in the camera. If it argues,
-replace it.</p>
+fires</em>, so it looks exactly like a software bug. Stop the run and preserve its
+logs. Power the body fully off before removing the card. Recover and verify any
+needed images on a computer before deciding to erase it. After preservation, a
+full-format followed by an in-camera format is a recovery option; replace a card
+that continues to stall.</p>
 
 <h3>The two cameras disagree</h3>
 <p><code>settings_divergent</code>. They are not identically configured, so pairs taken now
@@ -710,7 +726,7 @@ Jetson (<code>chronyc tracking</code>). Node skew: the two Pis need to agree wit
 <tr><td class="mono">camera_absent</td><td><span class="sev bad">bad</span></td><td>Pi up, camera not claimed</td><td>a <em>data</em> USB cable, camera on, PC&nbsp;Remote mode</td></tr>
 <tr><td class="mono">ilx_down</td><td><span class="sev bad">bad</span></td><td>camera daemon wedged - piagent still answers</td><td>power-cycle the camera body. Shots still fire; pictures will not arrive</td></tr>
 <tr><td class="mono">card_missing</td><td><span class="sev bad">bad</span></td><td>no card in that body</td><td>the shutter fires and nothing records - insert a card</td></tr>
-<tr><td class="mono">body_locked</td><td><span class="sev bad">bad</span></td><td>the property table is gone - the card-stall signature</td><td>power the body off, full-format the card in a computer, or replace it with a V60/UHS-II</td></tr>
+<tr><td class="mono">body_locked</td><td><span class="sev bad">bad</span></td><td>the property table is gone - the card-stall signature</td><td>stop the run, power off, preserve needed card images; only then decide on a format or replacement</td></tr>
 <tr><td class="mono">card_write_stuck</td><td><span class="sev bad">bad</span></td><td>a card write has not completed</td><td>one stuck frame takes the whole body down; power off and read the card in a computer</td></tr>
 <tr><td class="mono">camera_overheating</td><td><span class="sev warn">warn</span></td><td>the body is cooking</td><td>it will shut down mid-transect - reduce duty cycle or cool it now</td></tr>
 <tr><td class="mono">pc_control_lost</td><td><span class="sev bad">bad</span></td><td>the body took control priority back</td><td>set the body's priority back to PC&nbsp;remote</td></tr>
@@ -746,8 +762,9 @@ and in Events rather than waiting for an alert.</p></div>
 
 <div class="note tip"><span class="lab">First thing to try</span>
 <p>Power-cycling the camera body fixes a surprising share of problems: a wedged
-daemon, a stuck transfer session, a locked property table. It is safe, and it is
-faster than diagnosing.</p></div>
+daemon, a stuck transfer session, a locked property table. Stop the run or drain
+first and preserve its logs. An interrupted write or unanswered command needs
+checking after recovery; a restart does not prove that its image was saved.</p></div>
 
 <pre><code><span class="cmt"># on the Jetson - what the fleet thinks</span>
 curl -s localhost:9090/api/fleet | python3 -m json.tool
@@ -756,8 +773,10 @@ curl -s localhost:9090/api/anomalies | python3 -m json.tool
 <span class="cmt"># a node's own health</span>
 curl -s 192.168.1.201:8081/health | python3 -m json.tool
 
-<span class="cmt"># restart the brain - finalises any active run first, nothing is lost</span>
+<span class="cmt"># stop the run/drain in the UI first; preserve logs and check finalisation</span>
+<span class="cmt"># restart the ONR Jetson controller; check the run and service afterwards</span>
 sudo systemctl restart rigd
+systemctl status rigd --no-pager
 
 <span class="cmt"># restart the strobe agent / an Olive IMU relay (on that Pi)</span>
 sudo systemctl restart piagent-strobe
@@ -796,7 +815,7 @@ you, and against the rig that recorded the data you are looking at.</p>
 <tbody>
 <tr><td class="mono">24 Aug 2026<br>build label "audit-fixes"</td><td>A Mac running <code>rigd</code>, and one Raspberry Pi per camera running <code>ilxctl</code> + <code>piagent</code>. Cameras fired by the hardware GPIO trigger. No strobe.</td><td><strong>This is the edition that matches the 20 Aug 2026 Narragansett Bay field transects.</strong> Those were recorded with a Mac host; a Pi 5 on cam1 and a Pi 4 on cam2; the hardware GPIO trigger; one IMU, on cam1; no strobe fired; and no live navigation (a static fix). "audit-fixes" is a build label for the audit-pass commits of 23-24 Aug 2026, not a branch or tag.</td></tr>
 <tr><td class="mono">21 Sep 2026<br>software tag <code>v1.0.0</code></td><td>A Jetson Orin NX running <code>rigd</code>, the XR256 strobe role, and one Olive IMU per camera. Describes the software tagged <code>v1.0.0</code>.</td><td>Does not match the 20 Aug 2026 field data. The strobe has not been fired with the camera array, and this configuration was not used for the 20 Aug 2026 transects.</td></tr>
-<tr><td class="mono">Current edition</td><td>The same hardware as the 21 Sep 2026 edition. Its text is unchanged from that edition apart from this revision history.</td><td>As for the 21 Sep 2026 edition: does not match the 20 Aug 2026 field data.</td></tr>
+<tr><td class="mono">26 Oct 2026<br>ONR cleanup<br>baseline <code>9ff73e4</code></td><td>ONR Jetson controller and Sony camera Pis. Clarifies timing provenance, clock topology, calibration boundaries and data-preserving recovery. Subsequent Mac/Allied development is a separate project version.</td><td>The operator confirms a separate ONR Jetson was used in September field trials. Those trials are distinct from the August Mac trials and the underwater scooter. This documentation cleanup introduces no new hardware qualification.</td></tr>
 </tbody></table></div>
 </section>
 
@@ -805,6 +824,6 @@ you, and against the rig that recorded the data you are looking at.</p>
 
 <footer>
   <span>Wild Sync</span><span>Jetson rigd | Pi ilxctl + piagent | XR256</span>
-  <span>manual revised 2026-09-21</span><span>documents the main branch</span>
+  <span>manual revised 2026-10-26</span><span>ONR edition | code baseline 9ff73e4</span>
 </footer>
 </div>

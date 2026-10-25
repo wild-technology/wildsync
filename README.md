@@ -1,5 +1,8 @@
 # Wild Sync
 
+**ONR source delivery:** see [`docs/SHARING.md`](docs/SHARING.md) to export a
+self-contained source ZIP with its matching field manual and exact version.
+
 Control software for a multi-camera **Sony ILX-LR1** underwater stereo rig used
 for seafloor photogrammetry.
 
